@@ -1,4 +1,5 @@
 #include "printerctl/cli.h"
+#include "printerctl/logging.h"
 #include "printerctl/version.h"
 
 #include <stdarg.h>
@@ -306,8 +307,9 @@ static void print_help(FILE *out)
         "       printerctl --version\n"
         "\n"
         "Command-line controller for Marlin-based 3D printers over USB serial.\n"
-        "This build parses commands and resolves configuration, but does not\n"
-        "yet perform any serial or hardware action (see roadmap.md, Milestone 1).\n"
+        "This build parses commands, resolves configuration, and logs activity,\n"
+        "but does not yet perform any serial or hardware action (see roadmap.md,\n"
+        "Milestone 2).\n"
         "\n"
         "Global options (must appear before COMMAND, at most once each):\n"
         "  --port VALUE      Serial device path (default: none)\n"
@@ -347,6 +349,41 @@ static void print_help(FILE *out)
         PRINTERCTL_CONFIG_MIN_TIMEOUT_MS, PRINTERCTL_CONFIG_MAX_TIMEOUT_MS, PRINTERCTL_CONFIG_DEFAULT_TIMEOUT_MS);
 }
 
+/*
+ * Records one ERROR log line for a human-facing error that is reported
+ * before configuration (and therefore `config.verbose`) is known. Uses a
+ * transient logger scoped to `err` because ERROR records are never
+ * filtered by verbosity, so the verbose flag's value cannot matter here.
+ * Best-effort: if logging itself cannot be set up, or the record or the
+ * shutdown flush fails, the human-readable message already printed by the
+ * caller is left as the only record of the failure, and a single brief
+ * warning is emitted so the gap is not silent. Shutdown is always attempted,
+ * even when recording the error failed, so the stream is still flushed.
+ */
+static void log_transient_error(FILE *err, const char *detail)
+{
+    printerctl_logger_t logger;
+    if (printerctl_log_init(&logger, err, false) != PRINTERCTL_LOG_OK) {
+        fprintf(err, "printerctl: warning: failed to record error log\n");
+        return;
+    }
+
+    printerctl_log_status_t record_status = printerctl_log_error(&logger, detail);
+    printerctl_log_status_t shutdown_status = printerctl_log_shutdown(&logger);
+
+    if (record_status != PRINTERCTL_LOG_OK || shutdown_status != PRINTERCTL_LOG_OK) {
+        fprintf(err, "printerctl: warning: failed to record error log\n");
+    }
+}
+
+/* Emits a brief human warning for a non-OK logging status without hiding the caller's primary result. */
+static void warn_on_log_failure(FILE *err, printerctl_log_status_t status, const char *what)
+{
+    if (status != PRINTERCTL_LOG_OK) {
+        fprintf(err, "printerctl: warning: %s\n", what);
+    }
+}
+
 int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
 {
     printerctl_cli_request_t request;
@@ -355,6 +392,7 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
     if (!printerctl_cli_parse(argc, argv, &request, &error)) {
         fprintf(err, "printerctl: %s\n", error.message);
         print_usage_hint(err);
+        log_transient_error(err, error.message);
         return PRINTERCTL_EXIT_USAGE_ERROR;
     }
 
@@ -374,14 +412,53 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
         printerctl_config_resolve(&request.overrides, &config, &config_error);
     if (status != PRINTERCTL_CONFIG_OK) {
         fprintf(err, "printerctl: configuration error: %s\n", config_error.message);
+        /* config_error.message may embed --config's path; the structured log
+         * uses a generic detail so the path is never written to the TSV
+         * stream, only to the human-readable line above. */
+        log_transient_error(err, "configuration error");
         return PRINTERCTL_EXIT_CONFIG_ERROR;
     }
 
     if (request.command_args.command == PRINTERCTL_COMMAND_HOME && !request.command_args.home_confirmed) {
-        fprintf(err,
-            "printerctl: refusing to home without --i-understand-no-endstops "
-            "(endstop sensors are not available; see Agents.md safety policy)\n");
+        static const char *const safety_message =
+            "refusing to home without --i-understand-no-endstops "
+            "(endstop sensors are not available; see Agents.md safety policy)";
+        fprintf(err, "printerctl: %s\n", safety_message);
+        log_transient_error(err, safety_message);
         return PRINTERCTL_EXIT_SAFETY_ERROR;
+    }
+
+    char command_detail[64];
+    snprintf(command_detail, sizeof(command_detail), "command=%s",
+             command_name(request.command_args.command));
+
+    printerctl_logger_t logger;
+    printerctl_log_status_t log_init_status = printerctl_log_init(&logger, err, config.verbose);
+    bool logger_ready = (log_init_status == PRINTERCTL_LOG_OK);
+    if (!logger_ready) {
+        fprintf(err, "printerctl: warning: logging unavailable\n");
+    }
+
+    if (logger_ready) {
+        warn_on_log_failure(err,
+            printerctl_log_record(&logger, PRINTERCTL_LOG_INFO, PRINTERCTL_LOG_EVENT_SESSION_START, NULL),
+            "failed to record session_start log");
+
+        char summary[160];
+        snprintf(summary, sizeof(summary),
+                 "port_set=%s config_file_set=%s baud=%d timeout_ms=%d dry_run=%s verbose=%s",
+                 request.overrides.has_port ? "true" : "false",
+                 request.overrides.has_config_path ? "true" : "false",
+                 config.baud, config.timeout_ms,
+                 config.dry_run ? "true" : "false",
+                 config.verbose ? "true" : "false");
+        warn_on_log_failure(err,
+            printerctl_log_record(&logger, PRINTERCTL_LOG_INFO, PRINTERCTL_LOG_EVENT_CONFIG_SUMMARY, summary),
+            "failed to record config_summary log");
+
+        warn_on_log_failure(err,
+            printerctl_log_record(&logger, PRINTERCTL_LOG_DEBUG, PRINTERCTL_LOG_EVENT_COMMAND_PARSED, command_detail),
+            "failed to record command_parsed log");
     }
 
     fprintf(out,
@@ -392,5 +469,18 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
         config.baud, config.timeout_ms,
         config.dry_run ? "true" : "false",
         config.verbose ? "true" : "false");
+
+    if (logger_ready) {
+        warn_on_log_failure(err,
+            printerctl_log_record(&logger, PRINTERCTL_LOG_WARNING, PRINTERCTL_LOG_EVENT_COMMAND_UNAVAILABLE, command_detail),
+            "failed to record command_unavailable log");
+
+        warn_on_log_failure(err,
+            printerctl_log_record(&logger, PRINTERCTL_LOG_INFO, PRINTERCTL_LOG_EVENT_SESSION_END, NULL),
+            "failed to record session_end log");
+
+        warn_on_log_failure(err, printerctl_log_shutdown(&logger), "failed to shut down logging cleanly");
+    }
+
     return PRINTERCTL_EXIT_UNAVAILABLE;
 }

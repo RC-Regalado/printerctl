@@ -158,6 +158,37 @@ Minimum events:
 - Serial reconnect attempts.
 - APCUPSD events.
 
+**Format (resolved in Milestone 2, see
+[[docs/design/milestone-2-logging]]):** plain TSV, hidden entirely behind
+the `printerctl_logging` API (`include/printerctl/logging.h`,
+`src/logging/logging.c`) — no call site assembles a log line itself. One
+physical line per record:
+
+```text
+<RFC3339 UTC timestamp with milliseconds>\t<LEVEL>\t<event>\t<detail>\n
+```
+
+`detail` is opaque text, not a second key=value grammar; escaping
+(backslash, tab, CR, LF, other control bytes and DEL as visible `\`
+sequences; bytes `>= 0x80` passed through) is centralized in
+`printerctl_log_record()` and is never the caller's responsibility. Levels
+are `DEBUG`/`INFO`/`WARNING`/`ERROR`; `DEBUG` is filtered unless the
+logger was initialized with `verbose = true`, and `ERROR` triggers an
+immediate flush. The Milestone 2 event taxonomy is fixed: `session_start`,
+`session_end`, `config_summary`, `command_parsed`,
+`command_unavailable`, `serial_tx`, `serial_rx`, `state_transition`,
+`progress`, `error`, `warning`. `logging` has no dependency on `cli` or
+`config`; `cli` depends on `logging`. TSV was chosen over JSON Lines
+because Milestone 2 has no real log consumer yet beyond a human reading
+`stderr` — the API shape (hidden format, one narrow entry point) is what
+makes a later switch to JSON Lines a `logging.c`-only change, per the
+design goal already stated below.
+
+**Privacy:** the CLI integration never logs the raw `--port` value, the
+`--config` file path, `print`'s file argument, or `send`'s raw command
+text — only booleans (`port_set`, `config_file_set`) and the command
+name. See [[docs/design/milestone-2-logging]] §13.
+
 Recommended initial format: line-oriented text or JSON Lines. The implementation should hide format details behind a logging API so JSON Lines can become the default without refactoring callers.
 
 ### 6.4 `serial`
@@ -444,7 +475,7 @@ Documentation updates:
 These decisions should be resolved early by Codex before broad implementation:
 
 1. Whether MVP pause/resume/cancel targets only direct Marlin commands, only local streaming sessions, or both.
-2. Whether structured logs default to plain text or JSON Lines.
+2. ~~Whether structured logs default to plain text or JSON Lines.~~ Resolved in Milestone 2: plain TSV, hidden behind the logging API. See [[docs/design/milestone-2-logging]].
 3. Test framework choice for C unit tests.
 4. Maximum G-code line length and command normalization rules.
 5. Whether `send` should block known unsafe commands by default.
@@ -452,3 +483,5 @@ These decisions should be resolved early by Codex before broad implementation:
 
 Resolved decisions are recorded in milestone design notes. Configuration
 path and format were resolved in [[docs/design/milestone-1-cli-config]].
+Logging format and event taxonomy were resolved in
+[[docs/design/milestone-2-logging]].

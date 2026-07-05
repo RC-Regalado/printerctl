@@ -19,6 +19,25 @@ static void check(int condition, const char *description)
     }
 }
 
+/* Counts occurrences of `needle` in `haystack`; both NUL-terminated. */
+static int count_occurrences(const char *haystack, const char *needle)
+{
+    if (haystack == NULL) {
+        return 0;
+    }
+
+    int count = 0;
+    const char *p = haystack;
+    size_t needle_len = strlen(needle);
+
+    while ((p = strstr(p, needle)) != NULL) {
+        count++;
+        p += needle_len;
+    }
+
+    return count;
+}
+
 static int run_cli(int argc, char *argv[], char **out_buf, char **err_buf)
 {
     size_t out_len = 0;
@@ -76,6 +95,7 @@ static void test_help(void)
     check(out != NULL && strstr(out, "position") != NULL, "help documents position");
     check(out != NULL && strstr(out, "info") != NULL, "help documents info");
     check(out != NULL && strstr(out, "Safety:") != NULL, "help documents the home safety policy");
+    check(out != NULL && strstr(out, "Milestone 1") == NULL, "help no longer claims to be Milestone 1");
     check(err != NULL && err[0] == '\0', "help produces no error output");
 
     free(out);
@@ -611,6 +631,179 @@ static void test_parse_direct_contract(void)
           "direct parse leaves options that were not passed with has_*== false");
 }
 
+static void test_help_and_version_produce_no_logs(void)
+{
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"--help"};
+        char *out = NULL;
+        char *err = NULL;
+        run_cli(2, argv, &out, &err);
+        check(err != NULL && err[0] == '\0', "'--help' writes nothing to stderr, including no log lines");
+        free(out);
+        free(err);
+    }
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"--version"};
+        char *out = NULL;
+        char *err = NULL;
+        run_cli(2, argv, &out, &err);
+        check(err != NULL && err[0] == '\0', "'--version' writes nothing to stderr, including no log lines");
+        free(out);
+        free(err);
+    }
+}
+
+static void test_successful_command_logs_session_lifecycle(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(2, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "non-verbose 'pause' still resolves and reports unavailable");
+    check(err != NULL && strstr(err, "\tINFO\tsession_start\t") != NULL, "log includes a session_start line");
+    check(err != NULL && strstr(err, "\tINFO\tconfig_summary\t") != NULL, "log includes a config_summary line");
+    check(err != NULL && strstr(err, "\tWARNING\tcommand_unavailable\tcommand=pause") != NULL,
+          "log includes a command_unavailable line naming the command");
+    check(err != NULL && strstr(err, "\tINFO\tsession_end\t") != NULL, "log includes a session_end line");
+    check(err != NULL && strstr(err, "command_parsed") == NULL,
+          "non-verbose run does not log the DEBUG command_parsed line");
+    check(err != NULL && count_occurrences(err, "\n") == 4, "non-verbose run logs exactly four lines");
+
+    free(out);
+    free(err);
+}
+
+static void test_verbose_adds_command_parsed_log(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--verbose", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "verbose 'pause' still resolves and reports unavailable");
+    check(err != NULL && strstr(err, "\tDEBUG\tcommand_parsed\tcommand=pause") != NULL,
+          "verbose run logs the DEBUG command_parsed line naming the command");
+    check(err != NULL && count_occurrences(err, "\n") == 5, "verbose run logs exactly five lines");
+
+    free(out);
+    free(err);
+}
+
+static void test_config_summary_omits_raw_port_and_config_path(void)
+{
+    char path[64];
+    write_temp_config("baud=57600\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"/dev/ttyACM0",
+                     (char *)"--config", path, (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(6, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "port+config 'pause' still resolves and reports unavailable");
+    check(err != NULL && strstr(err, "port_set=true") != NULL, "config_summary reports port_set=true as a boolean");
+    check(err != NULL && strstr(err, "config_file_set=true") != NULL,
+          "config_summary reports config_file_set=true as a boolean");
+    check(err != NULL && strstr(err, "/dev/ttyACM0") == NULL, "config_summary never contains the raw port value");
+    check(err != NULL && strstr(err, path) == NULL, "config_summary never contains the config file path");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_print_and_send_do_not_leak_content(void)
+{
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"print", (char *)"/tmp/secret-job.gcode"};
+        char *out = NULL;
+        char *err = NULL;
+        run_cli(3, argv, &out, &err);
+        check(err != NULL && strstr(err, "secret-job.gcode") == NULL,
+              "logs never contain the print file path");
+        check(err != NULL && strstr(err, "command=print") != NULL, "logs still name the command as 'print'");
+        free(out);
+        free(err);
+    }
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"send", (char *)"M117 secret payload"};
+        char *out = NULL;
+        char *err = NULL;
+        run_cli(3, argv, &out, &err);
+        check(err != NULL && strstr(err, "secret payload") == NULL, "logs never contain the raw send content");
+        check(err != NULL && strstr(err, "command=send") != NULL, "logs still name the command as 'send'");
+        free(out);
+        free(err);
+    }
+}
+
+static void test_usage_error_adds_single_error_log_line(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--bogus", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "unknown option still exits with usage error");
+    check(err != NULL && count_occurrences(err, "\tERROR\terror\t") == 1,
+          "usage error adds exactly one ERROR log line alongside the human-readable message");
+    check(err != NULL && strstr(err, "--bogus") != NULL, "human-readable usage message is preserved");
+
+    free(out);
+    free(err);
+}
+
+static void test_config_error_adds_single_error_log_line(void)
+{
+    const char *path = "/nonexistent/printerctl.conf";
+    char *argv[] = {(char *)"printerctl", (char *)"--config", (char *)path, (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "missing config file still exits with configuration error");
+    check(err != NULL && count_occurrences(err, "\tERROR\terror\t") == 1,
+          "configuration error adds exactly one ERROR log line alongside the human-readable message");
+    check(err != NULL && strstr(err, "configuration error") != NULL, "human-readable configuration message is preserved");
+    check(err != NULL && count_occurrences(err, path) == 1,
+          "the --config path appears exactly once in stderr, in the human-readable message only");
+
+    if (err != NULL) {
+        const char *error_line = strstr(err, "\tERROR\terror\t");
+        check(error_line != NULL && strstr(error_line, "configuration error") != NULL,
+              "the structured ERROR log line uses the generic 'configuration error' detail");
+        check(error_line != NULL && strstr(error_line, path) == NULL,
+              "the structured ERROR log line never contains the --config path");
+    }
+
+    free(out);
+    free(err);
+}
+
+static void test_safety_error_adds_single_error_log_line(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"home"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(2, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "unconfirmed home still exits with safety error");
+    check(err != NULL && count_occurrences(err, "\tERROR\terror\t") == 1,
+          "safety rejection adds exactly one ERROR log line alongside the human-readable message");
+    check(err != NULL && strstr(err, "i-understand-no-endstops") != NULL,
+          "human-readable safety message is preserved");
+
+    free(out);
+    free(err);
+}
+
 int main(void)
 {
     test_help();
@@ -646,6 +839,14 @@ int main(void)
     test_config_file_duplicate_key();
     test_config_missing_value();
     test_parse_direct_contract();
+    test_help_and_version_produce_no_logs();
+    test_successful_command_logs_session_lifecycle();
+    test_verbose_adds_command_parsed_log();
+    test_config_summary_omits_raw_port_and_config_path();
+    test_print_and_send_do_not_leak_content();
+    test_usage_error_adds_single_error_log_line();
+    test_config_error_adds_single_error_log_line();
+    test_safety_error_adds_single_error_log_line();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

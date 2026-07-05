@@ -6,17 +6,21 @@ Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
 
 ## Status
 
-This repository currently implements Milestone 1 (CLI and configuration);
+This repository currently implements Milestone 2 (Logging Foundation);
 see `roadmap.md` for the milestone plan and
-`docs/milestones/milestone-1.md` / `docs/design/milestone-1-cli-config.md`
-for what this milestone covers and why.
+`docs/milestones/milestone-2.md` / `docs/design/milestone-2-logging.md`
+for what this milestone covers and why (Milestone 1's CLI/config work is
+covered in `docs/milestones/milestone-1.md` /
+`docs/design/milestone-1-cli-config.md`).
 
 The CLI parses the full command grammar and resolves configuration from
-defaults, an optional `--config` file and CLI overrides, but **no serial,
-G-code, Marlin protocol or logging functionality exists yet**. Every valid
-printer command is parsed and its configuration fully resolved, then the
-program reports that execution is not yet implemented (exit code `5`).
-Nothing ever opens a serial device or talks to a printer in this build.
+defaults, an optional `--config` file and CLI overrides, and every command
+invocation now produces structured, timestamped logs on `stderr` (see
+`docs/logging.md`), but **no serial, G-code or Marlin protocol
+functionality exists yet**. Every valid printer command is parsed and its
+configuration fully resolved, then the program reports that execution is
+not yet implemented (exit code `5`). Nothing ever opens a serial device or
+talks to a printer in this build.
 
 ## Requirements
 
@@ -46,9 +50,10 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. Two
-independent test binaries are run: `printerctl_tests` (CLI grammar) and
-`printerctl_config_tests` (configuration module).
+Use `build-clang` instead of `build` if you configured with Clang. Three
+independent test binaries are run: `printerctl_tests` (CLI grammar,
+including its logging integration), `printerctl_config_tests`
+(configuration module) and `printerctl_logging_tests` (logging module).
 
 ## Usage
 
@@ -125,6 +130,16 @@ duplicated key, a malformed line, an invalid or out-of-range value, an
 empty `port` value, or a file that cannot be opened or read is a
 configuration error (exit code `3`). Precedence is: built-in defaults,
 then the config file, then CLI options — CLI options always win.
+
+### Logging
+
+Every command invocation (other than `--help`/`--version`) writes
+structured, timestamped log lines to `stderr`, alongside the existing
+human-readable messages. `--verbose` additionally enables `DEBUG`-level
+records (e.g. `command_parsed`). Logs never include the raw `--port`
+value, the `--config` path, `print`'s file argument or `send`'s raw
+command text — only booleans and the command name. See `docs/logging.md`
+for the full format and event reference.
 
 ## Run
 
