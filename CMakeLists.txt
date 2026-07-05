@@ -18,6 +18,15 @@ configure_file(
     @ONLY
 )
 
+add_library(printerctl_config STATIC
+    src/config/config.c
+)
+
+target_include_directories(printerctl_config
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
 add_library(printerctl_cli STATIC
     src/cli/cli.c
 )
@@ -27,6 +36,8 @@ target_include_directories(printerctl_cli
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
         "${CMAKE_CURRENT_BINARY_DIR}/include"
 )
+
+target_link_libraries(printerctl_cli PUBLIC printerctl_config)
 
 add_executable(printerctl
     src/main.c

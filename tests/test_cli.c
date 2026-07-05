@@ -1,11 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "printerctl/cli.h"
+#include "printerctl/config.h"
 #include "printerctl/version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int g_failures = 0;
 
@@ -32,6 +34,22 @@ static int run_cli(int argc, char *argv[], char **out_buf, char **err_buf)
     return status;
 }
 
+/* Writes `content` to a fresh temp file and returns its path via `path`. */
+static void write_temp_config(const char *content, char *path, size_t path_size)
+{
+    snprintf(path, path_size, "/tmp/printerctl_cli_test_XXXXXX");
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        fprintf(stderr, "FAIL: mkstemp() failed for temp config fixture\n");
+        g_failures++;
+        return;
+    }
+
+    FILE *file = fdopen(fd, "w");
+    fputs(content, file);
+    fclose(file);
+}
+
 static void test_help(void)
 {
     char *argv[] = {(char *)"printerctl", (char *)"--help"};
@@ -42,8 +60,22 @@ static void test_help(void)
 
     check(status == PRINTERCTL_EXIT_OK, "help exits with success status");
     check(out != NULL && strstr(out, "Usage: printerctl") != NULL, "help output includes usage line");
-    check(out != NULL && strstr(out, "--help") != NULL, "help output documents --help");
-    check(out != NULL && strstr(out, "--version") != NULL, "help output documents --version");
+    check(out != NULL && strstr(out, "--port") != NULL, "help documents --port");
+    check(out != NULL && strstr(out, "--baud") != NULL, "help documents --baud");
+    check(out != NULL && strstr(out, "--timeout") != NULL, "help documents --timeout");
+    check(out != NULL && strstr(out, "--dry-run") != NULL, "help documents --dry-run");
+    check(out != NULL && strstr(out, "--verbose") != NULL, "help documents --verbose");
+    check(out != NULL && strstr(out, "--config") != NULL, "help documents --config");
+    check(out != NULL && strstr(out, "print FILE") != NULL, "help documents print");
+    check(out != NULL && strstr(out, "send COMMAND") != NULL, "help documents send");
+    check(out != NULL && strstr(out, "--i-understand-no-endstops") != NULL, "help documents home confirmation flag");
+    check(out != NULL && strstr(out, "pause") != NULL, "help documents pause");
+    check(out != NULL && strstr(out, "resume") != NULL, "help documents resume");
+    check(out != NULL && strstr(out, "cancel") != NULL, "help documents cancel");
+    check(out != NULL && strstr(out, "temp") != NULL, "help documents temp");
+    check(out != NULL && strstr(out, "position") != NULL, "help documents position");
+    check(out != NULL && strstr(out, "info") != NULL, "help documents info");
+    check(out != NULL && strstr(out, "Safety:") != NULL, "help documents the home safety policy");
     check(err != NULL && err[0] == '\0', "help produces no error output");
 
     free(out);
@@ -85,23 +117,22 @@ static void test_missing_command(void)
     free(err);
 }
 
-static void test_unknown_argument(void)
+static void test_unknown_global_option(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"--bogus"};
+    char *argv[] = {(char *)"printerctl", (char *)"--bogus", (char *)"pause"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(2, argv, &out, &err);
+    int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "unknown argument exits with usage error");
-    check(err != NULL && strstr(err, "--bogus") != NULL, "unknown argument error names the argument");
-    check(out != NULL && out[0] == '\0', "unknown argument produces no stdout output");
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "unknown global option exits with usage error");
+    check(err != NULL && strstr(err, "--bogus") != NULL, "unknown option error names the option");
 
     free(out);
     free(err);
 }
 
-static void test_too_many_arguments(void)
+static void test_help_rejects_extra_arguments(void)
 {
     char *argv[] = {(char *)"printerctl", (char *)"--help", (char *)"extra"};
     char *out = NULL;
@@ -109,11 +140,475 @@ static void test_too_many_arguments(void)
 
     int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "extra arguments exit with usage error");
-    check(err != NULL && strstr(err, "too many arguments") != NULL, "extra arguments error is explicit");
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'--help extra' exits with usage error");
+    check(err != NULL && strstr(err, "too many arguments") != NULL, "'--help extra' error is explicit");
 
     free(out);
     free(err);
+}
+
+static void test_equals_form_rejected(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--port=/dev/ttyACM0", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'--option=VALUE' form exits with usage error");
+    check(err != NULL && strstr(err, "--port") != NULL, "'--option=VALUE' error names the option");
+    check(err != NULL && strstr(err, "=") != NULL, "'--option=VALUE' error mentions the unsupported syntax");
+
+    free(out);
+    free(err);
+}
+
+static void test_duplicate_global_option(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"/dev/ttyACM0",
+                     (char *)"--port", (char *)"/dev/ttyACM1", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(6, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "duplicate --port exits with usage error");
+    check(err != NULL && strstr(err, "duplicate") != NULL, "duplicate --port error says 'duplicate'");
+
+    free(out);
+    free(err);
+}
+
+static void test_duplicate_boolean_flag(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"--dry-run", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "duplicate --dry-run exits with usage error");
+    check(err != NULL && strstr(err, "duplicate") != NULL, "duplicate --dry-run error says 'duplicate'");
+
+    free(out);
+    free(err);
+}
+
+static void test_missing_option_value(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--port"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(2, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'--port' with no value exits with usage error");
+    check(err != NULL && strstr(err, "--port") != NULL, "missing value error names the option");
+
+    free(out);
+    free(err);
+}
+
+static void test_port_empty_value(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "empty '--port' value exits with usage error");
+    check(err != NULL && strstr(err, "--port") != NULL, "empty '--port' error names the option");
+
+    free(out);
+    free(err);
+}
+
+static void test_print_empty_file(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"print", (char *)""};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'print' with an empty FILE argument exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+static void test_send_empty_command(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"send", (char *)""};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'send' with an empty COMMAND argument exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+static void test_invalid_baud_value(void)
+{
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"--baud", (char *)"abc", (char *)"pause"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(4, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR, "non-numeric --baud exits with usage error");
+        free(out);
+        free(err);
+    }
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"--baud", (char *)"0", (char *)"pause"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(4, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR, "out-of-range --baud (0) exits with usage error");
+        free(out);
+        free(err);
+    }
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"--baud", (char *)"5000000", (char *)"pause"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(4, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR, "out-of-range --baud (5000000) exits with usage error");
+        free(out);
+        free(err);
+    }
+}
+
+static void test_invalid_timeout_value(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--timeout", (char *)"700000", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "out-of-range --timeout exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+static void test_unknown_command(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"levitate"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(2, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "unknown command exits with usage error");
+    check(err != NULL && strstr(err, "levitate") != NULL, "unknown command error names the command");
+
+    free(out);
+    free(err);
+}
+
+static void test_print_command_unavailable(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"print", (char *)"file.gcode"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "valid 'print' parses and reports unavailable");
+    check(out != NULL && strstr(out, "print") != NULL, "unavailable message names the command");
+    check(out != NULL && strstr(out, "(none)") != NULL, "unavailable message shows the default (empty) port");
+
+    free(out);
+    free(err);
+}
+
+static void test_print_missing_file(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"print"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(2, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'print' with no FILE exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+static void test_print_extra_arguments(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"print", (char *)"a.gcode", (char *)"b.gcode"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'print' with two files exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+static void test_send_command(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"send", (char *)"M115 extra words"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "valid 'send' parses and reports unavailable");
+    check(out != NULL && strstr(out, "send") != NULL, "unavailable message names the command");
+
+    free(out);
+    free(err);
+}
+
+static void test_send_missing_argument(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"send"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(2, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'send' with no COMMAND exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+static void test_home_without_confirmation(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"home"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(2, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "'home' without confirmation exits with safety error");
+    check(err != NULL && strstr(err, "i-understand-no-endstops") != NULL,
+          "safety error mentions the confirmation flag");
+
+    free(out);
+    free(err);
+}
+
+static void test_home_with_confirmation(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"--i-understand-no-endstops"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "confirmed 'home' parses and reports unavailable");
+
+    free(out);
+    free(err);
+}
+
+static void test_home_with_wrong_flag(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"--yes"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'home --yes' exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_home_without_confirmation_still_fails(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"home"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "'--dry-run home' without confirmation still exits with safety error");
+
+    free(out);
+    free(err);
+}
+
+static void test_simple_commands_unavailable(void)
+{
+    const char *commands[] = {"pause", "resume", "cancel", "temp", "position", "info"};
+
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        char *argv[] = {(char *)"printerctl", (char *)commands[i]};
+        char *out = NULL;
+        char *err = NULL;
+
+        int status = run_cli(2, argv, &out, &err);
+
+        check(status == PRINTERCTL_EXIT_UNAVAILABLE, "simple command parses and reports unavailable");
+        check(out != NULL && strstr(out, commands[i]) != NULL, "unavailable message names the command");
+
+        free(out);
+        free(err);
+    }
+}
+
+static void test_global_option_after_command_rejected(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"pause", (char *)"--verbose"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "global option placed after the command exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+static void test_cli_value_equal_to_default(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--baud", (char *)"115200", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "explicit --baud equal to the default still parses successfully");
+    check(out != NULL && strstr(out, "baud=115200") != NULL, "resolved config reflects the explicit default value");
+
+    free(out);
+    free(err);
+}
+
+static void test_config_file_precedence(void)
+{
+    char path[64];
+    write_temp_config("port=/dev/from-file\nbaud=57600\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--config", path,
+                     (char *)"--port", (char *)"/dev/from-cli", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(6, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "valid --config with CLI override parses successfully");
+    check(out != NULL && strstr(out, "port=/dev/from-cli") != NULL, "CLI port overrides the config file port");
+    check(out != NULL && strstr(out, "baud=57600") != NULL, "config file baud is applied when CLI does not override it");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_config_file_not_found(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--config", (char *)"/nonexistent/printerctl.conf", (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "missing --config file exits with configuration error");
+    check(err != NULL && strstr(err, "configuration error") != NULL, "configuration error message is explicit");
+
+    free(out);
+    free(err);
+}
+
+static void test_config_file_invalid(void)
+{
+    char path[64];
+    write_temp_config("baud=not-a-number\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--config", path, (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "invalid --config file exits with configuration error");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_config_file_duplicate_key(void)
+{
+    char path[64];
+    write_temp_config("port=/dev/ttyACM0\nport=/dev/ttyACM1\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--config", path, (char *)"pause"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "--config file with a duplicated key exits with configuration error");
+    check(err != NULL && strstr(err, "duplicated") != NULL, "configuration error mentions the duplicated key");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_config_missing_value(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--config"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(2, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'--config' with no value exits with usage error");
+
+    free(out);
+    free(err);
+}
+
+/*
+ * Exercises printerctl_cli_parse() directly rather than through
+ * printerctl_cli_run(), to verify the pure-parser contract documented in
+ * cli.h: the resolved action/command, overrides (value plus has_* flag) and
+ * that print_file/send_command point straight into argv rather than a copy.
+ */
+static void test_parse_direct_contract(void)
+{
+    char *argv[] = {(char *)"printerctl",
+                     (char *)"--port", (char *)"/dev/ttyACM0",
+                     (char *)"--baud", (char *)"250000",
+                     (char *)"--dry-run",
+                     (char *)"print", (char *)"file.gcode"};
+    int argc = (int)(sizeof(argv) / sizeof(argv[0]));
+
+    printerctl_cli_request_t request;
+    printerctl_cli_error_t error;
+
+    bool ok = printerctl_cli_parse(argc, argv, &request, &error);
+
+    check(ok, "direct parse of a valid invocation succeeds");
+    check(request.action == PRINTERCTL_CLI_ACTION_COMMAND, "direct parse sets action to COMMAND");
+    check(request.command_args.command == PRINTERCTL_COMMAND_PRINT, "direct parse sets command to PRINT");
+    check(request.command_args.print_file == argv[7], "print_file points directly into argv, not a copy");
+    check(request.overrides.has_port && strcmp(request.overrides.port, "/dev/ttyACM0") == 0,
+          "direct parse records the --port override value");
+    check(request.overrides.has_baud && request.overrides.baud == 250000,
+          "direct parse records the --baud override value");
+    check(request.overrides.has_dry_run && request.overrides.dry_run == true,
+          "direct parse records the --dry-run override");
+    check(!request.overrides.has_verbose && !request.overrides.has_timeout && !request.overrides.has_config_path,
+          "direct parse leaves options that were not passed with has_*== false");
 }
 
 int main(void)
@@ -121,8 +616,36 @@ int main(void)
     test_help();
     test_version();
     test_missing_command();
-    test_unknown_argument();
-    test_too_many_arguments();
+    test_unknown_global_option();
+    test_help_rejects_extra_arguments();
+    test_equals_form_rejected();
+    test_duplicate_global_option();
+    test_duplicate_boolean_flag();
+    test_missing_option_value();
+    test_port_empty_value();
+    test_print_empty_file();
+    test_send_empty_command();
+    test_invalid_baud_value();
+    test_invalid_timeout_value();
+    test_unknown_command();
+    test_print_command_unavailable();
+    test_print_missing_file();
+    test_print_extra_arguments();
+    test_send_command();
+    test_send_missing_argument();
+    test_home_without_confirmation();
+    test_home_with_confirmation();
+    test_home_with_wrong_flag();
+    test_dry_run_home_without_confirmation_still_fails();
+    test_simple_commands_unavailable();
+    test_global_option_after_command_rejected();
+    test_cli_value_equal_to_default();
+    test_config_file_precedence();
+    test_config_file_not_found();
+    test_config_file_invalid();
+    test_config_file_duplicate_key();
+    test_config_missing_value();
+    test_parse_direct_contract();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

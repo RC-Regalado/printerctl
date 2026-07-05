@@ -5,3 +5,11 @@ add_executable(printerctl_tests
 target_link_libraries(printerctl_tests PRIVATE printerctl_cli)
 
 add_test(NAME printerctl_tests COMMAND printerctl_tests)
+
+add_executable(printerctl_config_tests
+    test_config.c
+)
+
+target_link_libraries(printerctl_config_tests PRIVATE printerctl_config)
+
+add_test(NAME printerctl_config_tests COMMAND printerctl_config_tests)

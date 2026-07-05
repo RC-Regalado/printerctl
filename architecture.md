@@ -126,11 +126,21 @@ typedef struct {
 } printerctl_config_t;
 ```
 
+Milestone 1 implements only `port`, `baud_rate`, `timeout_ms`, `dry_run`
+and `verbose`. The APCUPSD fields enter the model with Milestone 10, when
+they have a real consumer and tests.
+
 Precedence:
 
 1. Built-in safe defaults.
 2. Configuration file.
 3. CLI options.
+
+Configuration files are loaded only through an explicit `--config PATH`.
+The Milestone 1 format is root-level `key=value`, with blank lines and
+full-line `#` comments allowed. Recognized keys are `port`, `baud`,
+`timeout`, `dry_run` and `verbose`; unknown or duplicate keys fail. See
+[[docs/design/milestone-1-cli-config]] for the complete contract.
 
 ### 6.3 `logging`
 
@@ -352,6 +362,16 @@ Recommended categories:
 
 No silent failures are allowed. Every failure should produce an operator-facing message and a log entry when logging is active.
 
+Milestone 1 defines the initial process exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `2` | CLI usage error |
+| `3` | Configuration error |
+| `4` | Safety policy rejection |
+| `5` | Valid request whose execution is not available yet |
+
 ## 10. Testing Architecture
 
 Primary tests must not require printer motion.
@@ -425,8 +445,10 @@ These decisions should be resolved early by Codex before broad implementation:
 
 1. Whether MVP pause/resume/cancel targets only direct Marlin commands, only local streaming sessions, or both.
 2. Whether structured logs default to plain text or JSON Lines.
-3. Exact configuration file path and format.
-4. Test framework choice for C unit tests.
-5. Maximum G-code line length and command normalization rules.
-6. Whether `send` should block known unsafe commands by default.
-7. Whether a future daemon mode is required for external pause/resume/cancel of active prints.
+3. Test framework choice for C unit tests.
+4. Maximum G-code line length and command normalization rules.
+5. Whether `send` should block known unsafe commands by default.
+6. Whether a future daemon mode is required for external pause/resume/cancel of active prints.
+
+Resolved decisions are recorded in milestone design notes. Configuration
+path and format were resolved in [[docs/design/milestone-1-cli-config]].
