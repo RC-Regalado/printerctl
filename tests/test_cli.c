@@ -786,6 +786,240 @@ static void test_config_error_adds_single_error_log_line(void)
     free(err);
 }
 
+/* Writes `content` to a fresh temp G-code file and returns its path via `path`. */
+static void write_temp_gcode(const char *content, char *path, size_t path_size)
+{
+    snprintf(path, path_size, "/tmp/printerctl_cli_gcode_XXXXXX");
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        fprintf(stderr, "FAIL: mkstemp() failed for temp G-code fixture\n");
+        g_failures++;
+        return;
+    }
+
+    FILE *file = fdopen(fd, "w");
+    fputs(content, file);
+    fclose(file);
+}
+
+static void test_dry_run_print_success(void)
+{
+    char path[64];
+    write_temp_gcode("; header\nG21\nG90 ; absolute\n\nM104 S200\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "a clean dry-run print exits with success");
+    check(out != NULL && strstr(out, "dry run") != NULL, "dry-run output announces the dry run");
+    check(out != NULL && strstr(out, "G21") != NULL, "dry-run output lists the first command");
+    check(out != NULL && strstr(out, "G90") != NULL, "dry-run output lists a comment-stripped command");
+    check(out != NULL && strstr(out, "M104 S200") != NULL, "dry-run output lists the last command");
+    check(out != NULL && strstr(out, "absolute") == NULL, "dry-run output strips inline comments");
+    check(out != NULL && strstr(out, "line 2") != NULL, "dry-run output reports source line numbers");
+    check(out != NULL && strstr(out, "100%") != NULL, "dry-run output reports progress reaching 100%");
+    check(out != NULL && strstr(out, "3 command(s)") != NULL, "dry-run summary counts the commands");
+
+    check(err != NULL && strstr(err, "\tINFO\tstate_transition\tstate=dry_run_print_started") != NULL,
+          "log includes the dry-run start state transition");
+    check(err != NULL && strstr(err, "\tINFO\tprogress\tcommands=3 lines=5 percent=100") != NULL,
+          "log includes the summarizing INFO progress record");
+    check(err != NULL && strstr(err, "state=dry_run_print_completed status=ok") != NULL,
+          "log includes the dry-run completion state transition");
+    check(err != NULL && strstr(err, path) == NULL, "logs never contain the G-code file path");
+    check(err != NULL && strstr(err, "M104") == NULL, "logs never contain G-code command text");
+    check(err != NULL && strstr(err, "command_unavailable") == NULL,
+          "a dry-run print is not reported as unavailable");
+    check(err != NULL && strstr(err, "\tINFO\tsession_end\t") != NULL, "session_end is still logged");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_print_verbose_logs_per_command_progress(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG90\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"--verbose", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(5, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "a verbose dry-run print exits with success");
+    check(err != NULL && count_occurrences(err, "\tDEBUG\tprogress\t") == 2,
+          "verbose dry run logs one DEBUG progress record per command");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_print_non_verbose_omits_per_command_progress(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG90\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    run_cli(4, argv, &out, &err);
+
+    check(err != NULL && count_occurrences(err, "\tDEBUG\t") == 0,
+          "non-verbose dry run logs no DEBUG records");
+    check(err != NULL && count_occurrences(err, "\tINFO\tprogress\t") == 1,
+          "non-verbose dry run still logs the one summarizing progress record");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_print_empty_file(void)
+{
+    char path[64];
+    write_temp_gcode("", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "a dry run of an empty file exits with success");
+    check(out != NULL && strstr(out, "0 command(s)") != NULL, "empty-file dry-run summary reports zero commands");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_print_unsafe_g28(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG28\nG90\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "a G-code file containing G28 exits with the safety error code");
+    check(err != NULL && strstr(err, "G28") != NULL, "the G28 rejection message names the command");
+    check(err != NULL && strstr(err, "line 2") != NULL, "the G28 rejection message names the source line");
+    check(err != NULL && count_occurrences(err, "\tERROR\terror\t") == 1,
+          "the G28 rejection adds exactly one ERROR log line");
+    check(err != NULL && strstr(err, "status=unsafe_g28") != NULL,
+          "the structured ERROR record carries the unsafe_g28 status");
+    check(err != NULL && strstr(err, "state=dry_run_print_failed") != NULL,
+          "the failed dry run logs its state transition");
+    check(err != NULL && strstr(err, path) == NULL, "logs never contain the G-code file path");
+    check(out != NULL && strstr(out, "G21") != NULL, "commands before the G28 line were still reported");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_print_missing_file(void)
+{
+    const char *path = "/nonexistent/printerctl-job.gcode";
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"print", (char *)path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_GCODE_ERROR, "a missing G-code file exits with the G-code error code");
+    check(err != NULL && strstr(err, "dry run failed") != NULL, "the missing-file message is explicit");
+    check(err != NULL && count_occurrences(err, path) == 1,
+          "the file path appears exactly once in stderr, in the human-readable message only");
+
+    if (err != NULL) {
+        const char *error_line = strstr(err, "\tERROR\terror\t");
+        check(error_line != NULL && strstr(error_line, "status=open_failed") != NULL,
+              "the structured ERROR record carries the open_failed status");
+        check(error_line != NULL && strstr(error_line, path) == NULL,
+              "the structured ERROR record never contains the file path");
+    }
+
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_print_malformed_file(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG1 (never closed\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_GCODE_ERROR, "a malformed G-code file exits with the G-code error code");
+    check(err != NULL && strstr(err, "line 2") != NULL, "the malformed-file message names the source line");
+    check(err != NULL && strstr(err, "status=malformed") != NULL,
+          "the structured ERROR record carries the malformed status");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_print_without_dry_run_is_still_unavailable(void)
+{
+    char path[64];
+    write_temp_gcode("G21\n", path, sizeof(path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE,
+          "'print' without --dry-run still reports unavailable, even for a readable file");
+    check(out != NULL && strstr(out, "not yet implemented") != NULL,
+          "non-dry-run print keeps the unavailable message");
+    check(out != NULL && strstr(out, "G21") == NULL, "non-dry-run print does not parse the file");
+
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_from_config_file_enables_dry_run_print(void)
+{
+    char gcode_path[64];
+    write_temp_gcode("G21\n", gcode_path, sizeof(gcode_path));
+
+    char config_path[64];
+    write_temp_config("dry_run=true\n", config_path, sizeof(config_path));
+
+    char *argv[] = {(char *)"printerctl", (char *)"--config", config_path, (char *)"print", gcode_path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(5, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "dry_run=true from the config file enables the dry-run print path");
+    check(out != NULL && strstr(out, "G21") != NULL, "config-enabled dry run parses the file");
+
+    remove(gcode_path);
+    remove(config_path);
+    free(out);
+    free(err);
+}
+
 static void test_safety_error_adds_single_error_log_line(void)
 {
     char *argv[] = {(char *)"printerctl", (char *)"home"};
@@ -847,6 +1081,15 @@ int main(void)
     test_usage_error_adds_single_error_log_line();
     test_config_error_adds_single_error_log_line();
     test_safety_error_adds_single_error_log_line();
+    test_dry_run_print_success();
+    test_dry_run_print_verbose_logs_per_command_progress();
+    test_dry_run_print_non_verbose_omits_per_command_progress();
+    test_dry_run_print_empty_file();
+    test_dry_run_print_unsafe_g28();
+    test_dry_run_print_missing_file();
+    test_dry_run_print_malformed_file();
+    test_print_without_dry_run_is_still_unavailable();
+    test_dry_run_from_config_file_enables_dry_run_print();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

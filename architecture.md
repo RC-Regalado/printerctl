@@ -267,6 +267,29 @@ Responsibilities:
 - Detect lines that exceed configured limits.
 - Reject or flag disabled unsafe commands, especially `G28` unless explicitly confirmed.
 
+**Milestone 3 resolution:** `gcode` is implemented as a streaming file
+reader with no serial dependency. It accepts regular files only, snapshots
+the opened file identity/size/mtime with `fstat()`, and fails if the file
+changes while being read. Normalization is intentionally small:
+
+- skip a leading UTF-8 BOM only at byte 0;
+- strip full-line and inline `;` comments;
+- strip parenthesized comments, including nested parentheses up to depth 8;
+- trim leading/trailing spaces and tabs;
+- ignore blank/comment-only lines;
+- reject control bytes other than tab, oversized source lines, unmatched or
+  unterminated parenthesized comments, and unexpected BOM bytes later in the
+  file.
+
+`PRINTERCTL_GCODE_LINE_MAX` is `4096` content bytes excluding the newline.
+Progress is computed as floored whole-percent byte progress
+(`bytes_consumed / file_size`) from the open-time file size snapshot, with
+empty files treated as complete. `G28` detection is case-insensitive,
+allows an optional leading `N<digits>` line word, accepts `G 28`/`G028`
+forms, and blocks any `G28` suffix conservatively unless the reader is
+opened with `allow_g28 = true`. The CLI dry-run print path always opens
+with `allow_g28 = false`; `print` has no confirmation flag in Milestone 3.
+
 ### 6.7 `printer`
 
 Coordinates high-level printer sessions and maps user commands to Marlin commands.
@@ -402,6 +425,7 @@ Milestone 1 defines the initial process exit codes:
 | `3` | Configuration error |
 | `4` | Safety policy rejection |
 | `5` | Valid request whose execution is not available yet |
+| `6` | G-code file error |
 
 ## 10. Testing Architecture
 
@@ -477,7 +501,7 @@ These decisions should be resolved early by Codex before broad implementation:
 1. Whether MVP pause/resume/cancel targets only direct Marlin commands, only local streaming sessions, or both.
 2. ~~Whether structured logs default to plain text or JSON Lines.~~ Resolved in Milestone 2: plain TSV, hidden behind the logging API. See [[docs/design/milestone-2-logging]].
 3. Test framework choice for C unit tests.
-4. Maximum G-code line length and command normalization rules.
+4. ~~Maximum G-code line length and command normalization rules.~~ Resolved in Milestone 3: 4096-byte source-line limit and the normalization contract in [[docs/design/milestone-3-gcode-dry-run]].
 5. Whether `send` should block known unsafe commands by default.
 6. Whether a future daemon mode is required for external pause/resume/cancel of active prints.
 
@@ -485,3 +509,5 @@ Resolved decisions are recorded in milestone design notes. Configuration
 path and format were resolved in [[docs/design/milestone-1-cli-config]].
 Logging format and event taxonomy were resolved in
 [[docs/design/milestone-2-logging]].
+G-code normalization, unsafe `G28` detection and dry-run progress were
+resolved in [[docs/design/milestone-3-gcode-dry-run]].

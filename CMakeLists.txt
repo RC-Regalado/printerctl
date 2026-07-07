@@ -36,6 +36,17 @@ target_include_directories(printerctl_logging
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+add_library(printerctl_gcode STATIC
+    src/gcode/gcode.c
+)
+
+target_include_directories(printerctl_gcode
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_gcode PUBLIC m)
+
 add_library(printerctl_cli STATIC
     src/cli/cli.c
 )
@@ -46,7 +57,7 @@ target_include_directories(printerctl_cli
         "${CMAKE_CURRENT_BINARY_DIR}/include"
 )
 
-target_link_libraries(printerctl_cli PUBLIC printerctl_config printerctl_logging)
+target_link_libraries(printerctl_cli PUBLIC printerctl_config printerctl_logging printerctl_gcode)
 
 add_executable(printerctl
     src/main.c

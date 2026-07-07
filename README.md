@@ -6,21 +6,19 @@ Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
 
 ## Status
 
-This repository currently implements Milestone 2 (Logging Foundation);
+This repository currently implements Milestone 3 (G-code Parser and Dry Run);
 see `roadmap.md` for the milestone plan and
-`docs/milestones/milestone-2.md` / `docs/design/milestone-2-logging.md`
-for what this milestone covers and why (Milestone 1's CLI/config work is
-covered in `docs/milestones/milestone-1.md` /
-`docs/design/milestone-1-cli-config.md`).
+`docs/milestones/milestone-3.md` /
+`docs/design/milestone-3-gcode-dry-run.md` for what this milestone covers
+and why.
 
 The CLI parses the full command grammar and resolves configuration from
 defaults, an optional `--config` file and CLI overrides, and every command
 invocation now produces structured, timestamped logs on `stderr` (see
-`docs/logging.md`), but **no serial, G-code or Marlin protocol
-functionality exists yet**. Every valid printer command is parsed and its
-configuration fully resolved, then the program reports that execution is
-not yet implemented (exit code `5`). Nothing ever opens a serial device or
-talks to a printer in this build.
+`docs/logging.md`). `--dry-run print FILE` now parses and normalizes the
+G-code file, reports commands and byte progress, and never opens a serial
+device. No non-dry-run serial or Marlin protocol functionality exists yet;
+those valid commands still exit `5`.
 
 ## Requirements
 
@@ -50,10 +48,11 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. Three
+Use `build-clang` instead of `build` if you configured with Clang. Four
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 including its logging integration), `printerctl_config_tests`
-(configuration module) and `printerctl_logging_tests` (logging module).
+(configuration module), `printerctl_gcode_tests` (G-code reader) and
+`printerctl_logging_tests` (logging module).
 
 ## Usage
 
@@ -78,6 +77,7 @@ at most once each):
 Commands:
 
 ```bash
+printerctl --dry-run print file.gcode
 printerctl print file.gcode
 printerctl send "M115"
 printerctl home --i-understand-no-endstops
@@ -96,8 +96,15 @@ as a usage error (exit code `2`).
 given explicitly, because endstop sensors are not available on the target
 printer. This applies even under `--dry-run`.
 
-Every other valid command parses successfully, resolves configuration, and
-then exits `5` because execution is not implemented yet in this build.
+`--dry-run print FILE` exits `0` when the file parses cleanly and writes
+the normalized command stream with source line numbers and whole-percent
+progress. It strips comments and blank lines, rejects malformed or
+oversized lines with exit code `6`, and rejects `G28` with exit code `4`.
+No serial device is opened.
+
+Every non-dry-run valid command parses successfully, resolves
+configuration, and then exits `5` because serial execution is not
+implemented yet in this build.
 
 ### Exit codes
 
@@ -108,6 +115,7 @@ then exits `5` because execution is not implemented yet in this build.
 | `3` | Configuration error |
 | `4` | Safety policy rejection |
 | `5` | Parsed and resolved successfully, but not yet available |
+| `6` | G-code file error |
 
 ### Configuration file
 

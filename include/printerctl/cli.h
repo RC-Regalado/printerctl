@@ -16,6 +16,7 @@
 #define PRINTERCTL_EXIT_CONFIG_ERROR 3
 #define PRINTERCTL_EXIT_SAFETY_ERROR 4
 #define PRINTERCTL_EXIT_UNAVAILABLE 5
+#define PRINTERCTL_EXIT_GCODE_ERROR 6
 
 #define PRINTERCTL_CLI_ERROR_MAX 256
 
@@ -91,9 +92,20 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * Composition entry point used by main(): parses argv, resolves
  * configuration (defaults, optional --config file, then CLI overrides),
  * enforces the `home` safety confirmation, renders human-readable output to
- * `out`/`err` and returns the process exit code. No printer command is
- * actually executed in Milestone 1; a successfully parsed and resolved
- * printer command always ends in PRINTERCTL_EXIT_UNAVAILABLE.
+ * `out`/`err` and returns the process exit code.
+ *
+ * As of Milestone 3, `print FILE` under --dry-run (from the CLI flag or
+ * the config file) is the first command with a real execution path: the
+ * G-code file is parsed and normalized via printerctl_gcode, each command
+ * that would be sent is written to `out` with its source line number and
+ * progress, and no serial device is ever opened. A clean dry run exits
+ * PRINTERCTL_EXIT_OK; a file containing G28 exits
+ * PRINTERCTL_EXIT_SAFETY_ERROR (never confirmable from `print` in this
+ * milestone); any other G-code file problem (unreadable, not a regular
+ * file, oversized line, malformed line, I/O error, file changed while
+ * being read) exits PRINTERCTL_EXIT_GCODE_ERROR. Every other successfully
+ * parsed and resolved printer command — including `print` without
+ * --dry-run — still ends in PRINTERCTL_EXIT_UNAVAILABLE.
  */
 int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err);
 
