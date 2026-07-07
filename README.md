@@ -6,19 +6,24 @@ Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
 
 ## Status
 
-This repository currently implements Milestone 3 (G-code Parser and Dry Run);
+This repository currently implements Milestone 4 (Marlin Response Parser);
 see `roadmap.md` for the milestone plan and
+`docs/milestones/milestone-4.md` /
+`docs/design/milestone-4-marlin.md` for what this milestone covers and
+why (Milestone 3's G-code/dry-run work is covered in
 `docs/milestones/milestone-3.md` /
-`docs/design/milestone-3-gcode-dry-run.md` for what this milestone covers
-and why.
+`docs/design/milestone-3-gcode-dry-run.md`).
 
 The CLI parses the full command grammar and resolves configuration from
 defaults, an optional `--config` file and CLI overrides, and every command
 invocation now produces structured, timestamped logs on `stderr` (see
-`docs/logging.md`). `--dry-run print FILE` now parses and normalizes the
+`docs/logging.md`). `--dry-run print FILE` parses and normalizes the
 G-code file, reports commands and byte progress, and never opens a serial
-device. No non-dry-run serial or Marlin protocol functionality exists yet;
-those valid commands still exit `5`.
+device. The Marlin response parser (`printerctl_marlin`) classifies
+`ok`/`Error:`/`busy:`/`echo:`/`Resend:` lines and decodes temperature,
+position and firmware-info reports, but nothing feeds it real printer
+output yet: no serial functionality exists, and non-dry-run commands
+still exit `5`.
 
 ## Requirements
 
@@ -48,10 +53,11 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. Four
+Use `build-clang` instead of `build` if you configured with Clang. Five
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 including its logging integration), `printerctl_config_tests`
-(configuration module), `printerctl_gcode_tests` (G-code reader) and
+(configuration module), `printerctl_gcode_tests` (G-code reader),
+`printerctl_marlin_tests` (Marlin response parser) and
 `printerctl_logging_tests` (logging module).
 
 ## Usage

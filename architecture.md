@@ -253,6 +253,15 @@ Future behavior:
 - Add checksums.
 - Retry from requested line after `Resend:`.
 
+**Milestone 4 resolution:** `marlin` is implemented as a pure parser
+library with no serial, CLI, config, logging or G-code dependency. It
+classifies one newline-stripped response line as `ACK`, `ERROR`, `BUSY`,
+`ECHO`, `RESEND` or `INFO`. `ACK`, `ERROR` and `RESEND` are terminal for
+the current command; `BUSY`, `ECHO` and `INFO` are non-terminal. `Resend:`
+is terminal-unsupported for the MVP because line numbering/checksums are
+not implemented yet. Typed parsers decode M105 temperature, M114 logical
+position and M115 firmware info reports for Milestone 6 renderers.
+
 ### 6.6 `gcode`
 
 Reads, validates and normalizes G-code files.

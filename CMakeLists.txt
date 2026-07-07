@@ -47,6 +47,15 @@ target_include_directories(printerctl_gcode
 
 target_link_libraries(printerctl_gcode PUBLIC m)
 
+add_library(printerctl_marlin STATIC
+    src/marlin/marlin.c
+)
+
+target_include_directories(printerctl_marlin
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
 add_library(printerctl_cli STATIC
     src/cli/cli.c
 )
