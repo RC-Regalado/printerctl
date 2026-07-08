@@ -6,27 +6,26 @@ Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
 
 ## Status
 
-This repository currently implements Milestone 5 (Serial Transport);
+This repository currently implements Milestone 6 (Single Marlin Commands);
 see `roadmap.md` for the milestone plan and
-`docs/milestones/milestone-5.md` /
-`docs/design/milestone-5-serial.md` for what this milestone covers and
-why (earlier milestones are covered by their own reports under
-`docs/milestones/`).
+`docs/milestones/milestone-6.md` /
+`docs/design/milestone-6-printer-commands.md` for what this milestone
+covers and why (earlier milestones are covered by their own reports
+under `docs/milestones/`).
 
 The CLI parses the full command grammar and resolves configuration from
 defaults, an optional `--config` file and CLI overrides, and every command
-invocation now produces structured, timestamped logs on `stderr` (see
-`docs/logging.md`). `--dry-run print FILE` parses and normalizes the
-G-code file, reports commands and byte progress, and never opens a serial
-device. The Marlin response parser (`printerctl_marlin`) classifies
-`ok`/`Error:`/`busy:`/`echo:`/`Resend:` lines and decodes temperature,
-position and firmware-info reports. The serial transport
-(`printerctl_serial`) opens a terminal device in raw 8N1 mode and
-exchanges timeout-bounded command/response lines, validated against
-pseudo-terminals. The pieces are not composed yet: no CLI command opens
-a serial port, and non-dry-run commands still exit `5` until
-Milestone 6 wires `serial` + `marlin` + `logging` into `temp`,
-`position`, `info` and `send`.
+invocation produces structured, timestamped logs on `stderr` (see
+`docs/logging.md`). `temp`, `position`, `info` and `send COMMAND` now
+talk to the printer over the configured `--port`: one command is
+transmitted, response lines are read until Marlin's terminal reply
+(waiting out `busy:`/`echo:` keepalives), and the result is rendered
+human-readably. `send` refuses G28 with no bypass; the operator's
+explicit `M112` passes through. `--dry-run print FILE` parses and
+normalizes the G-code file, reports commands and byte progress, and
+never opens a serial device; `--dry-run` with a single command prints
+the line it would transmit and exits `0`. Streaming (`print` without
+`--dry-run`), `home`, `pause`, `resume` and `cancel` still exit `5`.
 
 ## Requirements
 
@@ -56,13 +55,15 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. Six
+Use `build-clang` instead of `build` if you configured with Clang. Seven
 independent test binaries are run: `printerctl_tests` (CLI grammar,
-including its logging integration), `printerctl_config_tests`
-(configuration module), `printerctl_gcode_tests` (G-code reader),
-`printerctl_marlin_tests` (Marlin response parser),
-`printerctl_serial_tests` (serial transport over pseudo-terminals) and
-`printerctl_logging_tests` (logging module).
+logging integration and end-to-end commands against forked mock
+printers), `printerctl_config_tests` (configuration module),
+`printerctl_gcode_tests` (G-code reader), `printerctl_marlin_tests`
+(Marlin response parser), `printerctl_serial_tests` (serial transport
+over pseudo-terminals), `printerctl_printer_tests` (printer session
+against scripted mock printers) and `printerctl_logging_tests`
+(logging module).
 
 ## Usage
 
@@ -112,9 +113,13 @@ progress. It strips comments and blank lines, rejects malformed or
 oversized lines with exit code `6`, and rejects `G28` with exit code `4`.
 No serial device is opened.
 
-Every non-dry-run valid command parses successfully, resolves
-configuration, and then exits `5` because serial execution is not
-implemented yet in this build.
+`temp`, `position`, `info` and `send COMMAND` require a configured port
+(`--port` or the config file; exit code `3` otherwise), transmit their
+Marlin command (`M105`, `M114`, `M115`, or the raw text), wait for the
+terminal reply and render it. `send` refuses `G28` (exit code `4`, no
+bypass). Under `--dry-run` they print the line they would send and exit
+`0` without touching any device. `print` without `--dry-run`, `home`,
+`pause`, `resume` and `cancel` still exit `5`.
 
 ### Exit codes
 
@@ -126,6 +131,8 @@ implemented yet in this build.
 | `4` | Safety policy rejection |
 | `5` | Parsed and resolved successfully, but not yet available |
 | `6` | G-code file error |
+| `7` | Communication error (cannot open port, I/O failure, timeout) |
+| `8` | Printer error (`Error:`/`Resend:` reply, or missing report) |
 
 ### Configuration file
 
@@ -154,10 +161,13 @@ then the config file, then CLI options — CLI options always win.
 Every command invocation (other than `--help`/`--version`) writes
 structured, timestamped log lines to `stderr`, alongside the existing
 human-readable messages. `--verbose` additionally enables `DEBUG`-level
-records (e.g. `command_parsed`). Logs never include the raw `--port`
-value, the `--config` path, `print`'s file argument or `send`'s raw
-command text — only booleans and the command name. See `docs/logging.md`
-for the full format and event reference.
+records: `command_parsed`, and for the printer commands the full wire
+exchange as `serial_tx`/`serial_rx` records. Logs never include the raw
+`--port` value, the `--config` path or `print`'s file argument; the
+`command_parsed`/`command_unavailable` events carry only the command
+name (never `send`'s text — the wire exchange is visible only through
+the `serial_tx`/`serial_rx` records under `--verbose`). See
+`docs/logging.md` for the full format and event reference.
 
 ## Run
 
@@ -165,8 +175,11 @@ for the full format and event reference.
 ./build/printerctl --help
 ./build/printerctl --version
 ./build/printerctl --dry-run print file.gcode
+./build/printerctl --port /dev/ttyACM0 temp
+./build/printerctl --port /dev/ttyACM0 position
+./build/printerctl --port /dev/ttyACM0 info
+./build/printerctl --port /dev/ttyACM0 send "M115"
 ./build/printerctl home
-./build/printerctl home --i-understand-no-endstops
 ```
 
 ## Versioning

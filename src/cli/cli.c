@@ -1,6 +1,7 @@
 #include "printerctl/cli.h"
 #include "printerctl/gcode.h"
 #include "printerctl/logging.h"
+#include "printerctl/printer.h"
 #include "printerctl/version.h"
 
 #include <stdarg.h>
@@ -308,10 +309,11 @@ static void print_help(FILE *out)
         "       printerctl --version\n"
         "\n"
         "Command-line controller for Marlin-based 3D printers over USB serial.\n"
-        "This build parses commands, resolves configuration, and logs activity.\n"
-        "'--dry-run print FILE' parses and normalizes the G-code file without\n"
-        "opening any serial device (Milestone 3); no other command performs a\n"
-        "serial or hardware action yet (see roadmap.md).\n"
+        "'temp', 'position', 'info' and 'send' talk to the printer over the\n"
+        "configured --port (Milestone 6). '--dry-run print FILE' parses and\n"
+        "normalizes the G-code file without opening any serial device\n"
+        "(Milestone 3). Streaming ('print' without --dry-run), 'home', 'pause',\n"
+        "'resume' and 'cancel' are not implemented yet (see roadmap.md).\n"
         "\n"
         "Global options (must appear before COMMAND, at most once each):\n"
         "  --port VALUE      Serial device path (default: none)\n"
@@ -342,15 +344,19 @@ static void print_help(FILE *out)
         "  because endstop sensors are not available on this printer. This applies\n"
         "  even in --dry-run mode: home is never confirmed implicitly.\n"
         "  A G-code file containing G28 always fails 'print' (exit code 4);\n"
-        "  'print' has no confirmation flag.\n"
+        "  'print' has no confirmation flag. 'send' refuses G28 the same way,\n"
+        "  with no bypass; every other command passes through, including the\n"
+        "  operator's explicit emergency stop (M112).\n"
         "\n"
         "Exit codes:\n"
         "  0  success (including --help/--version and a clean dry run)\n"
         "  2  usage error\n"
-        "  3  configuration error\n"
-        "  4  safety policy rejection (including G28 found in a G-code file)\n"
+        "  3  configuration error (including no --port for a printer command)\n"
+        "  4  safety policy rejection (G28 in a G-code file or via send)\n"
         "  5  parsed successfully but not yet available in this build\n"
-        "  6  G-code file error (unreadable, malformed, oversized line, ...)\n",
+        "  6  G-code file error (unreadable, malformed, oversized line, ...)\n"
+        "  7  communication error (cannot open port, I/O failure, timeout)\n"
+        "  8  printer error (Error:/Resend: reply, or missing report)\n",
         PRINTERCTL_CONFIG_MIN_BAUD, PRINTERCTL_CONFIG_MAX_BAUD, PRINTERCTL_CONFIG_DEFAULT_BAUD,
         PRINTERCTL_CONFIG_MIN_TIMEOUT_MS, PRINTERCTL_CONFIG_MAX_TIMEOUT_MS, PRINTERCTL_CONFIG_DEFAULT_TIMEOUT_MS);
 }
@@ -532,6 +538,194 @@ static int run_dry_run_print(const char *path, printerctl_logger_t *logger,
         : PRINTERCTL_EXIT_GCODE_ERROR;
 }
 
+static const char *printer_status_name(printerctl_printer_status_t status)
+{
+    switch (status) {
+    case PRINTERCTL_PRINTER_OK: return "ok";
+    case PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT: return "invalid_argument";
+    case PRINTERCTL_PRINTER_ERR_NOT_CONNECTED: return "not_connected";
+    case PRINTERCTL_PRINTER_ERR_NO_PORT: return "no_port";
+    case PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND: return "unsafe_command";
+    case PRINTERCTL_PRINTER_ERR_SERIAL: return "serial";
+    case PRINTERCTL_PRINTER_ERR_TIMEOUT: return "timeout";
+    case PRINTERCTL_PRINTER_ERR_PRINTER_ERROR: return "printer_error";
+    case PRINTERCTL_PRINTER_ERR_RESEND: return "resend";
+    case PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE: return "unexpected_response";
+    }
+    return "unknown";
+}
+
+static int printer_status_to_exit_code(printerctl_printer_status_t status)
+{
+    switch (status) {
+    case PRINTERCTL_PRINTER_OK:
+        return PRINTERCTL_EXIT_OK;
+    case PRINTERCTL_PRINTER_ERR_NO_PORT:
+        return PRINTERCTL_EXIT_CONFIG_ERROR;
+    case PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND:
+        return PRINTERCTL_EXIT_SAFETY_ERROR;
+    case PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT:
+    case PRINTERCTL_PRINTER_ERR_NOT_CONNECTED:
+        return PRINTERCTL_EXIT_USAGE_ERROR;
+    case PRINTERCTL_PRINTER_ERR_SERIAL:
+    case PRINTERCTL_PRINTER_ERR_TIMEOUT:
+        return PRINTERCTL_EXIT_COMM_ERROR;
+    case PRINTERCTL_PRINTER_ERR_PRINTER_ERROR:
+    case PRINTERCTL_PRINTER_ERR_RESEND:
+    case PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE:
+        return PRINTERCTL_EXIT_PRINTER_ERROR;
+    }
+    return PRINTERCTL_EXIT_COMM_ERROR;
+}
+
+/*
+ * Reports a failed printer exchange: the human-readable message (which
+ * may embed the port path, so it stays out of the structured log) to
+ * `err`, and one generic ERROR record naming only the command and the
+ * status, matching the Milestone 3 pattern for gcode failures.
+ */
+static void report_printer_failure(FILE *err, printerctl_logger_t *logger, bool logger_ready,
+                                    const char *command_name_text,
+                                    printerctl_printer_status_t status,
+                                    const printerctl_printer_error_t *error)
+{
+    fprintf(err, "printerctl: %s\n", error->message);
+
+    if (logger_ready) {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "command=%s status=%s",
+                 command_name_text, printer_status_name(status));
+        warn_on_log_failure(err, printerctl_log_error(logger, detail),
+            "failed to record error log");
+    }
+}
+
+/* stdout renderer for `send`: every received line, prefixed to read as an exchange. */
+static void render_received_line(const char *line, void *context)
+{
+    FILE *out = context;
+    fprintf(out, "< %s\n", line);
+}
+
+/*
+ * Milestone 6 execution of temp/position/info/send: connect, run the
+ * one exchange, render, disconnect. The session lives entirely inside
+ * this call; the port is always closed before returning, on success and
+ * on failure.
+ */
+static int run_single_command(const printerctl_command_args_t *args,
+                               const printerctl_config_t *config,
+                               printerctl_logger_t *logger, bool logger_ready,
+                               FILE *out, FILE *err)
+{
+    const char *name = command_name(args->command);
+
+    if (args->command == PRINTERCTL_COMMAND_SEND &&
+        printerctl_gcode_command_is_unsafe_g28(args->send_command)) {
+        static const char *const safety_message =
+            "refusing to send G28: homing is disabled because endstop sensors "
+            "are not available (see the safety policy in Agents.md)";
+        fprintf(err, "printerctl: %s\n", safety_message);
+        if (logger_ready) {
+            warn_on_log_failure(err, printerctl_log_error(logger, safety_message),
+                "failed to record error log");
+        }
+        return PRINTERCTL_EXIT_SAFETY_ERROR;
+    }
+
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+
+    printerctl_printer_status_t status =
+        printerctl_printer_connect(&session, config, logger_ready ? logger : NULL, &error);
+    if (status != PRINTERCTL_PRINTER_OK) {
+        report_printer_failure(err, logger, logger_ready, name, status, &error);
+        return printer_status_to_exit_code(status);
+    }
+
+    switch (args->command) {
+    case PRINTERCTL_COMMAND_TEMP: {
+        printerctl_marlin_temperature_report_t report;
+        status = printerctl_printer_query_temperature(&session, &report, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            fprintf(out, "printerctl: hotend %.2f C (target %.2f C)",
+                    report.hotend_actual, report.hotend_target);
+            if (report.has_bed) {
+                fprintf(out, ", bed %.2f C (target %.2f C)",
+                        report.bed_actual, report.bed_target);
+            }
+            fprintf(out, "\n");
+        }
+        break;
+    }
+
+    case PRINTERCTL_COMMAND_POSITION: {
+        printerctl_marlin_position_report_t report;
+        status = printerctl_printer_query_position(&session, &report, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            fprintf(out, "printerctl: position X=%.2f Y=%.2f Z=%.2f",
+                    report.x, report.y, report.z);
+            if (report.has_e) {
+                fprintf(out, " E=%.2f", report.e);
+            }
+            fprintf(out, "\n");
+        }
+        break;
+    }
+
+    case PRINTERCTL_COMMAND_INFO: {
+        printerctl_marlin_firmware_info_t info;
+        status = printerctl_printer_query_info(&session, &info, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            fprintf(out, "printerctl: firmware: %s\n", info.firmware_name);
+            if (info.machine_type[0] != '\0') {
+                fprintf(out, "printerctl: machine: %s\n", info.machine_type);
+            }
+            if (info.protocol_version[0] != '\0') {
+                fprintf(out, "printerctl: protocol: %s\n", info.protocol_version);
+            }
+            if (info.has_extruder_count) {
+                fprintf(out, "printerctl: extruders: %d\n", info.extruder_count);
+            }
+            if (info.uuid[0] != '\0') {
+                fprintf(out, "printerctl: uuid: %s\n", info.uuid);
+            }
+        }
+        break;
+    }
+
+    case PRINTERCTL_COMMAND_SEND:
+    default:
+        fprintf(out, "> %s\n", args->send_command);
+        status = printerctl_printer_send(&session, args->send_command,
+                                          render_received_line, out, &error);
+        break;
+    }
+
+    if (status != PRINTERCTL_PRINTER_OK) {
+        report_printer_failure(err, logger, logger_ready, name, status, &error);
+    }
+
+    printerctl_printer_error_t disconnect_error;
+    if (printerctl_printer_disconnect(&session, &disconnect_error) != PRINTERCTL_PRINTER_OK) {
+        fprintf(err, "printerctl: warning: failed to close the serial port cleanly\n");
+    }
+
+    return printer_status_to_exit_code(status);
+}
+
+/* Marlin command a query maps to, for the dry-run "would send" report. */
+static const char *single_command_tx_line(const printerctl_command_args_t *args)
+{
+    switch (args->command) {
+    case PRINTERCTL_COMMAND_TEMP: return "M105";
+    case PRINTERCTL_COMMAND_POSITION: return "M114";
+    case PRINTERCTL_COMMAND_INFO: return "M115";
+    case PRINTERCTL_COMMAND_SEND: return args->send_command;
+    default: return NULL;
+    }
+}
+
 int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
 {
     printerctl_cli_request_t request;
@@ -609,10 +803,41 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
             "failed to record command_parsed log");
     }
 
+    bool is_single_command =
+        request.command_args.command == PRINTERCTL_COMMAND_TEMP ||
+        request.command_args.command == PRINTERCTL_COMMAND_POSITION ||
+        request.command_args.command == PRINTERCTL_COMMAND_INFO ||
+        request.command_args.command == PRINTERCTL_COMMAND_SEND;
+
     int exit_code;
 
     if (request.command_args.command == PRINTERCTL_COMMAND_PRINT && config.dry_run) {
         exit_code = run_dry_run_print(request.command_args.print_file, &logger, logger_ready, out, err);
+    } else if (is_single_command && config.dry_run) {
+        const char *tx_line = single_command_tx_line(&request.command_args);
+
+        /* The safety policy holds even when nothing would be sent: a
+         * G28 through `send` is rejected in dry-run mode too, exactly
+         * like `home` is never confirmed implicitly by --dry-run. */
+        if (request.command_args.command == PRINTERCTL_COMMAND_SEND &&
+            printerctl_gcode_command_is_unsafe_g28(tx_line)) {
+            static const char *const safety_message =
+                "refusing to send G28: homing is disabled because endstop sensors "
+                "are not available (see the safety policy in Agents.md)";
+            fprintf(err, "printerctl: %s\n", safety_message);
+            if (logger_ready) {
+                warn_on_log_failure(err, printerctl_log_error(&logger, safety_message),
+                    "failed to record error log");
+            }
+            exit_code = PRINTERCTL_EXIT_SAFETY_ERROR;
+        } else {
+            fprintf(out,
+                "printerctl: dry run: would send '%s' and wait for the response "
+                "(no serial device is opened)\n", tx_line);
+            exit_code = PRINTERCTL_EXIT_OK;
+        }
+    } else if (is_single_command) {
+        exit_code = run_single_command(&request.command_args, &config, &logger, logger_ready, out, err);
     } else {
         fprintf(out,
             "printerctl: command '%s' parsed successfully but is not yet implemented "

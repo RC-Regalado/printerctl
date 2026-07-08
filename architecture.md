@@ -521,7 +521,7 @@ These decisions should be resolved early by Codex before broad implementation:
 2. ~~Whether structured logs default to plain text or JSON Lines.~~ Resolved in Milestone 2: plain TSV, hidden behind the logging API. See [[docs/design/milestone-2-logging]].
 3. Test framework choice for C unit tests.
 4. ~~Maximum G-code line length and command normalization rules.~~ Resolved in Milestone 3: 4096-byte source-line limit and the normalization contract in [[docs/design/milestone-3-gcode-dry-run]].
-5. Whether `send` should block known unsafe commands by default.
+5. ~~Whether `send` should block known unsafe commands by default.~~ Resolved in Milestone 6: `send` blocks G28 (all variants, no bypass, shared detection with the G-code reader); M112 passes through as the operator's explicit emergency stop. See [[docs/design/milestone-6-printer-commands]].
 6. Whether a future daemon mode is required for external pause/resume/cancel of active prints.
 
 Resolved decisions are recorded in milestone design notes. Configuration

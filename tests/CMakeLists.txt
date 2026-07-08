@@ -38,6 +38,14 @@ target_link_libraries(printerctl_serial_tests PRIVATE printerctl_serial)
 
 add_test(NAME printerctl_serial_tests COMMAND printerctl_serial_tests)
 
+add_executable(printerctl_printer_tests
+    test_printer.c
+)
+
+target_link_libraries(printerctl_printer_tests PRIVATE printerctl_printer)
+
+add_test(NAME printerctl_printer_tests COMMAND printerctl_printer_tests)
+
 add_executable(printerctl_logging_tests
     test_logging.c
 )

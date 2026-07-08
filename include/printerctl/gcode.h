@@ -223,6 +223,20 @@ printerctl_gcode_status_t printerctl_gcode_reader_next(
     printerctl_gcode_error_t *out_error);
 
 /*
+ * True when `command` is a G28 homing command: an optional `N<digits>`
+ * line-number word, then `G`/`g`, optional spaces, then a decimal value
+ * of 28 (leading zeros allowed), with any suffix (`.1`, parameters)
+ * still counting. Leading spaces and tabs are skipped. Lookalikes
+ * (`G280`, `G2`, `G29`, `M28`, `G1 X28`) are not G28. A NULL command is
+ * not G28.
+ *
+ * This is the same detection printerctl_gcode_reader_next() applies to
+ * file content, exposed so the execution layer (Milestone 6's `send`)
+ * can enforce the same safety policy on operator-typed commands.
+ */
+bool printerctl_gcode_command_is_unsafe_g28(const char *command);
+
+/*
  * Closes the reader's underlying FILE* (fclose) and marks *reader
  * not-open. Idempotent: calling this again on an already-closed (or
  * never-opened) reader is a no-op that returns PRINTERCTL_GCODE_OK

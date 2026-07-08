@@ -17,6 +17,8 @@
 #define PRINTERCTL_EXIT_SAFETY_ERROR 4
 #define PRINTERCTL_EXIT_UNAVAILABLE 5
 #define PRINTERCTL_EXIT_GCODE_ERROR 6
+#define PRINTERCTL_EXIT_COMM_ERROR 7
+#define PRINTERCTL_EXIT_PRINTER_ERROR 8
 
 #define PRINTERCTL_CLI_ERROR_MAX 256
 
@@ -103,9 +105,22 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * PRINTERCTL_EXIT_SAFETY_ERROR (never confirmable from `print` in this
  * milestone); any other G-code file problem (unreadable, not a regular
  * file, oversized line, malformed line, I/O error, file changed while
- * being read) exits PRINTERCTL_EXIT_GCODE_ERROR. Every other successfully
- * parsed and resolved printer command — including `print` without
- * --dry-run — still ends in PRINTERCTL_EXIT_UNAVAILABLE.
+ * being read) exits PRINTERCTL_EXIT_GCODE_ERROR.
+ *
+ * As of Milestone 6, `temp`, `position`, `info` and `send COMMAND`
+ * execute a real single-command exchange via printerctl_printer (serial
+ * + marlin + logging): PRINTERCTL_EXIT_OK with human-readable output on
+ * success; PRINTERCTL_EXIT_CONFIG_ERROR when no port is configured;
+ * PRINTERCTL_EXIT_SAFETY_ERROR when `send` carries a G28;
+ * PRINTERCTL_EXIT_COMM_ERROR when the port cannot be opened or the
+ * exchange fails at the transport level (I/O, disconnect, timeout);
+ * PRINTERCTL_EXIT_PRINTER_ERROR when the printer replies `Error:` or
+ * `Resend:`, or acknowledges without the expected report. Under
+ * --dry-run these four commands print the line they would transmit and
+ * exit PRINTERCTL_EXIT_OK without touching any serial device. Every
+ * other successfully parsed and resolved printer command — `print`
+ * without --dry-run, `home`, `pause`, `resume`, `cancel` — still ends
+ * in PRINTERCTL_EXIT_UNAVAILABLE.
  */
 int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err);
 

@@ -1,12 +1,17 @@
-#define _POSIX_C_SOURCE 200809L
+/* XOPEN 700 for posix_openpt/grantpt/unlockpt/ptsname (and POSIX.1-2008). */
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
 
 #include "printerctl/cli.h"
 #include "printerctl/config.h"
 #include "printerctl/version.h"
 
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int g_failures = 0;
@@ -377,14 +382,16 @@ static void test_print_extra_arguments(void)
 
 static void test_send_command(void)
 {
+    /* Since Milestone 6 'send' executes for real; without a configured
+     * port it is a configuration error, not "unavailable". */
     char *argv[] = {(char *)"printerctl", (char *)"send", (char *)"M115 extra words"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "valid 'send' parses and reports unavailable");
-    check(out != NULL && strstr(out, "send") != NULL, "unavailable message names the command");
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "valid 'send' without a port is a configuration error");
+    check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
 
     free(out);
     free(err);
@@ -464,7 +471,8 @@ static void test_dry_run_home_without_confirmation_still_fails(void)
 
 static void test_simple_commands_unavailable(void)
 {
-    const char *commands[] = {"pause", "resume", "cancel", "temp", "position", "info"};
+    /* Streaming-session controls are still unavailable in this build. */
+    const char *commands[] = {"pause", "resume", "cancel"};
 
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
         char *argv[] = {(char *)"printerctl", (char *)commands[i]};
@@ -475,6 +483,24 @@ static void test_simple_commands_unavailable(void)
 
         check(status == PRINTERCTL_EXIT_UNAVAILABLE, "simple command parses and reports unavailable");
         check(out != NULL && strstr(out, commands[i]) != NULL, "unavailable message names the command");
+
+        free(out);
+        free(err);
+    }
+
+    /* Since Milestone 6 the query commands execute for real; without a
+     * configured port they are a configuration error. */
+    const char *queries[] = {"temp", "position", "info"};
+
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        char *argv[] = {(char *)"printerctl", (char *)queries[i]};
+        char *out = NULL;
+        char *err = NULL;
+
+        int status = run_cli(2, argv, &out, &err);
+
+        check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "a query command without a port is a configuration error");
+        check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
 
         free(out);
         free(err);
@@ -1020,6 +1046,317 @@ static void test_dry_run_from_config_file_enables_dry_run_print(void)
     free(err);
 }
 
+/*
+ * Scriptable mock Marlin printer for end-to-end CLI tests: a pty whose
+ * master side is serviced by a forked child. The child waits for one
+ * complete command line, writes the scripted reply (which may be
+ * several lines), then keeps draining input until the parent kills it.
+ * The child must run concurrently with printerctl_cli_run() because the
+ * serial open flushes any input scripted in advance.
+ */
+typedef struct {
+    int master;
+    pid_t child;
+    char slave_path[64];
+} cli_mock_printer_t;
+
+static bool cli_mock_start(cli_mock_printer_t *mock, const char *scripted_reply)
+{
+    mock->master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (mock->master < 0 || grantpt(mock->master) != 0 || unlockpt(mock->master) != 0) {
+        fprintf(stderr, "FAIL: cannot create pty for the mock printer\n");
+        g_failures++;
+        return false;
+    }
+
+    const char *name = ptsname(mock->master);
+    if (name == NULL || strlen(name) >= sizeof(mock->slave_path)) {
+        fprintf(stderr, "FAIL: ptsname for the mock printer\n");
+        g_failures++;
+        close(mock->master);
+        return false;
+    }
+    strcpy(mock->slave_path, name);
+
+    mock->child = fork();
+    if (mock->child < 0) {
+        fprintf(stderr, "FAIL: cannot fork the mock printer\n");
+        g_failures++;
+        close(mock->master);
+        return false;
+    }
+
+    if (mock->child == 0) {
+        char c;
+        for (;;) {
+            ssize_t n = read(mock->master, &c, 1);
+            if (n <= 0) {
+                _exit(1);
+            }
+            if (c == '\n') {
+                break;
+            }
+        }
+        if (scripted_reply != NULL) {
+            size_t length = strlen(scripted_reply);
+            if (write(mock->master, scripted_reply, length) != (ssize_t)length) {
+                _exit(1);
+            }
+        }
+        for (;;) {
+            ssize_t n = read(mock->master, &c, 1);
+            if (n <= 0) {
+                _exit(0);
+            }
+        }
+    }
+
+    return true;
+}
+
+static void cli_mock_stop(cli_mock_printer_t *mock)
+{
+    kill(mock->child, SIGKILL);
+    waitpid(mock->child, NULL, 0);
+    close(mock->master);
+}
+
+static void test_temp_end_to_end(void)
+{
+    cli_mock_printer_t mock;
+    if (!cli_mock_start(&mock, "ok T:210.00 /210.00 B:60.00 /60.00 @:127 B@:0\n")) {
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"--verbose", (char *)"temp"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(5, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "'temp' against the mock printer exits with success");
+    check(out != NULL && strstr(out, "hotend 210.00 C (target 210.00 C)") != NULL,
+          "'temp' renders the hotend temperatures");
+    check(out != NULL && strstr(out, "bed 60.00 C (target 60.00 C)") != NULL,
+          "'temp' renders the bed temperatures");
+    check(err != NULL && strstr(err, "\tDEBUG\tserial_tx\tM105") != NULL,
+          "the transmitted M105 line is logged as serial_tx");
+    check(err != NULL && strstr(err, "\tDEBUG\tserial_rx\tok T:210.00") != NULL,
+          "the received response line is logged as serial_rx");
+    check(err != NULL && strstr(err, "state=connected baud=115200") != NULL,
+          "the connect state transition is logged with baud and timeout");
+    check(err != NULL && strstr(err, "state=disconnected") != NULL,
+          "the disconnect state transition is logged");
+    check(err != NULL && strstr(err, mock.slave_path) == NULL,
+          "logs never contain the port path");
+
+    cli_mock_stop(&mock);
+    free(out);
+    free(err);
+}
+
+static void test_position_end_to_end(void)
+{
+    cli_mock_printer_t mock;
+    if (!cli_mock_start(&mock, "X:1.00 Y:2.00 Z:3.00 E:4.00 Count X:0 Y:0 Z:0\nok\n")) {
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path, (char *)"position"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "'position' against the mock printer exits with success");
+    check(out != NULL && strstr(out, "position X=1.00 Y=2.00 Z=3.00 E=4.00") != NULL,
+          "'position' renders the coordinates");
+
+    cli_mock_stop(&mock);
+    free(out);
+    free(err);
+}
+
+static void test_info_end_to_end(void)
+{
+    cli_mock_printer_t mock;
+    if (!cli_mock_start(&mock,
+                         "FIRMWARE_NAME:Marlin 2.1.2 MACHINE_TYPE:EasyThreed K9 "
+                         "EXTRUDER_COUNT:1\nok\n")) {
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path, (char *)"info"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "'info' against the mock printer exits with success");
+    check(out != NULL && strstr(out, "firmware: Marlin 2.1.2") != NULL,
+          "'info' renders the firmware name");
+    check(out != NULL && strstr(out, "machine: EasyThreed K9") != NULL,
+          "'info' renders the machine type");
+    check(out != NULL && strstr(out, "extruders: 1") != NULL,
+          "'info' renders the extruder count");
+
+    cli_mock_stop(&mock);
+    free(out);
+    free(err);
+}
+
+static void test_send_end_to_end_logs_full_exchange(void)
+{
+    cli_mock_printer_t mock;
+    if (!cli_mock_start(&mock, "echo:Settings Stored\nok\n")) {
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"--verbose", (char *)"send", (char *)"M500"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(6, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "'send' against the mock printer exits with success");
+    check(out != NULL && strstr(out, "> M500") != NULL, "'send' echoes the transmitted command");
+    check(out != NULL && strstr(out, "< echo:Settings Stored") != NULL,
+          "'send' renders each received line");
+    check(out != NULL && strstr(out, "< ok") != NULL, "'send' renders the acknowledgement");
+    check(err != NULL && strstr(err, "\tDEBUG\tserial_tx\tM500") != NULL,
+          "'send' logs the transmitted line");
+    check(err != NULL && strstr(err, "\tDEBUG\tserial_rx\tok") != NULL,
+          "'send' logs the received lines");
+
+    cli_mock_stop(&mock);
+    free(out);
+    free(err);
+}
+
+static void test_send_g28_blocked_end_to_end(void)
+{
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"send", (char *)"G28"};
+        char *out = NULL;
+        char *err = NULL;
+
+        int status = run_cli(3, argv, &out, &err);
+
+        check(status == PRINTERCTL_EXIT_SAFETY_ERROR,
+              "'send G28' is rejected before requiring a configured port");
+        check(err != NULL && strstr(err, "G28") != NULL, "the no-port G28 rejection names G28");
+
+        free(out);
+        free(err);
+    }
+
+    cli_mock_printer_t mock;
+    if (!cli_mock_start(&mock, NULL)) {
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"send", (char *)"G28"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(5, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "'send G28' exits with the safety error code");
+    check(err != NULL && strstr(err, "G28") != NULL, "the rejection names G28");
+    check(err != NULL && strstr(err, "endstop") != NULL, "the rejection explains why");
+
+    cli_mock_stop(&mock);
+    free(out);
+    free(err);
+}
+
+static void test_printer_error_end_to_end(void)
+{
+    cli_mock_printer_t mock;
+    if (!cli_mock_start(&mock, "Error:Thermal Runaway\n")) {
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path, (char *)"temp"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(4, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_PRINTER_ERROR,
+          "an Error: reply exits with the printer error code");
+    check(err != NULL && strstr(err, "Thermal Runaway") != NULL,
+          "the printer's error message reaches the operator");
+
+    cli_mock_stop(&mock);
+    free(out);
+    free(err);
+}
+
+static void test_timeout_end_to_end(void)
+{
+    cli_mock_printer_t mock;
+    if (!cli_mock_start(&mock, NULL)) { /* the mock never answers */
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"--timeout", (char *)"150", (char *)"temp"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(6, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "a silent printer exits with the communication error code");
+    check(err != NULL && strstr(err, "timed out") != NULL, "the timeout message is explicit");
+
+    cli_mock_stop(&mock);
+    free(out);
+    free(err);
+}
+
+static void test_dry_run_single_commands(void)
+{
+    /* --dry-run works without a port: nothing is opened. */
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"temp"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(3, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_OK, "'--dry-run temp' exits with success without a port");
+        check(out != NULL && strstr(out, "would send 'M105'") != NULL,
+              "'--dry-run temp' reports the M105 it would send");
+        free(out);
+        free(err);
+    }
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"send", (char *)"M400"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(4, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_OK, "'--dry-run send' exits with success");
+        check(out != NULL && strstr(out, "would send 'M400'") != NULL,
+              "'--dry-run send' reports the raw command it would send");
+        free(out);
+        free(err);
+    }
+    {
+        /* The safety policy holds even when nothing would be transmitted. */
+        char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"send", (char *)"G28"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(4, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_SAFETY_ERROR,
+              "'--dry-run send G28' still exits with the safety error code");
+        free(out);
+        free(err);
+    }
+}
+
 static void test_safety_error_adds_single_error_log_line(void)
 {
     char *argv[] = {(char *)"printerctl", (char *)"home"};
@@ -1090,6 +1427,14 @@ int main(void)
     test_dry_run_print_malformed_file();
     test_print_without_dry_run_is_still_unavailable();
     test_dry_run_from_config_file_enables_dry_run_print();
+    test_temp_end_to_end();
+    test_position_end_to_end();
+    test_info_end_to_end();
+    test_send_end_to_end_logs_full_exchange();
+    test_send_g28_blocked_end_to_end();
+    test_printer_error_end_to_end();
+    test_timeout_end_to_end();
+    test_dry_run_single_commands();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

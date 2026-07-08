@@ -370,6 +370,19 @@ static printerctl_gcode_status_t read_raw_line(printerctl_gcode_reader_t *reader
     return PRINTERCTL_GCODE_OK;
 }
 
+bool printerctl_gcode_command_is_unsafe_g28(const char *command)
+{
+    if (command == NULL) {
+        return false;
+    }
+
+    while (*command == ' ' || *command == '\t') {
+        command++;
+    }
+
+    return is_unsafe_g28(command, strlen(command));
+}
+
 printerctl_gcode_status_t printerctl_gcode_reader_open(
     printerctl_gcode_reader_t *reader,
     const char *path,
