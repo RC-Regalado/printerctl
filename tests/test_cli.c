@@ -336,17 +336,18 @@ static void test_unknown_command(void)
     free(err);
 }
 
-static void test_print_command_unavailable(void)
+static void test_print_command_needs_port(void)
 {
+    /* Since Milestone 7 'print' streams for real; without a configured
+     * port it is a configuration error, not "unavailable". */
     char *argv[] = {(char *)"printerctl", (char *)"print", (char *)"file.gcode"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "valid 'print' parses and reports unavailable");
-    check(out != NULL && strstr(out, "print") != NULL, "unavailable message names the command");
-    check(out != NULL && strstr(out, "(none)") != NULL, "unavailable message shows the default (empty) port");
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "valid 'print' without a port is a configuration error");
+    check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
 
     free(out);
     free(err);
@@ -1001,7 +1002,7 @@ static void test_dry_run_print_malformed_file(void)
     free(err);
 }
 
-static void test_print_without_dry_run_is_still_unavailable(void)
+static void test_print_without_port_does_not_touch_the_file(void)
 {
     char path[64];
     write_temp_gcode("G21\n", path, sizeof(path));
@@ -1012,11 +1013,10 @@ static void test_print_without_dry_run_is_still_unavailable(void)
 
     int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE,
-          "'print' without --dry-run still reports unavailable, even for a readable file");
-    check(out != NULL && strstr(out, "not yet implemented") != NULL,
-          "non-dry-run print keeps the unavailable message");
-    check(out != NULL && strstr(out, "G21") == NULL, "non-dry-run print does not parse the file");
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR,
+          "'print' without a port fails as a configuration error before streaming");
+    check(out != NULL && strstr(out, "G21") == NULL,
+          "no command is parsed or reported when the connection cannot be made");
 
     remove(path);
     free(out);
@@ -1100,6 +1100,67 @@ static bool cli_mock_start(cli_mock_printer_t *mock, const char *scripted_reply)
         if (scripted_reply != NULL) {
             size_t length = strlen(scripted_reply);
             if (write(mock->master, scripted_reply, length) != (ssize_t)length) {
+                _exit(1);
+            }
+        }
+        for (;;) {
+            ssize_t n = read(mock->master, &c, 1);
+            if (n <= 0) {
+                _exit(0);
+            }
+        }
+    }
+
+    return true;
+}
+
+/*
+ * Streaming variant of the mock: one scripted reply per received
+ * command line, in order, then silence (drain until killed). Used by
+ * the Milestone 7 print tests, where each acknowledged command triggers
+ * the transmission of the next one.
+ */
+static bool cli_mock_start_script(cli_mock_printer_t *mock,
+                                   const char *const *replies, size_t reply_count)
+{
+    mock->master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (mock->master < 0 || grantpt(mock->master) != 0 || unlockpt(mock->master) != 0) {
+        fprintf(stderr, "FAIL: cannot create pty for the scripted mock printer\n");
+        g_failures++;
+        return false;
+    }
+
+    const char *name = ptsname(mock->master);
+    if (name == NULL || strlen(name) >= sizeof(mock->slave_path)) {
+        fprintf(stderr, "FAIL: ptsname for the scripted mock printer\n");
+        g_failures++;
+        close(mock->master);
+        return false;
+    }
+    strcpy(mock->slave_path, name);
+
+    mock->child = fork();
+    if (mock->child < 0) {
+        fprintf(stderr, "FAIL: cannot fork the scripted mock printer\n");
+        g_failures++;
+        close(mock->master);
+        return false;
+    }
+
+    if (mock->child == 0) {
+        char c;
+        for (size_t i = 0; i < reply_count; i++) {
+            for (;;) {
+                ssize_t n = read(mock->master, &c, 1);
+                if (n <= 0) {
+                    _exit(1);
+                }
+                if (c == '\n') {
+                    break;
+                }
+            }
+            size_t length = strlen(replies[i]);
+            if (write(mock->master, replies[i], length) != (ssize_t)length) {
                 _exit(1);
             }
         }
@@ -1319,6 +1380,150 @@ static void test_timeout_end_to_end(void)
     free(err);
 }
 
+static void test_print_end_to_end(void)
+{
+    char path[64];
+    write_temp_gcode("; header\nG21\nG90 ; absolute\nM105\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n", "ok\n", "ok\n"};
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script(&mock, replies, 3)) {
+        remove(path);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"--verbose", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(6, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "'print' against the mock printer exits with success");
+    check(out != NULL && strstr(out, "print completed") != NULL,
+          "the session summary reports completion");
+    check(out != NULL && strstr(out, "3 command(s) sent, 3 acknowledged") != NULL,
+          "the session summary counts sent and acknowledged commands");
+    check(out != NULL && strstr(out, "100%") != NULL, "progress reaches 100%");
+    check(out != NULL && strstr(out, path) != NULL, "the summary names the file");
+    check(err != NULL && strstr(err, "\tDEBUG\tserial_tx\tG21") != NULL,
+          "each streamed command is logged as serial_tx");
+    check(err != NULL && strstr(err, "\tDEBUG\tserial_tx\tM105") != NULL,
+          "the last streamed command is logged as serial_tx");
+    check(err != NULL && strstr(err, "state=printing") != NULL,
+          "the print start state transition is logged");
+    check(err != NULL && strstr(err, "state=print_completed") != NULL,
+          "the print completion state transition is logged");
+    check(err != NULL && strstr(err, "\tINFO\tprogress\t") != NULL,
+          "progress is logged at INFO on percent changes");
+    check(err != NULL && strstr(err, path) == NULL, "logs never contain the G-code file path");
+
+    cli_mock_stop(&mock);
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_print_error_stops_gracefully_end_to_end(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n", "Error:Thermal Runaway\n"};
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script(&mock, replies, 2)) {
+        remove(path);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(5, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_PRINTER_ERROR,
+          "an Error: reply during a print exits with the printer error code");
+    check(err != NULL && strstr(err, "Thermal Runaway") != NULL,
+          "the printer's error message reaches the operator");
+    check(out != NULL && strstr(out, "print failed") != NULL,
+          "the session summary reports the failure");
+    check(out != NULL && strstr(out, "2 command(s) sent, 1 acknowledged") != NULL,
+          "the summary shows the exchange stopped at the failing command");
+    check(out != NULL && strstr(out, "last acknowledged line 1") != NULL,
+          "the summary names the last acknowledged source line");
+
+    cli_mock_stop(&mock);
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_print_g28_in_file_end_to_end(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG28\nG90\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n"};
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script(&mock, replies, 1)) {
+        remove(path);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(5, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_SAFETY_ERROR,
+          "a G28 in the streamed file exits with the safety error code");
+    check(err != NULL && strstr(err, "G28") != NULL, "the rejection names G28");
+    check(out != NULL && strstr(out, "1 command(s) sent, 1 acknowledged") != NULL,
+          "commands before the G28 line were streamed; the G28 line was not");
+
+    cli_mock_stop(&mock);
+    remove(path);
+    free(out);
+    free(err);
+}
+
+static void test_print_timeout_end_to_end(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG90\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n"}; /* then silence */
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script(&mock, replies, 1)) {
+        remove(path);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"--timeout", (char *)"150", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(7, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "a print that stops receiving acknowledgements exits with the communication error code");
+    check(err != NULL && strstr(err, "timed out") != NULL, "the timeout message is explicit");
+    check(out != NULL && strstr(out, "print failed") != NULL,
+          "the session summary reports the failure");
+    check(out != NULL && strstr(out, "2 command(s) sent, 1 acknowledged") != NULL,
+          "the summary shows where streaming stopped");
+
+    cli_mock_stop(&mock);
+    remove(path);
+    free(out);
+    free(err);
+}
+
 static void test_dry_run_single_commands(void)
 {
     /* --dry-run works without a port: nothing is opened. */
@@ -1392,7 +1597,7 @@ int main(void)
     test_invalid_baud_value();
     test_invalid_timeout_value();
     test_unknown_command();
-    test_print_command_unavailable();
+    test_print_command_needs_port();
     test_print_missing_file();
     test_print_extra_arguments();
     test_send_command();
@@ -1425,7 +1630,7 @@ int main(void)
     test_dry_run_print_unsafe_g28();
     test_dry_run_print_missing_file();
     test_dry_run_print_malformed_file();
-    test_print_without_dry_run_is_still_unavailable();
+    test_print_without_port_does_not_touch_the_file();
     test_dry_run_from_config_file_enables_dry_run_print();
     test_temp_end_to_end();
     test_position_end_to_end();
@@ -1434,6 +1639,10 @@ int main(void)
     test_send_g28_blocked_end_to_end();
     test_printer_error_end_to_end();
     test_timeout_end_to_end();
+    test_print_end_to_end();
+    test_print_error_stops_gracefully_end_to_end();
+    test_print_g28_in_file_end_to_end();
+    test_print_timeout_end_to_end();
     test_dry_run_single_commands();
 
     if (g_failures > 0) {

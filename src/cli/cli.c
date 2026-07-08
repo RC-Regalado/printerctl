@@ -309,10 +309,10 @@ static void print_help(FILE *out)
         "       printerctl --version\n"
         "\n"
         "Command-line controller for Marlin-based 3D printers over USB serial.\n"
-        "'temp', 'position', 'info' and 'send' talk to the printer over the\n"
-        "configured --port (Milestone 6). '--dry-run print FILE' parses and\n"
-        "normalizes the G-code file without opening any serial device\n"
-        "(Milestone 3). Streaming ('print' without --dry-run), 'home', 'pause',\n"
+        "'print FILE' streams a G-code file one acknowledged command at a time\n"
+        "(Milestone 7); 'temp', 'position', 'info' and 'send' run one command\n"
+        "each (Milestone 6). '--dry-run print FILE' parses and normalizes the\n"
+        "file without opening any serial device (Milestone 3). 'home', 'pause',\n"
         "'resume' and 'cancel' are not implemented yet (see roadmap.md).\n"
         "\n"
         "Global options (must appear before COMMAND, at most once each):\n"
@@ -324,8 +324,9 @@ static void print_help(FILE *out)
         "  --config PATH     Load key=value configuration from PATH\n"
         "\n"
         "Commands:\n"
-        "  print FILE                          Stream a G-code file (with --dry-run:\n"
-        "                                       parse and report, no serial access)\n"
+        "  print FILE                          Stream a G-code file, waiting for each\n"
+        "                                       command's 'ok' (with --dry-run: parse\n"
+        "                                       and report only, no serial access)\n"
         "  send COMMAND                        Send one raw command\n"
         "  home [--i-understand-no-endstops]   Home all axes (see Safety below)\n"
         "  pause                                Pause an active print\n"
@@ -551,6 +552,7 @@ static const char *printer_status_name(printerctl_printer_status_t status)
     case PRINTERCTL_PRINTER_ERR_PRINTER_ERROR: return "printer_error";
     case PRINTERCTL_PRINTER_ERR_RESEND: return "resend";
     case PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE: return "unexpected_response";
+    case PRINTERCTL_PRINTER_ERR_GCODE: return "gcode";
     }
     return "unknown";
 }
@@ -574,6 +576,8 @@ static int printer_status_to_exit_code(printerctl_printer_status_t status)
     case PRINTERCTL_PRINTER_ERR_RESEND:
     case PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE:
         return PRINTERCTL_EXIT_PRINTER_ERROR;
+    case PRINTERCTL_PRINTER_ERR_GCODE:
+        return PRINTERCTL_EXIT_GCODE_ERROR;
     }
     return PRINTERCTL_EXIT_COMM_ERROR;
 }
@@ -714,6 +718,76 @@ static int run_single_command(const printerctl_command_args_t *args,
     return printer_status_to_exit_code(status);
 }
 
+/* Renders a progress line whenever the whole-percent value changes. */
+typedef struct {
+    FILE *out;
+    unsigned last_percent;
+} print_progress_renderer_t;
+
+static void render_print_progress(const printerctl_gcode_result_t *result, void *context)
+{
+    print_progress_renderer_t *renderer = context;
+    if (result->progress_percent != renderer->last_percent) {
+        fprintf(renderer->out, "printerctl: printing: %u%% (line %llu, %llu command(s) acknowledged)\n",
+                result->progress_percent,
+                (unsigned long long)result->line_number,
+                (unsigned long long)result->command_number);
+        renderer->last_percent = result->progress_percent;
+    }
+}
+
+/*
+ * Milestone 7 execution of `print FILE` (without --dry-run): connect,
+ * stream the file one acknowledged command at a time, render progress
+ * on every whole-percent change and a session summary at the end, then
+ * disconnect. The summary is rendered on success and on failure alike,
+ * naming the file, the final state and the last acknowledged line.
+ */
+static int run_print_command(const printerctl_command_args_t *args,
+                              const printerctl_config_t *config,
+                              printerctl_logger_t *logger, bool logger_ready,
+                              FILE *out, FILE *err)
+{
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+
+    printerctl_printer_status_t status =
+        printerctl_printer_connect(&session, config, logger_ready ? logger : NULL, &error);
+    if (status != PRINTERCTL_PRINTER_OK) {
+        report_printer_failure(err, logger, logger_ready, "print", status, &error);
+        return printer_status_to_exit_code(status);
+    }
+
+    fprintf(out, "printerctl: printing '%s'\n", args->print_file);
+
+    print_progress_renderer_t renderer = {.out = out, .last_percent = (unsigned)-1};
+    printerctl_print_summary_t summary;
+    status = printerctl_printer_print_file(&session, args->print_file,
+                                            render_print_progress, &renderer,
+                                            &summary, &error);
+
+    if (status != PRINTERCTL_PRINTER_OK) {
+        report_printer_failure(err, logger, logger_ready, "print", status, &error);
+    }
+
+    fprintf(out,
+        "printerctl: print %s: '%s' — %llu command(s) sent, %llu acknowledged, "
+        "last acknowledged line %llu, %u%%\n",
+        summary.state == PRINTERCTL_PRINT_COMPLETED ? "completed" : "failed",
+        args->print_file,
+        (unsigned long long)summary.commands_sent,
+        (unsigned long long)summary.commands_acknowledged,
+        (unsigned long long)summary.last_acknowledged_line,
+        summary.progress_percent);
+
+    printerctl_printer_error_t disconnect_error;
+    if (printerctl_printer_disconnect(&session, &disconnect_error) != PRINTERCTL_PRINTER_OK) {
+        fprintf(err, "printerctl: warning: failed to close the serial port cleanly\n");
+    }
+
+    return printer_status_to_exit_code(status);
+}
+
 /* Marlin command a query maps to, for the dry-run "would send" report. */
 static const char *single_command_tx_line(const printerctl_command_args_t *args)
 {
@@ -813,6 +887,8 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
 
     if (request.command_args.command == PRINTERCTL_COMMAND_PRINT && config.dry_run) {
         exit_code = run_dry_run_print(request.command_args.print_file, &logger, logger_ready, out, err);
+    } else if (request.command_args.command == PRINTERCTL_COMMAND_PRINT) {
+        exit_code = run_print_command(&request.command_args, &config, &logger, logger_ready, out, err);
     } else if (is_single_command && config.dry_run) {
         const char *tx_line = single_command_tx_line(&request.command_args);
 

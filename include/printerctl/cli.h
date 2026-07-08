@@ -117,10 +117,18 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * PRINTERCTL_EXIT_PRINTER_ERROR when the printer replies `Error:` or
  * `Resend:`, or acknowledges without the expected report. Under
  * --dry-run these four commands print the line they would transmit and
- * exit PRINTERCTL_EXIT_OK without touching any serial device. Every
- * other successfully parsed and resolved printer command — `print`
- * without --dry-run, `home`, `pause`, `resume`, `cancel` — still ends
- * in PRINTERCTL_EXIT_UNAVAILABLE.
+ * exit PRINTERCTL_EXIT_OK without touching any serial device.
+ *
+ * As of Milestone 7, `print FILE` without --dry-run streams the file
+ * for real via printerctl_printer_print_file(): one normalized command
+ * at a time, waiting for `ok` before the next, rendering progress on
+ * every whole-percent change and a session summary (final state, file,
+ * commands sent/acknowledged, last acknowledged line) on every outcome.
+ * Exit codes follow the same mapping as the single commands, plus
+ * PRINTERCTL_EXIT_GCODE_ERROR for a file that fails mid-stream and
+ * PRINTERCTL_EXIT_SAFETY_ERROR for a G28 found in the file. Only
+ * `home`, `pause`, `resume` and `cancel` still end in
+ * PRINTERCTL_EXIT_UNAVAILABLE.
  */
 int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err);
 

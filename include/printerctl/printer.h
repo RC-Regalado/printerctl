@@ -2,6 +2,7 @@
 #define PRINTERCTL_PRINTER_H
 
 #include "printerctl/config.h"
+#include "printerctl/gcode.h"
 #include "printerctl/logging.h"
 #include "printerctl/marlin.h"
 #include "printerctl/serial.h"
@@ -60,7 +61,8 @@ typedef enum {
     PRINTERCTL_PRINTER_ERR_TIMEOUT,
     PRINTERCTL_PRINTER_ERR_PRINTER_ERROR,   /* Marlin replied Error: */
     PRINTERCTL_PRINTER_ERR_RESEND,          /* Marlin requested a resend (unsupported in MVP) */
-    PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE
+    PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE,
+    PRINTERCTL_PRINTER_ERR_GCODE            /* the G-code file itself failed (Milestone 7) */
 } printerctl_printer_status_t;
 
 typedef struct {
@@ -178,6 +180,79 @@ printerctl_printer_status_t printerctl_printer_send(
     const char *command,
     printerctl_printer_line_fn on_line,
     void *context,
+    printerctl_printer_error_t *out_error);
+
+/*
+ * Milestone 7 print session summary. Always fully filled by
+ * printerctl_printer_print_file(), on success and on every failure, so
+ * the caller can render a session summary regardless of how the print
+ * ended: `state` is the final state, `status` the cause when it is
+ * PRINTERCTL_PRINT_FAILED (PRINTERCTL_PRINTER_OK when completed).
+ *
+ * `commands_sent` counts commands transmitted; `commands_acknowledged`
+ * counts those that received `ok` (they differ by at most one — the MVP
+ * streams strictly one command at a time). `last_acknowledged_line` is
+ * the source line number of the last command Marlin acknowledged, 0
+ * when nothing was acknowledged. `progress_percent` is the byte-based
+ * whole-percent progress of the last acknowledged command (100 for a
+ * completed print, including an empty file).
+ */
+typedef enum {
+    PRINTERCTL_PRINT_COMPLETED = 0,
+    PRINTERCTL_PRINT_FAILED
+} printerctl_print_final_state_t;
+
+typedef struct {
+    printerctl_print_final_state_t state;
+    printerctl_printer_status_t status;
+    uint64_t commands_sent;
+    uint64_t commands_acknowledged;
+    uint64_t last_acknowledged_line;
+    uint64_t bytes_consumed;
+    uint64_t file_size;
+    unsigned progress_percent;
+} printerctl_print_summary_t;
+
+/*
+ * Called after each acknowledged command with the reader's result for
+ * that command (line number, ordinal, byte progress). `result` borrows
+ * session storage and is valid only for the duration of the call.
+ */
+typedef void (*printerctl_printer_progress_fn)(
+    const printerctl_gcode_result_t *result, void *context);
+
+/*
+ * Streams the G-code file at `path`, one normalized command at a time,
+ * over the connected session: each command is transmitted and the next
+ * one is not read from the file — let alone sent — until Marlin
+ * acknowledges with `ok`, so the serial buffer is never flooded.
+ * `busy:`/`echo:`/informational lines are waited out exactly as in
+ * printerctl_printer_execute(). The file is opened with allow_g28 =
+ * false: a G28 anywhere in the file stops the print with
+ * PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND before that line is sent.
+ *
+ * Stops gracefully — no further commands are transmitted, the file is
+ * closed, *out_summary is filled and the failure is logged — on
+ * `Error:` (ERR_PRINTER_ERROR), `Resend:` (ERR_RESEND, explicit
+ * unsupported status), response timeout (ERR_TIMEOUT), serial failure
+ * or disconnect (ERR_SERIAL), or a G-code file error mid-stream
+ * (ERR_GCODE, with the reader's message and line in *out_error).
+ *
+ * Progress: `on_progress` (optional) runs after every acknowledged
+ * command; a DEBUG `progress` record is logged per acknowledgement and
+ * an INFO `progress` record whenever the whole-percent value changes,
+ * with INFO `state_transition` records at print start and end.
+ *
+ * `session` must be connected, and `path`, `out_summary` and
+ * `out_error` non-NULL. The session remains connected afterwards; the
+ * caller disconnects.
+ */
+printerctl_printer_status_t printerctl_printer_print_file(
+    printerctl_printer_session_t *session,
+    const char *path,
+    printerctl_printer_progress_fn on_progress,
+    void *context,
+    printerctl_print_summary_t *out_summary,
     printerctl_printer_error_t *out_error);
 
 /*

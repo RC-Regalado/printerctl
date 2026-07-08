@@ -395,6 +395,160 @@ printerctl_printer_status_t printerctl_printer_send(
     return printerctl_printer_execute(session, command, on_line, context, out_error);
 }
 
+/* Maps a reader failure to the session-level status the CLI renders. */
+static printerctl_printer_status_t gcode_failure_status(printerctl_gcode_status_t status)
+{
+    return status == PRINTERCTL_GCODE_ERR_UNSAFE_G28
+               ? PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND
+               : PRINTERCTL_PRINTER_ERR_GCODE;
+}
+
+/* One INFO state_transition record closing a print session, with the summary attached. */
+static void log_print_end(printerctl_logger_t *logger,
+                           const printerctl_print_summary_t *summary,
+                           const char *state_name)
+{
+    char detail[160];
+    snprintf(detail, sizeof(detail),
+             "state=%s commands_sent=%llu commands_acknowledged=%llu "
+             "last_acknowledged_line=%llu percent=%u",
+             state_name,
+             (unsigned long long)summary->commands_sent,
+             (unsigned long long)summary->commands_acknowledged,
+             (unsigned long long)summary->last_acknowledged_line,
+             summary->progress_percent);
+    log_detail(logger, printerctl_log_state_transition, detail);
+}
+
+printerctl_printer_status_t printerctl_printer_print_file(
+    printerctl_printer_session_t *session,
+    const char *path,
+    printerctl_printer_progress_fn on_progress,
+    void *context,
+    printerctl_print_summary_t *out_summary,
+    printerctl_printer_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    out_error->status = PRINTERCTL_PRINTER_OK;
+
+    if (out_summary == NULL) {
+        set_error(out_error, PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT,
+                   "out_summary must not be NULL");
+        return out_error->status;
+    }
+
+    memset(out_summary, 0, sizeof(*out_summary));
+    out_summary->state = PRINTERCTL_PRINT_FAILED;
+
+    if (session == NULL || path == NULL) {
+        set_error(out_error, PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT,
+                   "session and path must not be NULL");
+        out_summary->status = out_error->status;
+        return out_error->status;
+    }
+
+    if (!session->connected) {
+        set_error(out_error, PRINTERCTL_PRINTER_ERR_NOT_CONNECTED,
+                   "session is not connected");
+        out_summary->status = out_error->status;
+        return out_error->status;
+    }
+
+    printerctl_gcode_reader_t reader;
+    printerctl_gcode_error_t gcode_error;
+    printerctl_gcode_status_t gcode_status =
+        printerctl_gcode_reader_open(&reader, path, false, &gcode_error);
+    if (gcode_status != PRINTERCTL_GCODE_OK) {
+        printerctl_printer_status_t status = gcode_failure_status(gcode_status);
+        set_error(out_error, status, "%s", gcode_error.message);
+        out_summary->status = status;
+        log_detail(session->logger, printerctl_log_error, "print failed: cannot open G-code file");
+        log_print_end(session->logger, out_summary, "print_failed");
+        return out_error->status;
+    }
+
+    out_summary->file_size = reader.size;
+    log_detail(session->logger, printerctl_log_state_transition, "state=printing");
+
+    unsigned last_logged_percent = (unsigned)-1;
+    printerctl_printer_status_t status = PRINTERCTL_PRINTER_OK;
+
+    for (;;) {
+        /* The next command is not even read from the file until the
+         * previous one was acknowledged: strictly one in flight. */
+        printerctl_gcode_result_t result;
+        gcode_status = printerctl_gcode_reader_next(&reader, &result, &gcode_error);
+        if (gcode_status == PRINTERCTL_GCODE_EOF) {
+            out_summary->state = PRINTERCTL_PRINT_COMPLETED;
+            out_summary->status = PRINTERCTL_PRINTER_OK;
+            out_summary->bytes_consumed = reader.bytes_consumed;
+            out_summary->progress_percent = 100;
+            break;
+        }
+        if (gcode_status != PRINTERCTL_GCODE_OK) {
+            status = gcode_failure_status(gcode_status);
+            if (gcode_error.line_number != 0) {
+                set_error(out_error, status, "%s (line %llu)", gcode_error.message,
+                           (unsigned long long)gcode_error.line_number);
+            } else {
+                set_error(out_error, status, "%s", gcode_error.message);
+            }
+            log_detail(session->logger, printerctl_log_error,
+                        status == PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND
+                            ? "print stopped: unsafe G28 in the file"
+                            : "print stopped: G-code file error");
+            break;
+        }
+
+        printerctl_printer_status_t exchange_status =
+            printerctl_printer_execute(session, result.command, NULL, NULL, out_error);
+        out_summary->commands_sent++;
+        if (exchange_status != PRINTERCTL_PRINTER_OK) {
+            status = exchange_status;
+            break;
+        }
+
+        out_summary->commands_acknowledged++;
+        out_summary->last_acknowledged_line = result.line_number;
+        out_summary->bytes_consumed = result.bytes_consumed;
+        out_summary->progress_percent = result.progress_percent;
+
+        if (session->logger != NULL) {
+            char detail[128];
+            snprintf(detail, sizeof(detail), "line=%llu command=%llu percent=%u",
+                     (unsigned long long)result.line_number,
+                     (unsigned long long)result.command_number,
+                     result.progress_percent);
+            (void)printerctl_log_record(session->logger, PRINTERCTL_LOG_DEBUG,
+                                         PRINTERCTL_LOG_EVENT_PROGRESS, detail);
+            if (result.progress_percent != last_logged_percent) {
+                (void)printerctl_log_progress(session->logger, detail);
+                last_logged_percent = result.progress_percent;
+            }
+        }
+
+        if (on_progress != NULL) {
+            on_progress(&result, context);
+        }
+    }
+
+    printerctl_gcode_error_t close_error;
+    (void)printerctl_gcode_reader_close(&reader, &close_error);
+
+    if (status != PRINTERCTL_PRINTER_OK) {
+        out_summary->state = PRINTERCTL_PRINT_FAILED;
+        out_summary->status = status;
+        log_print_end(session->logger, out_summary, "print_failed");
+        return status;
+    }
+
+    log_print_end(session->logger, out_summary, "print_completed");
+    return PRINTERCTL_PRINTER_OK;
+}
+
 printerctl_printer_status_t printerctl_printer_disconnect(
     printerctl_printer_session_t *session,
     printerctl_printer_error_t *out_error)

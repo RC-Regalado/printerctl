@@ -16,9 +16,11 @@
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int g_failures = 0;
@@ -517,6 +519,412 @@ static void test_lifecycle(void)
     mock_close(&mock);
 }
 
+/* Writes `content` to a fresh temp G-code file and returns its path via `path`. */
+static void write_temp_gcode(const char *content, char *path, size_t path_size)
+{
+    snprintf(path, path_size, "/tmp/printerctl_printer_gcode_XXXXXX");
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        fprintf(stderr, "FAIL: mkstemp() failed for temp G-code fixture\n");
+        g_failures++;
+        return;
+    }
+
+    FILE *file = fdopen(fd, "w");
+    fputs(content, file);
+    fclose(file);
+}
+
+/* Collects per-acknowledgement progress callbacks for assertions. */
+typedef struct {
+    uint64_t calls;
+    uint64_t last_line;
+    unsigned last_percent;
+    bool monotonic;
+} progress_probe_t;
+
+static void collect_progress(const printerctl_gcode_result_t *result, void *context)
+{
+    progress_probe_t *probe = context;
+    if (probe->calls > 0 && result->progress_percent < probe->last_percent) {
+        probe->monotonic = false;
+    }
+    probe->calls++;
+    probe->last_line = result->line_number;
+    probe->last_percent = result->progress_percent;
+}
+
+static void test_print_file_completes_and_reports_progress(void)
+{
+    mock_printer_t mock;
+    if (!mock_open(&mock, 1000)) {
+        return;
+    }
+
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+    char path[64];
+    write_temp_gcode("; header\nG21\nG90 ; absolute\n\nM105\n", path, sizeof(path));
+    mock_reply(&mock, "ok\nok\nok\n");
+
+    progress_probe_t probe = {.monotonic = true};
+    printerctl_print_summary_t summary;
+    printerctl_printer_status_t status = printerctl_printer_print_file(
+        &session, path, collect_progress, &probe, &summary, &error);
+
+    check(status == PRINTERCTL_PRINTER_OK, "a clean print completes");
+    check(summary.state == PRINTERCTL_PRINT_COMPLETED, "the summary reports the completed state");
+    check(summary.commands_sent == 3 && summary.commands_acknowledged == 3,
+          "the summary counts sent and acknowledged commands");
+    check(summary.last_acknowledged_line == 5, "the summary names the last acknowledged source line");
+    check(summary.progress_percent == 100, "a completed print reports 100%");
+    check(summary.file_size > 0 && summary.bytes_consumed == summary.file_size,
+          "a completed print consumed the whole file");
+    check(probe.calls == 3, "the progress callback ran once per acknowledged command");
+    check(probe.monotonic && probe.last_percent == 100,
+          "progress is monotonic and ends at 100%");
+
+    char transmitted[128];
+    mock_received(&mock, transmitted, sizeof(transmitted));
+    check(strcmp(transmitted, "G21\nG90\nM105\n") == 0,
+          "exactly the normalized commands were transmitted, in order");
+
+    printerctl_printer_disconnect(&session, &error);
+    mock_close(&mock);
+    remove(path);
+}
+
+/*
+ * The no-flooding acceptance test: a strict mock that, after reading
+ * each complete command line, verifies nothing else arrives before it
+ * sends its `ok`. If the session ever transmits command N+1 before
+ * command N was acknowledged, the child exits with status 2.
+ */
+static pid_t spawn_strict_mock(int master, int expected_commands)
+{
+    pid_t pid = fork();
+    if (pid != 0) {
+        return pid;
+    }
+
+    for (int i = 0; i < expected_commands; i++) {
+        char c;
+        for (;;) {
+            if (read(master, &c, 1) <= 0) {
+                _exit(1);
+            }
+            if (c == '\n') {
+                break;
+            }
+        }
+
+        struct pollfd pfd = {.fd = master, .events = POLLIN, .revents = 0};
+        if (poll(&pfd, 1, 150) != 0) {
+            _exit(2); /* flooding: more data arrived before our ok */
+        }
+
+        if (write(master, "ok\n", 3) != 3) {
+            _exit(1);
+        }
+    }
+    _exit(0);
+}
+
+static void test_print_file_never_floods_the_serial_buffer(void)
+{
+    mock_printer_t mock;
+    if (!mock_open(&mock, 2000)) {
+        return;
+    }
+
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\nM400\n", path, sizeof(path));
+
+    pid_t mock_pid = spawn_strict_mock(mock.master, 4);
+
+    printerctl_print_summary_t summary;
+    printerctl_printer_status_t status =
+        printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+
+    check(status == PRINTERCTL_PRINTER_OK, "the strictly paced print completes");
+
+    if (status != PRINTERCTL_PRINTER_OK) {
+        kill(mock_pid, SIGKILL); /* avoid a blocked child on failure */
+    }
+    int child_status = 0;
+    waitpid(mock_pid, &child_status, 0);
+    check(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0,
+          "the strict mock observed no command before the previous acknowledgement");
+
+    printerctl_printer_disconnect(&session, &error);
+    mock_close(&mock);
+    remove(path);
+}
+
+static void test_print_file_stops_on_error(void)
+{
+    mock_printer_t mock;
+    if (!mock_open(&mock, 1000)) {
+        return;
+    }
+
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\n", path, sizeof(path));
+    mock_reply(&mock, "ok\nError:Thermal Runaway\n");
+
+    printerctl_print_summary_t summary;
+    printerctl_printer_status_t status =
+        printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+
+    check(status == PRINTERCTL_PRINTER_ERR_PRINTER_ERROR,
+          "an Error: reply stops the print with the printer-error status");
+    check(summary.state == PRINTERCTL_PRINT_FAILED, "the summary reports the failed state");
+    check(summary.commands_sent == 2 && summary.commands_acknowledged == 1,
+          "the summary shows the failing command was the second one");
+    check(summary.last_acknowledged_line == 1, "the last acknowledged line is the first command's");
+    check(strstr(error.message, "Thermal Runaway") != NULL,
+          "the printer's error message is carried through");
+
+    char transmitted[64];
+    mock_received(&mock, transmitted, sizeof(transmitted));
+    check(strcmp(transmitted, "G21\nG90\n") == 0,
+          "no command after the failing one was transmitted");
+
+    printerctl_printer_disconnect(&session, &error);
+    mock_close(&mock);
+    remove(path);
+}
+
+static void test_print_file_stops_on_resend_and_timeout(void)
+{
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG90\n", path, sizeof(path));
+        mock_reply(&mock, "ok\nResend: 2\n");
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status =
+            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_ERR_RESEND,
+              "a Resend: reply stops the print with the explicit unsupported status");
+        check(summary.state == PRINTERCTL_PRINT_FAILED && summary.commands_acknowledged == 1,
+              "the resend summary shows where streaming stopped");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 150)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG90\n", path, sizeof(path));
+        mock_reply(&mock, "ok\n"); /* then silence */
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status =
+            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_ERR_TIMEOUT,
+              "acknowledgement silence stops the print with an explicit timeout");
+        check(summary.state == PRINTERCTL_PRINT_FAILED &&
+                  summary.commands_sent == 2 && summary.commands_acknowledged == 1,
+              "the timeout summary shows where streaming stopped");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+}
+
+static void test_print_file_blocks_g28_and_file_errors(void)
+{
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG28\nG90\n", path, sizeof(path));
+        mock_reply(&mock, "ok\n");
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status =
+            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND,
+              "a G28 in the file stops the print as an unsafe command");
+        check(strstr(error.message, "line 2") != NULL, "the G28 rejection names its line");
+        check(summary.commands_sent == 1, "the G28 line itself was never transmitted");
+
+        char transmitted[64];
+        mock_received(&mock, transmitted, sizeof(transmitted));
+        check(strcmp(transmitted, "G21\n") == 0, "only the command before the G28 went out");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG1 (never closed\n", path, sizeof(path));
+        mock_reply(&mock, "ok\n");
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status =
+            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_ERR_GCODE,
+              "a malformed line mid-stream stops the print with the G-code status");
+        check(summary.state == PRINTERCTL_PRINT_FAILED && summary.commands_acknowledged == 1,
+              "the file-error summary shows where streaming stopped");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+    {
+        /* Unopenable file: fails before anything is transmitted. */
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status = printerctl_printer_print_file(
+            &session, "/nonexistent/job.gcode", NULL, NULL, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_ERR_GCODE,
+              "an unopenable file fails with the G-code status");
+        check(summary.commands_sent == 0, "nothing was transmitted for an unopenable file");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+    }
+}
+
+static void test_print_file_waits_out_busy_and_handles_empty_file(void)
+{
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG90\n", path, sizeof(path));
+        mock_reply(&mock, "echo:busy: processing\nok\nok\n");
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status =
+            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_OK,
+              "busy keepalives during a print are waited out");
+        check(summary.commands_acknowledged == 2, "both commands were acknowledged");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("", path, sizeof(path));
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status =
+            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_OK, "an empty file completes trivially");
+        check(summary.state == PRINTERCTL_PRINT_COMPLETED && summary.commands_sent == 0 &&
+                  summary.progress_percent == 100,
+              "the empty-file summary reports completion with zero commands");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+}
+
+static void test_print_file_guards(void)
+{
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_print_summary_t summary;
+    printerctl_config_t config;
+    printerctl_config_set_defaults(&config);
+
+    printerctl_printer_connect(&session, &config, NULL, &error); /* rejected: no port */
+
+    check(printerctl_printer_print_file(&session, "/tmp/x.gcode", NULL, NULL, &summary, &error) ==
+              PRINTERCTL_PRINTER_ERR_NOT_CONNECTED,
+          "printing on an unconnected session reports NOT_CONNECTED");
+    check(printerctl_printer_print_file(&session, NULL, NULL, NULL, &summary, &error) ==
+              PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT,
+          "printing with a NULL path is rejected");
+    check(printerctl_printer_print_file(&session, "/tmp/x.gcode", NULL, NULL, NULL, &error) ==
+              PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT,
+          "printing with a NULL summary is rejected");
+}
+
 int main(void)
 {
     test_query_temperature_from_ok_payload();
@@ -531,6 +939,13 @@ int main(void)
     test_disconnected_printer();
     test_connect_guards();
     test_lifecycle();
+    test_print_file_completes_and_reports_progress();
+    test_print_file_never_floods_the_serial_buffer();
+    test_print_file_stops_on_error();
+    test_print_file_stops_on_resend_and_timeout();
+    test_print_file_blocks_g28_and_file_errors();
+    test_print_file_waits_out_busy_and_handles_empty_file();
+    test_print_file_guards();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

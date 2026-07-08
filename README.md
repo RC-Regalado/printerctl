@@ -6,12 +6,12 @@ Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
 
 ## Status
 
-This repository currently implements Milestone 6 (Single Marlin Commands);
-see `roadmap.md` for the milestone plan and
-`docs/milestones/milestone-6.md` /
-`docs/design/milestone-6-printer-commands.md` for what this milestone
-covers and why (earlier milestones are covered by their own reports
-under `docs/milestones/`).
+This repository currently implements Milestone 7 (Reliable G-code
+Streaming MVP); see `roadmap.md` for the milestone plan and
+`docs/milestones/milestone-7.md` /
+`docs/design/milestone-7-streaming.md` for what this milestone covers
+and why (earlier milestones are covered by their own reports under
+`docs/milestones/`).
 
 The CLI parses the full command grammar and resolves configuration from
 defaults, an optional `--config` file and CLI overrides, and every command
@@ -21,11 +21,14 @@ talk to the printer over the configured `--port`: one command is
 transmitted, response lines are read until Marlin's terminal reply
 (waiting out `busy:`/`echo:` keepalives), and the result is rendered
 human-readably. `send` refuses G28 with no bypass; the operator's
-explicit `M112` passes through. `--dry-run print FILE` parses and
-normalizes the G-code file, reports commands and byte progress, and
-never opens a serial device; `--dry-run` with a single command prints
-the line it would transmit and exits `0`. Streaming (`print` without
-`--dry-run`), `home`, `pause`, `resume` and `cancel` still exit `5`.
+explicit `M112` passes through. `print FILE` streams the G-code file
+one acknowledged command at a time — the next command is not sent (or
+even read from the file) until Marlin replies `ok` — reporting progress
+per whole-percent change and a session summary with the final state and
+last acknowledged line. `--dry-run print FILE` parses and normalizes
+the file without opening a serial device; `--dry-run` with a single
+command prints the line it would transmit and exits `0`. Only `home`,
+`pause`, `resume` and `cancel` still exit `5`.
 
 ## Requirements
 
@@ -113,6 +116,15 @@ progress. It strips comments and blank lines, rejects malformed or
 oversized lines with exit code `6`, and rejects `G28` with exit code `4`.
 No serial device is opened.
 
+`print FILE` (without `--dry-run`) streams the file over the configured
+port, waiting for each command's `ok` before sending the next; `busy:`
+and `echo:` keepalives never time the print out (the timeout bounds
+silence). It stops gracefully — nothing further is sent and a summary
+names the final state, commands sent/acknowledged and last acknowledged
+line — on `Error:` (exit `8`), `Resend:` (exit `8`, unsupported in the
+MVP), timeout or disconnect (exit `7`), a malformed file (exit `6`) or
+a `G28` line (exit `4`, blocked before transmission).
+
 `temp`, `position`, `info` and `send COMMAND` require a configured port
 (`--port` or the config file; exit code `3` otherwise), transmit their
 Marlin command (`M105`, `M114`, `M115`, or the raw text), wait for the
@@ -175,6 +187,7 @@ the `serial_tx`/`serial_rx` records under `--verbose`). See
 ./build/printerctl --help
 ./build/printerctl --version
 ./build/printerctl --dry-run print file.gcode
+./build/printerctl --port /dev/ttyACM0 print file.gcode
 ./build/printerctl --port /dev/ttyACM0 temp
 ./build/printerctl --port /dev/ttyACM0 position
 ./build/printerctl --port /dev/ttyACM0 info
