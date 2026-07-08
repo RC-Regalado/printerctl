@@ -6,13 +6,12 @@ Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
 
 ## Status
 
-This repository currently implements Milestone 4 (Marlin Response Parser);
+This repository currently implements Milestone 5 (Serial Transport);
 see `roadmap.md` for the milestone plan and
-`docs/milestones/milestone-4.md` /
-`docs/design/milestone-4-marlin.md` for what this milestone covers and
-why (Milestone 3's G-code/dry-run work is covered in
-`docs/milestones/milestone-3.md` /
-`docs/design/milestone-3-gcode-dry-run.md`).
+`docs/milestones/milestone-5.md` /
+`docs/design/milestone-5-serial.md` for what this milestone covers and
+why (earlier milestones are covered by their own reports under
+`docs/milestones/`).
 
 The CLI parses the full command grammar and resolves configuration from
 defaults, an optional `--config` file and CLI overrides, and every command
@@ -21,9 +20,13 @@ invocation now produces structured, timestamped logs on `stderr` (see
 G-code file, reports commands and byte progress, and never opens a serial
 device. The Marlin response parser (`printerctl_marlin`) classifies
 `ok`/`Error:`/`busy:`/`echo:`/`Resend:` lines and decodes temperature,
-position and firmware-info reports, but nothing feeds it real printer
-output yet: no serial functionality exists, and non-dry-run commands
-still exit `5`.
+position and firmware-info reports. The serial transport
+(`printerctl_serial`) opens a terminal device in raw 8N1 mode and
+exchanges timeout-bounded command/response lines, validated against
+pseudo-terminals. The pieces are not composed yet: no CLI command opens
+a serial port, and non-dry-run commands still exit `5` until
+Milestone 6 wires `serial` + `marlin` + `logging` into `temp`,
+`position`, `info` and `send`.
 
 ## Requirements
 
@@ -53,11 +56,12 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. Five
+Use `build-clang` instead of `build` if you configured with Clang. Six
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 including its logging integration), `printerctl_config_tests`
 (configuration module), `printerctl_gcode_tests` (G-code reader),
-`printerctl_marlin_tests` (Marlin response parser) and
+`printerctl_marlin_tests` (Marlin response parser),
+`printerctl_serial_tests` (serial transport over pseudo-terminals) and
 `printerctl_logging_tests` (logging module).
 
 ## Usage

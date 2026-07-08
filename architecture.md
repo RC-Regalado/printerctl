@@ -223,6 +223,16 @@ serial_status_t serial_read_line(serial_port_t *port, char *buffer, size_t buffe
 void serial_close(serial_port_t *port);
 ```
 
+**Resolved in Milestone 5 (see [[docs/design/milestone-5-serial]]):** the
+implemented API (`include/printerctl/serial.h`) deviates deliberately
+from this sketch — `printerctl_serial_port_t` is a plain stack value (no
+heap, matching every other module), functions carry the `printerctl_`
+prefix, every call takes an explicit error out-parameter, and close is
+idempotent and returns a status. Timeouts and disconnects are distinct
+explicit statuses (`ERR_TIMEOUT`, `ERR_DISCONNECTED`), and only the
+standard Linux `Bxxx` baud rates are supported (Marlin's nonstandard
+250000 is rejected as `ERR_UNSUPPORTED_BAUD`).
+
 ### 6.5 `marlin`
 
 Parses Marlin responses and implements command acknowledgement semantics.

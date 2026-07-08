@@ -56,6 +56,15 @@ target_include_directories(printerctl_marlin
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+add_library(printerctl_serial STATIC
+    src/serial/serial.c
+)
+
+target_include_directories(printerctl_serial
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
 add_library(printerctl_cli STATIC
     src/cli/cli.c
 )
