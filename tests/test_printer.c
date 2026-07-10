@@ -572,7 +572,7 @@ static void test_print_file_completes_and_reports_progress(void)
     progress_probe_t probe = {.monotonic = true};
     printerctl_print_summary_t summary;
     printerctl_printer_status_t status = printerctl_printer_print_file(
-        &session, path, collect_progress, &probe, &summary, &error);
+        &session, path, collect_progress, &probe, NULL, NULL, &summary, &error);
 
     check(status == PRINTERCTL_PRINTER_OK, "a clean print completes");
     check(summary.state == PRINTERCTL_PRINT_COMPLETED, "the summary reports the completed state");
@@ -650,7 +650,7 @@ static void test_print_file_never_floods_the_serial_buffer(void)
 
     printerctl_print_summary_t summary;
     printerctl_printer_status_t status =
-        printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+        printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
     check(status == PRINTERCTL_PRINTER_OK, "the strictly paced print completes");
 
@@ -684,7 +684,7 @@ static void test_print_file_stops_on_error(void)
 
     printerctl_print_summary_t summary;
     printerctl_printer_status_t status =
-        printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+        printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
     check(status == PRINTERCTL_PRINTER_ERR_PRINTER_ERROR,
           "an Error: reply stops the print with the printer-error status");
@@ -723,7 +723,7 @@ static void test_print_file_stops_on_resend_and_timeout(void)
 
         printerctl_print_summary_t summary;
         printerctl_printer_status_t status =
-            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+            printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
         check(status == PRINTERCTL_PRINTER_ERR_RESEND,
               "a Resend: reply stops the print with the explicit unsupported status");
@@ -750,7 +750,7 @@ static void test_print_file_stops_on_resend_and_timeout(void)
 
         printerctl_print_summary_t summary;
         printerctl_printer_status_t status =
-            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+            printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
         check(status == PRINTERCTL_PRINTER_ERR_TIMEOUT,
               "acknowledgement silence stops the print with an explicit timeout");
@@ -782,7 +782,7 @@ static void test_print_file_blocks_g28_and_file_errors(void)
 
         printerctl_print_summary_t summary;
         printerctl_printer_status_t status =
-            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+            printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
         check(status == PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND,
               "a G28 in the file stops the print as an unsafe command");
@@ -813,7 +813,7 @@ static void test_print_file_blocks_g28_and_file_errors(void)
 
         printerctl_print_summary_t summary;
         printerctl_printer_status_t status =
-            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+            printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
         check(status == PRINTERCTL_PRINTER_ERR_GCODE,
               "a malformed line mid-stream stops the print with the G-code status");
@@ -837,7 +837,7 @@ static void test_print_file_blocks_g28_and_file_errors(void)
 
         printerctl_print_summary_t summary;
         printerctl_printer_status_t status = printerctl_printer_print_file(
-            &session, "/nonexistent/job.gcode", NULL, NULL, &summary, &error);
+            &session, "/nonexistent/job.gcode", NULL, NULL, NULL, NULL, &summary, &error);
 
         check(status == PRINTERCTL_PRINTER_ERR_GCODE,
               "an unopenable file fails with the G-code status");
@@ -866,7 +866,7 @@ static void test_print_file_waits_out_busy_and_handles_empty_file(void)
 
         printerctl_print_summary_t summary;
         printerctl_printer_status_t status =
-            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+            printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
         check(status == PRINTERCTL_PRINTER_OK,
               "busy keepalives during a print are waited out");
@@ -891,7 +891,7 @@ static void test_print_file_waits_out_busy_and_handles_empty_file(void)
 
         printerctl_print_summary_t summary;
         printerctl_printer_status_t status =
-            printerctl_printer_print_file(&session, path, NULL, NULL, &summary, &error);
+            printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
         check(status == PRINTERCTL_PRINTER_OK, "an empty file completes trivially");
         check(summary.state == PRINTERCTL_PRINT_COMPLETED && summary.commands_sent == 0 &&
@@ -901,6 +901,285 @@ static void test_print_file_waits_out_busy_and_handles_empty_file(void)
         printerctl_printer_disconnect(&session, &error);
         mock_close(&mock);
         remove(path);
+    }
+}
+
+/*
+ * Scripted session control: a fixed sequence of decisions, one per
+ * poll, then CONTINUE forever. While paused it also watches the mock's
+ * master side: anything transmitted between pause polls is flooding.
+ */
+typedef struct {
+    const printerctl_print_control_t *decisions;
+    size_t count;
+    size_t polls;
+    int master;              /* -1 disables the paused-TX watch */
+    bool was_paused;
+    bool tx_while_paused;
+} control_script_t;
+
+static printerctl_print_control_t scripted_control(void *context)
+{
+    control_script_t *script = context;
+    printerctl_print_control_t decision =
+        script->polls < script->count ? script->decisions[script->polls]
+                                      : PRINTERCTL_PRINT_CONTROL_CONTINUE;
+    script->polls++;
+
+    bool paused = decision == PRINTERCTL_PRINT_CONTROL_PAUSE;
+    if (paused && script->master >= 0) {
+        struct pollfd pfd = {.fd = script->master, .events = POLLIN, .revents = 0};
+        if (!script->was_paused) {
+            /* Drain what was legitimately transmitted before the pause,
+             * so later polls only see pause-time traffic. */
+            char sink[256];
+            while (poll(&pfd, 1, 0) > 0 && read(script->master, sink, sizeof(sink)) > 0) {
+            }
+        } else if (poll(&pfd, 1, 0) != 0) {
+            script->tx_while_paused = true;
+        }
+    }
+    script->was_paused = paused;
+
+    return decision;
+}
+
+static void test_print_file_pause_transmits_nothing_and_resume_continues(void)
+{
+    mock_printer_t mock;
+    if (!mock_open(&mock, 1000)) {
+        return;
+    }
+
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\n", path, sizeof(path));
+    mock_reply(&mock, "ok\nok\nok\n");
+
+    /* Stream one command, pause for three polls, then resume. */
+    static const printerctl_print_control_t decisions[] = {
+        PRINTERCTL_PRINT_CONTROL_CONTINUE,
+        PRINTERCTL_PRINT_CONTROL_PAUSE,
+        PRINTERCTL_PRINT_CONTROL_PAUSE,
+        PRINTERCTL_PRINT_CONTROL_PAUSE,
+        PRINTERCTL_PRINT_CONTROL_CONTINUE,
+    };
+    control_script_t script = {
+        .decisions = decisions,
+        .count = sizeof(decisions) / sizeof(decisions[0]),
+        .master = mock.master,
+    };
+
+    printerctl_print_summary_t summary;
+    printerctl_printer_status_t status = printerctl_printer_print_file(
+        &session, path, NULL, NULL, scripted_control, &script, &summary, &error);
+
+    check(status == PRINTERCTL_PRINTER_OK, "a paused-then-resumed print completes");
+    check(summary.state == PRINTERCTL_PRINT_COMPLETED &&
+              summary.commands_sent == 3 && summary.commands_acknowledged == 3,
+          "resume continued from the next unsent command to the end");
+    check(!script.tx_while_paused, "nothing was transmitted while the print was paused");
+    check(script.polls >= 6, "the control callback was re-polled while paused");
+
+    /* The pause-time drain consumed 'G21\n'; the rest must follow in order. */
+    char transmitted[64];
+    mock_received(&mock, transmitted, sizeof(transmitted));
+    check(strcmp(transmitted, "G90\nM105\n") == 0,
+          "the commands after the pause went out in order");
+
+    printerctl_printer_disconnect(&session, &error);
+    mock_close(&mock);
+    remove(path);
+}
+
+static void test_print_file_cancel_stops_after_current_acknowledgement(void)
+{
+    mock_printer_t mock;
+    if (!mock_open(&mock, 1000)) {
+        return;
+    }
+
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\n", path, sizeof(path));
+    mock_reply(&mock, "ok\n");
+
+    static const printerctl_print_control_t decisions[] = {
+        PRINTERCTL_PRINT_CONTROL_CONTINUE,
+        PRINTERCTL_PRINT_CONTROL_CANCEL,
+    };
+    control_script_t script = {
+        .decisions = decisions,
+        .count = sizeof(decisions) / sizeof(decisions[0]),
+        .master = -1,
+    };
+
+    printerctl_print_summary_t summary;
+    printerctl_printer_status_t status = printerctl_printer_print_file(
+        &session, path, NULL, NULL, scripted_control, &script, &summary, &error);
+
+    check(status == PRINTERCTL_PRINTER_CANCELLED,
+          "an operator cancel returns the explicit cancelled status");
+    check(summary.state == PRINTERCTL_PRINT_CANCELLED &&
+              summary.status == PRINTERCTL_PRINTER_CANCELLED,
+          "the summary reports the cancelled state and status");
+    check(summary.commands_sent == 1 && summary.commands_acknowledged == 1 &&
+              summary.last_acknowledged_line == 1,
+          "the cancel took effect after the current acknowledgement");
+    check(strstr(error.message, "cancel") != NULL, "the cancel carries an operator-facing message");
+
+    char transmitted[64];
+    mock_received(&mock, transmitted, sizeof(transmitted));
+    check(strcmp(transmitted, "G21\n") == 0, "nothing after the cancel point was transmitted");
+
+    printerctl_printer_disconnect(&session, &error);
+    mock_close(&mock);
+    remove(path);
+}
+
+static void test_print_file_cancel_before_first_command_and_while_paused(void)
+{
+    {
+        /* Cancel before anything is streamed. */
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG90\n", path, sizeof(path));
+
+        static const printerctl_print_control_t decisions[] = {
+            PRINTERCTL_PRINT_CONTROL_CANCEL,
+        };
+        control_script_t script = {.decisions = decisions, .count = 1, .master = -1};
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status = printerctl_printer_print_file(
+            &session, path, NULL, NULL, scripted_control, &script, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_CANCELLED,
+              "cancelling before the first command reports cancelled");
+        check(summary.state == PRINTERCTL_PRINT_CANCELLED && summary.commands_sent == 0,
+              "nothing was transmitted for a cancel before the first command");
+
+        char transmitted[64];
+        check(mock_received(&mock, transmitted, sizeof(transmitted)) == 0,
+              "the mock received no bytes at all");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+    {
+        /* Cancel while paused. */
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG90\n", path, sizeof(path));
+        mock_reply(&mock, "ok\n");
+
+        static const printerctl_print_control_t decisions[] = {
+            PRINTERCTL_PRINT_CONTROL_CONTINUE,
+            PRINTERCTL_PRINT_CONTROL_PAUSE,
+            PRINTERCTL_PRINT_CONTROL_CANCEL,
+        };
+        control_script_t script = {.decisions = decisions, .count = 3, .master = -1};
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status = printerctl_printer_print_file(
+            &session, path, NULL, NULL, scripted_control, &script, &summary, &error);
+
+        check(status == PRINTERCTL_PRINTER_CANCELLED, "cancelling while paused reports cancelled");
+        check(summary.state == PRINTERCTL_PRINT_CANCELLED && summary.commands_sent == 1,
+              "the paused print stopped where the pause left it");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+}
+
+static void test_sd_print_controls_send_marlin_commands(void)
+{
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        mock_reply(&mock, "ok\nok\nok\n");
+
+        check(printerctl_printer_pause_sd_print(&session, NULL, NULL, &error) ==
+                  PRINTERCTL_PRINTER_OK,
+              "the SD pause exchange succeeds");
+        check(printerctl_printer_resume_sd_print(&session, NULL, NULL, &error) ==
+                  PRINTERCTL_PRINTER_OK,
+              "the SD resume exchange succeeds");
+        check(printerctl_printer_cancel_sd_print(&session, NULL, NULL, &error) ==
+                  PRINTERCTL_PRINTER_OK,
+              "the SD cancel exchange succeeds");
+
+        char transmitted[64];
+        mock_received(&mock, transmitted, sizeof(transmitted));
+        check(strcmp(transmitted, "M25\nM24\nM524\n") == 0,
+              "pause/resume/cancel map to exactly M25, M24 and M524");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+    }
+    {
+        /* An Error: reply fails the control like any other exchange. */
+        mock_printer_t mock;
+        if (!mock_open(&mock, 1000)) {
+            return;
+        }
+
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        mock_reply(&mock, "Error:Printer halted. kill() called!\n");
+
+        check(printerctl_printer_pause_sd_print(&session, NULL, NULL, &error) ==
+                  PRINTERCTL_PRINTER_ERR_PRINTER_ERROR,
+              "an Error: reply to M25 becomes ERR_PRINTER_ERROR");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+    }
+    {
+        /* Session-lifecycle guard: not connected. */
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_config_t config;
+        printerctl_config_set_defaults(&config);
+        printerctl_printer_connect(&session, &config, NULL, &error); /* rejected: no port */
+
+        check(printerctl_printer_pause_sd_print(&session, NULL, NULL, &error) ==
+                  PRINTERCTL_PRINTER_ERR_NOT_CONNECTED,
+              "an SD control on an unconnected session reports NOT_CONNECTED");
     }
 }
 
@@ -914,13 +1193,13 @@ static void test_print_file_guards(void)
 
     printerctl_printer_connect(&session, &config, NULL, &error); /* rejected: no port */
 
-    check(printerctl_printer_print_file(&session, "/tmp/x.gcode", NULL, NULL, &summary, &error) ==
+    check(printerctl_printer_print_file(&session, "/tmp/x.gcode", NULL, NULL, NULL, NULL, &summary, &error) ==
               PRINTERCTL_PRINTER_ERR_NOT_CONNECTED,
           "printing on an unconnected session reports NOT_CONNECTED");
-    check(printerctl_printer_print_file(&session, NULL, NULL, NULL, &summary, &error) ==
+    check(printerctl_printer_print_file(&session, NULL, NULL, NULL, NULL, NULL, &summary, &error) ==
               PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT,
           "printing with a NULL path is rejected");
-    check(printerctl_printer_print_file(&session, "/tmp/x.gcode", NULL, NULL, NULL, &error) ==
+    check(printerctl_printer_print_file(&session, "/tmp/x.gcode", NULL, NULL, NULL, NULL, NULL, &error) ==
               PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT,
           "printing with a NULL summary is rejected");
 }
@@ -945,6 +1224,10 @@ int main(void)
     test_print_file_stops_on_resend_and_timeout();
     test_print_file_blocks_g28_and_file_errors();
     test_print_file_waits_out_busy_and_handles_empty_file();
+    test_print_file_pause_transmits_nothing_and_resume_continues();
+    test_print_file_cancel_stops_after_current_acknowledgement();
+    test_print_file_cancel_before_first_command_and_while_paused();
+    test_sd_print_controls_send_marlin_commands();
     test_print_file_guards();
 
     if (g_failures > 0) {

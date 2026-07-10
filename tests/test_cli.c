@@ -7,6 +7,7 @@
 #include "printerctl/version.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -470,10 +471,12 @@ static void test_dry_run_home_without_confirmation_still_fails(void)
     free(err);
 }
 
-static void test_simple_commands_unavailable(void)
+static void test_printer_commands_need_port(void)
 {
-    /* Streaming-session controls are still unavailable in this build. */
-    const char *commands[] = {"pause", "resume", "cancel"};
+    /* Since Milestone 6 (queries/send) and Milestone 8 (SD-print
+     * controls) these commands execute for real; without a configured
+     * port they are a configuration error, not "unavailable". */
+    const char *commands[] = {"pause", "resume", "cancel", "temp", "position", "info"};
 
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
         char *argv[] = {(char *)"printerctl", (char *)commands[i]};
@@ -482,25 +485,7 @@ static void test_simple_commands_unavailable(void)
 
         int status = run_cli(2, argv, &out, &err);
 
-        check(status == PRINTERCTL_EXIT_UNAVAILABLE, "simple command parses and reports unavailable");
-        check(out != NULL && strstr(out, commands[i]) != NULL, "unavailable message names the command");
-
-        free(out);
-        free(err);
-    }
-
-    /* Since Milestone 6 the query commands execute for real; without a
-     * configured port they are a configuration error. */
-    const char *queries[] = {"temp", "position", "info"};
-
-    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
-        char *argv[] = {(char *)"printerctl", (char *)queries[i]};
-        char *out = NULL;
-        char *err = NULL;
-
-        int status = run_cli(2, argv, &out, &err);
-
-        check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "a query command without a port is a configuration error");
+        check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "a printer command without a port is a configuration error");
         check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
 
         free(out);
@@ -524,11 +509,14 @@ static void test_global_option_after_command_rejected(void)
 
 static void test_cli_value_equal_to_default(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"--baud", (char *)"115200", (char *)"pause"};
+    /* 'home' with confirmation is the one remaining unavailable command,
+     * so it still renders the resolved configuration. */
+    char *argv[] = {(char *)"printerctl", (char *)"--baud", (char *)"115200",
+                     (char *)"home", (char *)"--i-understand-no-endstops"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(4, argv, &out, &err);
+    int status = run_cli(5, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_UNAVAILABLE, "explicit --baud equal to the default still parses successfully");
     check(out != NULL && strstr(out, "baud=115200") != NULL, "resolved config reflects the explicit default value");
@@ -543,11 +531,12 @@ static void test_config_file_precedence(void)
     write_temp_config("port=/dev/from-file\nbaud=57600\n", path, sizeof(path));
 
     char *argv[] = {(char *)"printerctl", (char *)"--config", path,
-                     (char *)"--port", (char *)"/dev/from-cli", (char *)"pause"};
+                     (char *)"--port", (char *)"/dev/from-cli",
+                     (char *)"home", (char *)"--i-understand-no-endstops"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(6, argv, &out, &err);
+    int status = run_cli(7, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_UNAVAILABLE, "valid --config with CLI override parses successfully");
     check(out != NULL && strstr(out, "port=/dev/from-cli") != NULL, "CLI port overrides the config file port");
@@ -682,16 +671,16 @@ static void test_help_and_version_produce_no_logs(void)
 
 static void test_successful_command_logs_session_lifecycle(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"pause"};
+    char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"--i-understand-no-endstops"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(2, argv, &out, &err);
+    int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "non-verbose 'pause' still resolves and reports unavailable");
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "non-verbose confirmed 'home' still resolves and reports unavailable");
     check(err != NULL && strstr(err, "\tINFO\tsession_start\t") != NULL, "log includes a session_start line");
     check(err != NULL && strstr(err, "\tINFO\tconfig_summary\t") != NULL, "log includes a config_summary line");
-    check(err != NULL && strstr(err, "\tWARNING\tcommand_unavailable\tcommand=pause") != NULL,
+    check(err != NULL && strstr(err, "\tWARNING\tcommand_unavailable\tcommand=home") != NULL,
           "log includes a command_unavailable line naming the command");
     check(err != NULL && strstr(err, "\tINFO\tsession_end\t") != NULL, "log includes a session_end line");
     check(err != NULL && strstr(err, "command_parsed") == NULL,
@@ -704,14 +693,15 @@ static void test_successful_command_logs_session_lifecycle(void)
 
 static void test_verbose_adds_command_parsed_log(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"--verbose", (char *)"pause"};
+    char *argv[] = {(char *)"printerctl", (char *)"--verbose",
+                     (char *)"home", (char *)"--i-understand-no-endstops"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(3, argv, &out, &err);
+    int status = run_cli(4, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "verbose 'pause' still resolves and reports unavailable");
-    check(err != NULL && strstr(err, "\tDEBUG\tcommand_parsed\tcommand=pause") != NULL,
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "verbose confirmed 'home' still resolves and reports unavailable");
+    check(err != NULL && strstr(err, "\tDEBUG\tcommand_parsed\tcommand=home") != NULL,
           "verbose run logs the DEBUG command_parsed line naming the command");
     check(err != NULL && count_occurrences(err, "\n") == 5, "verbose run logs exactly five lines");
 
@@ -725,13 +715,14 @@ static void test_config_summary_omits_raw_port_and_config_path(void)
     write_temp_config("baud=57600\n", path, sizeof(path));
 
     char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"/dev/ttyACM0",
-                     (char *)"--config", path, (char *)"pause"};
+                     (char *)"--config", path,
+                     (char *)"home", (char *)"--i-understand-no-endstops"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(6, argv, &out, &err);
+    int status = run_cli(7, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "port+config 'pause' still resolves and reports unavailable");
+    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "port+config confirmed 'home' still resolves and reports unavailable");
     check(err != NULL && strstr(err, "port_set=true") != NULL, "config_summary reports port_set=true as a boolean");
     check(err != NULL && strstr(err, "config_file_set=true") != NULL,
           "config_summary reports config_file_set=true as a boolean");
@@ -1524,6 +1515,338 @@ static void test_print_timeout_end_to_end(void)
     free(err);
 }
 
+static void test_pause_resume_cancel_sd_end_to_end(void)
+{
+    const struct {
+        const char *command;
+        const char *tx_line;
+        const char *report;
+    } cases[] = {
+        {"pause", "> M25", "SD print pause requested (M25 acknowledged)"},
+        {"resume", "> M24", "SD print resume requested (M24 acknowledged)"},
+        {"cancel", "> M524", "SD print abort requested (M524 acknowledged)"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        cli_mock_printer_t mock;
+        if (!cli_mock_start(&mock, "ok\n")) {
+            return;
+        }
+
+        char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                         (char *)"--verbose", (char *)cases[i].command};
+        char *out = NULL;
+        char *err = NULL;
+
+        int status = run_cli(5, argv, &out, &err);
+
+        check(status == PRINTERCTL_EXIT_OK, "an SD-print control against the mock printer exits with success");
+        check(out != NULL && strstr(out, cases[i].tx_line) != NULL,
+              "the SD-print control echoes the Marlin command it transmits");
+        check(out != NULL && strstr(out, "< ok") != NULL,
+              "the SD-print control renders the acknowledgement");
+        check(out != NULL && strstr(out, cases[i].report) != NULL,
+              "the SD-print control reports what was requested");
+        check(err != NULL && strstr(err, "state=sd_") != NULL,
+              "the requested SD control is logged as a state transition");
+
+        cli_mock_stop(&mock);
+        free(out);
+        free(err);
+    }
+
+    {
+        /* An Error: reply fails the control with the printer error code. */
+        cli_mock_printer_t mock;
+        if (!cli_mock_start(&mock, "Error:Printer halted. kill() called!\n")) {
+            return;
+        }
+
+        char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path, (char *)"pause"};
+        char *out = NULL;
+        char *err = NULL;
+
+        int status = run_cli(4, argv, &out, &err);
+
+        check(status == PRINTERCTL_EXIT_PRINTER_ERROR,
+              "an Error: reply to an SD-print control exits with the printer error code");
+
+        cli_mock_stop(&mock);
+        free(out);
+        free(err);
+    }
+}
+
+static void test_dry_run_sd_controls(void)
+{
+    const struct {
+        const char *command;
+        const char *would_send;
+    } cases[] = {
+        {"pause", "would send 'M25'"},
+        {"resume", "would send 'M24'"},
+        {"cancel", "would send 'M524'"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)cases[i].command};
+        char *out = NULL;
+        char *err = NULL;
+
+        int status = run_cli(3, argv, &out, &err);
+
+        check(status == PRINTERCTL_EXIT_OK, "a dry-run SD-print control exits with success without a port");
+        check(out != NULL && strstr(out, cases[i].would_send) != NULL,
+              "the dry-run SD-print control reports the Marlin command it would send");
+
+        free(out);
+        free(err);
+    }
+}
+
+/*
+ * Slow-acknowledgement variant of the scripted mock: one reply per
+ * received command line, each delayed by `delay_ms`, so a streaming
+ * print stays in flight long enough for the parent to drive it with
+ * signals.
+ */
+static bool cli_mock_start_script_delayed(cli_mock_printer_t *mock,
+                                           const char *const *replies, size_t reply_count,
+                                           int delay_ms)
+{
+    mock->master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (mock->master < 0 || grantpt(mock->master) != 0 || unlockpt(mock->master) != 0) {
+        fprintf(stderr, "FAIL: cannot create pty for the delayed mock printer\n");
+        g_failures++;
+        return false;
+    }
+
+    const char *name = ptsname(mock->master);
+    if (name == NULL || strlen(name) >= sizeof(mock->slave_path)) {
+        fprintf(stderr, "FAIL: ptsname for the delayed mock printer\n");
+        g_failures++;
+        close(mock->master);
+        return false;
+    }
+    strcpy(mock->slave_path, name);
+
+    mock->child = fork();
+    if (mock->child < 0) {
+        fprintf(stderr, "FAIL: cannot fork the delayed mock printer\n");
+        g_failures++;
+        close(mock->master);
+        return false;
+    }
+
+    if (mock->child == 0) {
+        char c;
+        for (size_t i = 0; i < reply_count; i++) {
+            for (;;) {
+                ssize_t n = read(mock->master, &c, 1);
+                if (n <= 0) {
+                    _exit(1);
+                }
+                if (c == '\n') {
+                    break;
+                }
+            }
+            poll(NULL, 0, delay_ms);
+            size_t length = strlen(replies[i]);
+            if (write(mock->master, replies[i], length) != (ssize_t)length) {
+                _exit(1);
+            }
+        }
+        for (;;) {
+            ssize_t n = read(mock->master, &c, 1);
+            if (n <= 0) {
+                _exit(0);
+            }
+        }
+    }
+
+    return true;
+}
+
+/*
+ * Runs printerctl_cli_run() in a forked child with stdout captured to a
+ * temp file, so the parent can watch the output live and drive the
+ * print with signals — exactly how an operator controls a host stream.
+ */
+typedef struct {
+    pid_t pid;
+    char out_path[64];
+} cli_print_process_t;
+
+static bool cli_print_start(cli_print_process_t *proc, int argc, char *argv[])
+{
+    snprintf(proc->out_path, sizeof(proc->out_path), "/tmp/printerctl_cli_out_XXXXXX");
+    int fd = mkstemp(proc->out_path);
+    if (fd < 0) {
+        fprintf(stderr, "FAIL: mkstemp() failed for the CLI output capture\n");
+        g_failures++;
+        return false;
+    }
+
+    proc->pid = fork();
+    if (proc->pid < 0) {
+        fprintf(stderr, "FAIL: cannot fork the CLI process\n");
+        g_failures++;
+        close(fd);
+        return false;
+    }
+
+    if (proc->pid == 0) {
+        FILE *out = fdopen(fd, "w");
+        FILE *err = fopen("/dev/null", "w");
+        if (out == NULL || err == NULL) {
+            _exit(127);
+        }
+        int code = printerctl_cli_run(argc, argv, out, err);
+        fflush(out);
+        _exit(code);
+    }
+
+    close(fd);
+    return true;
+}
+
+/* Polls the captured output until `needle` appears (or ~3 s pass). */
+static bool cli_print_wait_for_output(cli_print_process_t *proc, const char *needle)
+{
+    char buffer[4096];
+    for (int attempt = 0; attempt < 300; attempt++) {
+        FILE *file = fopen(proc->out_path, "r");
+        if (file != NULL) {
+            size_t n = fread(buffer, 1, sizeof(buffer) - 1, file);
+            buffer[n] = '\0';
+            fclose(file);
+            if (strstr(buffer, needle) != NULL) {
+                return true;
+            }
+        }
+        poll(NULL, 0, 10);
+    }
+    return false;
+}
+
+/* Bounded wait for the CLI child; kills it rather than hanging the suite. */
+static bool cli_print_wait_exit(cli_print_process_t *proc, int *out_code)
+{
+    for (int attempt = 0; attempt < 800; attempt++) {
+        int status = 0;
+        pid_t done = waitpid(proc->pid, &status, WNOHANG);
+        if (done == proc->pid) {
+            if (WIFEXITED(status)) {
+                *out_code = WEXITSTATUS(status);
+                return true;
+            }
+            return false;
+        }
+        poll(NULL, 0, 10);
+    }
+    kill(proc->pid, SIGKILL);
+    waitpid(proc->pid, NULL, 0);
+    return false;
+}
+
+/* Reads the whole captured output into `buffer`. */
+static void cli_print_read_output(cli_print_process_t *proc, char *buffer, size_t buffer_size)
+{
+    buffer[0] = '\0';
+    FILE *file = fopen(proc->out_path, "r");
+    if (file != NULL) {
+        size_t n = fread(buffer, 1, buffer_size - 1, file);
+        buffer[n] = '\0';
+        fclose(file);
+    }
+}
+
+static void test_print_pause_and_resume_by_signal_end_to_end(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\nM400\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n", "ok\n", "ok\n", "ok\n"};
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script_delayed(&mock, replies, 4, 150)) {
+        remove(path);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"print", path};
+    cli_print_process_t proc;
+    if (!cli_print_start(&proc, 5, argv)) {
+        cli_mock_stop(&mock);
+        remove(path);
+        return;
+    }
+
+    /* The signals land while acknowledgements are still pending, because
+     * every mock reply is delayed 150 ms. */
+    check(cli_print_wait_for_output(&proc, "printerctl: printing"), "the print announces itself");
+    kill(proc.pid, SIGUSR1);
+    check(cli_print_wait_for_output(&proc, "print paused"),
+          "SIGUSR1 pauses the print after the current acknowledgement");
+    kill(proc.pid, SIGUSR2);
+    check(cli_print_wait_for_output(&proc, "print resumed"), "SIGUSR2 resumes the print");
+
+    int code = -1;
+    check(cli_print_wait_exit(&proc, &code), "the paused-then-resumed print finishes");
+    check(code == PRINTERCTL_EXIT_OK, "the resumed print exits with success");
+
+    char output[4096];
+    cli_print_read_output(&proc, output, sizeof(output));
+    check(strstr(output, "print completed") != NULL, "the summary reports completion");
+    check(strstr(output, "4 command(s) sent, 4 acknowledged") != NULL,
+          "resume continued from the next unsent command: every command streamed");
+
+    cli_mock_stop(&mock);
+    remove(proc.out_path);
+    remove(path);
+}
+
+static void test_print_cancel_by_signal_end_to_end(void)
+{
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\nM400\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n", "ok\n", "ok\n", "ok\n"};
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script_delayed(&mock, replies, 4, 150)) {
+        remove(path);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"print", path};
+    cli_print_process_t proc;
+    if (!cli_print_start(&proc, 5, argv)) {
+        cli_mock_stop(&mock);
+        remove(path);
+        return;
+    }
+
+    check(cli_print_wait_for_output(&proc, "printerctl: printing"), "the print announces itself");
+    kill(proc.pid, SIGINT);
+
+    int code = -1;
+    check(cli_print_wait_exit(&proc, &code), "the cancelled print finishes promptly");
+    check(code == PRINTERCTL_EXIT_PRINT_CANCELLED,
+          "SIGINT during a print exits with the print-cancelled code");
+
+    char output[4096];
+    cli_print_read_output(&proc, output, sizeof(output));
+    check(strstr(output, "print cancelled") != NULL, "the summary reports the cancelled state");
+    check(strstr(output, "print completed") == NULL, "a cancelled print never reports completion");
+    check(strstr(output, "4 command(s) sent") == NULL,
+          "the cancel stopped the stream before the whole file went out");
+
+    cli_mock_stop(&mock);
+    remove(proc.out_path);
+    remove(path);
+}
+
 static void test_dry_run_single_commands(void)
 {
     /* --dry-run works without a port: nothing is opened. */
@@ -1606,7 +1929,7 @@ int main(void)
     test_home_with_confirmation();
     test_home_with_wrong_flag();
     test_dry_run_home_without_confirmation_still_fails();
-    test_simple_commands_unavailable();
+    test_printer_commands_need_port();
     test_global_option_after_command_rejected();
     test_cli_value_equal_to_default();
     test_config_file_precedence();
@@ -1643,6 +1966,10 @@ int main(void)
     test_print_error_stops_gracefully_end_to_end();
     test_print_g28_in_file_end_to_end();
     test_print_timeout_end_to_end();
+    test_pause_resume_cancel_sd_end_to_end();
+    test_dry_run_sd_controls();
+    test_print_pause_and_resume_by_signal_end_to_end();
+    test_print_cancel_by_signal_end_to_end();
     test_dry_run_single_commands();
 
     if (g_failures > 0) {

@@ -354,6 +354,42 @@ static void test_open_failures(void)
           "an arbitrary baud value is rejected");
 }
 
+static void test_open_is_exclusive(void)
+{
+    int master;
+    char slave_path[64];
+    if (!open_pty(&master, slave_path, sizeof(slave_path))) {
+        return;
+    }
+
+    printerctl_serial_port_t port;
+    printerctl_serial_error_t error;
+    check(printerctl_serial_open(&port, slave_path, 115200, 500, &error) ==
+              PRINTERCTL_SERIAL_OK,
+          "the first open of the device succeeds");
+
+    /* While one session holds the port, a second open must fail: this is
+     * what keeps a concurrent printerctl invocation from interleaving
+     * bytes into an active exchange (Milestone 8). */
+    printerctl_serial_port_t second;
+    check(printerctl_serial_open(&second, slave_path, 115200, 500, &error) ==
+              PRINTERCTL_SERIAL_ERR_OPEN_FAILED,
+          "a second open of the held device fails");
+    check(!second.open, "the rejected second open leaves its port not-open");
+
+    check(printerctl_serial_close(&port, &error) == PRINTERCTL_SERIAL_OK,
+          "the holding port closes cleanly");
+
+    /* Exclusivity ends with the session: the device is reopenable. */
+    check(printerctl_serial_open(&second, slave_path, 115200, 500, &error) ==
+              PRINTERCTL_SERIAL_OK,
+          "the device can be reopened after the holder closed it");
+    check(printerctl_serial_close(&second, &error) == PRINTERCTL_SERIAL_OK,
+          "the reopened port closes cleanly");
+
+    close(master);
+}
+
 static void test_invalid_arguments_and_lifecycle(void)
 {
     printerctl_serial_port_t port;
@@ -427,6 +463,7 @@ int main(void)
     test_disconnect_is_explicit();
     test_line_too_long_for_buffer();
     test_open_failures();
+    test_open_is_exclusive();
     test_invalid_arguments_and_lifecycle();
 
     if (g_failures > 0) {

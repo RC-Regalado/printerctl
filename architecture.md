@@ -404,6 +404,18 @@ For local host streaming, pause/resume/cancel are session controls, not only Mar
 
 For future daemonized or persistent operation, these commands may target an active background session. In the MVP CLI-only model, they may be implemented as direct Marlin commands or session-local controls depending on the selected execution model.
 
+**Milestone 8 resolution:** both, through distinct mechanisms. The
+streaming `print` process handles SIGUSR1 (pause after the current
+acknowledgement), SIGUSR2 (resume from the next unsent command) and
+SIGINT/SIGTERM (graceful cancel, exit code 9, summary still rendered);
+nothing is ever sent to the printer on a host-stream pause/resume/cancel.
+The `pause`/`resume`/`cancel` CLI commands send M25/M24/M524 to a print
+running from the printer's SD card, with `send`-style exchange semantics.
+The serial port is held in exclusive mode (TIOCEXCL) for the lifetime of
+every session, so a second invocation cannot interleave bytes into an
+active stream — it fails to open the device with EBUSY instead. See
+[[docs/design/milestone-8-pause-resume-cancel]].
+
 ## 8. Safety Rules
 
 The following rules are mandatory acceptance criteria:
@@ -517,7 +529,7 @@ Documentation updates:
 
 These decisions should be resolved early by Codex before broad implementation:
 
-1. Whether MVP pause/resume/cancel targets only direct Marlin commands, only local streaming sessions, or both.
+1. ~~Whether MVP pause/resume/cancel targets only direct Marlin commands, only local streaming sessions, or both.~~ Resolved in Milestone 8: both, through distinct mechanisms. A host streaming session is controlled in-process with signals (SIGUSR1 pause, SIGUSR2 resume, SIGINT/SIGTERM graceful cancel) because the MVP has no daemon; the `pause`/`resume`/`cancel` CLI commands are direct Marlin SD-print commands (M25/M24/M524). The serial port is opened exclusively (TIOCEXCL) so the two worlds cannot collide. See [[docs/design/milestone-8-pause-resume-cancel]].
 2. ~~Whether structured logs default to plain text or JSON Lines.~~ Resolved in Milestone 2: plain TSV, hidden behind the logging API. See [[docs/design/milestone-2-logging]].
 3. Test framework choice for C unit tests.
 4. ~~Maximum G-code line length and command normalization rules.~~ Resolved in Milestone 3: 4096-byte source-line limit and the normalization contract in [[docs/design/milestone-3-gcode-dry-run]].

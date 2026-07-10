@@ -6,12 +6,12 @@ Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
 
 ## Status
 
-This repository currently implements Milestone 7 (Reliable G-code
-Streaming MVP); see `roadmap.md` for the milestone plan and
-`docs/milestones/milestone-7.md` /
-`docs/design/milestone-7-streaming.md` for what this milestone covers
-and why (earlier milestones are covered by their own reports under
-`docs/milestones/`).
+This repository currently implements Milestone 8 (Pause, Resume and
+Cancel); see `roadmap.md` for the milestone plan and
+`docs/milestones/milestone-8.md` /
+`docs/design/milestone-8-pause-resume-cancel.md` for what this
+milestone covers and why (earlier milestones are covered by their own
+reports under `docs/milestones/`).
 
 The CLI parses the full command grammar and resolves configuration from
 defaults, an optional `--config` file and CLI overrides, and every command
@@ -25,10 +25,13 @@ explicit `M112` passes through. `print FILE` streams the G-code file
 one acknowledged command at a time — the next command is not sent (or
 even read from the file) until Marlin replies `ok` — reporting progress
 per whole-percent change and a session summary with the final state and
-last acknowledged line. `--dry-run print FILE` parses and normalizes
-the file without opening a serial device; `--dry-run` with a single
-command prints the line it would transmit and exits `0`. Only `home`,
-`pause`, `resume` and `cancel` still exit `5`.
+last acknowledged line; while it streams, the operator controls the
+session with signals (SIGUSR1 pauses, SIGUSR2 resumes, SIGINT/SIGTERM
+cancels gracefully with exit code `9`). `pause`, `resume` and `cancel`
+send `M25`/`M24`/`M524` to a print running from the printer's SD card.
+`--dry-run print FILE` parses and normalizes the file without opening a
+serial device; `--dry-run` with a single command prints the line it
+would transmit and exits `0`. Only `home` still exits `5`.
 
 ## Requirements
 
@@ -125,13 +128,36 @@ line — on `Error:` (exit `8`), `Resend:` (exit `8`, unsupported in the
 MVP), timeout or disconnect (exit `7`), a malformed file (exit `6`) or
 a `G28` line (exit `4`, blocked before transmission).
 
-`temp`, `position`, `info` and `send COMMAND` require a configured port
-(`--port` or the config file; exit code `3` otherwise), transmit their
-Marlin command (`M105`, `M114`, `M115`, or the raw text), wait for the
-terminal reply and render it. `send` refuses `G28` (exit code `4`, no
-bypass). Under `--dry-run` they print the line they would send and exit
-`0` without touching any device. `print` without `--dry-run`, `home`,
-`pause`, `resume` and `cancel` still exit `5`.
+While `print FILE` streams, signal the printerctl process to control
+the session (e.g. `kill -USR1 PID` from another terminal):
+
+| Signal | Effect |
+|---|---|
+| `SIGUSR1` | Pause after the current command is acknowledged |
+| `SIGUSR2` | Resume from the next unsent command |
+| `SIGINT` / `SIGTERM` | Cancel gracefully (Ctrl+C; summary still printed, exit code `9`) |
+
+Nothing is sent to the printer on pause/resume/cancel of a host stream:
+it never moves, heats or parks on its own, so a long pause leaves the
+nozzle hot where it stopped — the operator decides. The serial port is
+held exclusively while a session runs; a concurrent printerctl
+invocation against the same port fails to open it (exit `7`) instead of
+corrupting the stream.
+
+`pause`, `resume` and `cancel` instead control a print running from the
+**printer's SD card**, as direct Marlin commands: `M25` (pause SD
+print), `M24` (resume SD print) and `M524` (abort SD print). They
+render the exchange like `send` and cannot reach a host stream. On
+firmware without SD support Marlin answers `echo:Unknown command`
+(rendered) and still acknowledges, so the command is a visible no-op.
+
+`temp`, `position`, `info`, `send COMMAND`, `pause`, `resume` and
+`cancel` require a configured port (`--port` or the config file; exit
+code `3` otherwise), transmit their Marlin command (`M105`, `M114`,
+`M115`, `M25`, `M24`, `M524`, or the raw text), wait for the terminal
+reply and render it. `send` refuses `G28` (exit code `4`, no bypass).
+Under `--dry-run` they print the line they would send and exit `0`
+without touching any device. Only `home` still exits `5`.
 
 ### Exit codes
 
@@ -145,6 +171,7 @@ bypass). Under `--dry-run` they print the line they would send and exit
 | `6` | G-code file error |
 | `7` | Communication error (cannot open port, I/O failure, timeout) |
 | `8` | Printer error (`Error:`/`Resend:` reply, or missing report) |
+| `9` | Print cancelled by the operator (SIGINT/SIGTERM during `print`) |
 
 ### Configuration file
 
@@ -192,6 +219,9 @@ the `serial_tx`/`serial_rx` records under `--verbose`). See
 ./build/printerctl --port /dev/ttyACM0 position
 ./build/printerctl --port /dev/ttyACM0 info
 ./build/printerctl --port /dev/ttyACM0 send "M115"
+./build/printerctl --port /dev/ttyACM0 pause
+./build/printerctl --port /dev/ttyACM0 resume
+./build/printerctl --port /dev/ttyACM0 cancel
 ./build/printerctl home
 ```
 

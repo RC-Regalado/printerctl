@@ -2,9 +2,13 @@
 
 #include "printerctl/gcode.h"
 
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+/* How often a paused print re-polls its control callback. */
+#define PRINTERCTL_PRINTER_PAUSE_POLL_MS 100
 
 static void set_error(printerctl_printer_error_t *out_error,
                        printerctl_printer_status_t status,
@@ -395,6 +399,57 @@ printerctl_printer_status_t printerctl_printer_send(
     return printerctl_printer_execute(session, command, on_line, context, out_error);
 }
 
+/*
+ * Shared shape of the three SD-print controls: one explicit operator
+ * command with send-and-wait-for-terminal semantics, plus an INFO
+ * state_transition record naming the requested control on success.
+ */
+static printerctl_printer_status_t request_sd_control(
+    printerctl_printer_session_t *session,
+    const char *command,
+    const char *state_detail,
+    printerctl_printer_line_fn on_line,
+    void *context,
+    printerctl_printer_error_t *out_error)
+{
+    printerctl_printer_status_t status =
+        printerctl_printer_execute(session, command, on_line, context, out_error);
+    if (status == PRINTERCTL_PRINTER_OK) {
+        log_detail(session->logger, printerctl_log_state_transition, state_detail);
+    }
+    return status;
+}
+
+printerctl_printer_status_t printerctl_printer_pause_sd_print(
+    printerctl_printer_session_t *session,
+    printerctl_printer_line_fn on_line,
+    void *context,
+    printerctl_printer_error_t *out_error)
+{
+    return request_sd_control(session, "M25", "state=sd_pause_requested",
+                               on_line, context, out_error);
+}
+
+printerctl_printer_status_t printerctl_printer_resume_sd_print(
+    printerctl_printer_session_t *session,
+    printerctl_printer_line_fn on_line,
+    void *context,
+    printerctl_printer_error_t *out_error)
+{
+    return request_sd_control(session, "M24", "state=sd_resume_requested",
+                               on_line, context, out_error);
+}
+
+printerctl_printer_status_t printerctl_printer_cancel_sd_print(
+    printerctl_printer_session_t *session,
+    printerctl_printer_line_fn on_line,
+    void *context,
+    printerctl_printer_error_t *out_error)
+{
+    return request_sd_control(session, "M524", "state=sd_cancel_requested",
+                               on_line, context, out_error);
+}
+
 /* Maps a reader failure to the session-level status the CLI renders. */
 static printerctl_printer_status_t gcode_failure_status(printerctl_gcode_status_t status)
 {
@@ -424,7 +479,9 @@ printerctl_printer_status_t printerctl_printer_print_file(
     printerctl_printer_session_t *session,
     const char *path,
     printerctl_printer_progress_fn on_progress,
-    void *context,
+    void *progress_context,
+    printerctl_printer_control_fn on_control,
+    void *control_context,
     printerctl_print_summary_t *out_summary,
     printerctl_printer_error_t *out_error)
 {
@@ -477,6 +534,31 @@ printerctl_printer_status_t printerctl_printer_print_file(
     printerctl_printer_status_t status = PRINTERCTL_PRINTER_OK;
 
     for (;;) {
+        /* Session control sits between acknowledged commands: pause and
+         * cancel are honored here, never mid-exchange, so the command
+         * in flight always completes its acknowledgement first. */
+        if (on_control != NULL) {
+            printerctl_print_control_t control = on_control(control_context);
+            if (control == PRINTERCTL_PRINT_CONTROL_PAUSE) {
+                log_detail(session->logger, printerctl_log_state_transition,
+                            "state=print_paused");
+                do {
+                    (void)poll(NULL, 0, PRINTERCTL_PRINTER_PAUSE_POLL_MS);
+                    control = on_control(control_context);
+                } while (control == PRINTERCTL_PRINT_CONTROL_PAUSE);
+                if (control == PRINTERCTL_PRINT_CONTROL_CONTINUE) {
+                    log_detail(session->logger, printerctl_log_state_transition,
+                                "state=printing");
+                }
+            }
+            if (control == PRINTERCTL_PRINT_CONTROL_CANCEL) {
+                set_error(out_error, PRINTERCTL_PRINTER_CANCELLED,
+                           "print cancelled by the operator");
+                status = PRINTERCTL_PRINTER_CANCELLED;
+                break;
+            }
+        }
+
         /* The next command is not even read from the file until the
          * previous one was acknowledged: strictly one in flight. */
         printerctl_gcode_result_t result;
@@ -531,12 +613,19 @@ printerctl_printer_status_t printerctl_printer_print_file(
         }
 
         if (on_progress != NULL) {
-            on_progress(&result, context);
+            on_progress(&result, progress_context);
         }
     }
 
     printerctl_gcode_error_t close_error;
     (void)printerctl_gcode_reader_close(&reader, &close_error);
+
+    if (status == PRINTERCTL_PRINTER_CANCELLED) {
+        out_summary->state = PRINTERCTL_PRINT_CANCELLED;
+        out_summary->status = status;
+        log_print_end(session->logger, out_summary, "print_cancelled");
+        return status;
+    }
 
     if (status != PRINTERCTL_PRINTER_OK) {
         out_summary->state = PRINTERCTL_PRINT_FAILED;

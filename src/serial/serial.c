@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -234,6 +235,18 @@ printerctl_serial_status_t printerctl_serial_open(
         return out_error->status;
     }
 
+    /* Exclusive mode (Milestone 8): while this port is held open, any
+     * other open() of the device fails with EBUSY, so a concurrent
+     * printerctl invocation cannot interleave bytes into an active
+     * exchange or stream. Cleared again on close. (A CAP_SYS_ADMIN
+     * process can still bypass this — kernel semantics.) */
+    if (ioctl(fd, TIOCEXCL) != 0) {
+        set_error(out_error, PRINTERCTL_SERIAL_ERR_CONFIG_FAILED,
+                   "cannot take exclusive access to '%s': %s", path, strerror(errno));
+        close(fd);
+        return out_error->status;
+    }
+
     port->fd = fd;
     port->open = true;
     port->baud = baud;
@@ -434,6 +447,11 @@ printerctl_serial_status_t printerctl_serial_close(
 
     int fd = port->fd;
     reset_port(port);
+
+    /* Best-effort: the kernel also drops exclusive mode on the last
+     * close, but releasing it explicitly keeps the port reopenable even
+     * if another descriptor to it exists somewhere. */
+    (void)ioctl(fd, TIOCNXCL);
 
     if (close(fd) != 0) {
         set_error(out_error, PRINTERCTL_SERIAL_ERR_IO,

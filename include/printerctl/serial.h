@@ -79,6 +79,13 @@ typedef struct {
  * already pending in either direction are flushed so a session never
  * starts by reading a stale buffer.
  *
+ * The device is held in exclusive mode (TIOCEXCL, Milestone 8) for the
+ * lifetime of the port: while one printerctl invocation is talking to
+ * the printer, a second open() of the same device fails with EBUSY
+ * instead of silently interleaving bytes into the active exchange.
+ * Exclusive mode is released on close. (Processes with CAP_SYS_ADMIN
+ * bypass it — kernel semantics.)
+ *
  * Always overwrites the full contents of *port, on both success and
  * failure, so callers never need to zero it first.
  *

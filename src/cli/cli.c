@@ -1,9 +1,13 @@
+/* POSIX.1-2008 for sigaction(), used by the Milestone 8 print session controls. */
+#define _POSIX_C_SOURCE 200809L
+
 #include "printerctl/cli.h"
 #include "printerctl/gcode.h"
 #include "printerctl/logging.h"
 #include "printerctl/printer.h"
 #include "printerctl/version.h"
 
+#include <signal.h>
 #include <stdarg.h>
 #include <string.h>
 
@@ -311,9 +315,11 @@ static void print_help(FILE *out)
         "Command-line controller for Marlin-based 3D printers over USB serial.\n"
         "'print FILE' streams a G-code file one acknowledged command at a time\n"
         "(Milestone 7); 'temp', 'position', 'info' and 'send' run one command\n"
-        "each (Milestone 6). '--dry-run print FILE' parses and normalizes the\n"
-        "file without opening any serial device (Milestone 3). 'home', 'pause',\n"
-        "'resume' and 'cancel' are not implemented yet (see roadmap.md).\n"
+        "each (Milestone 6). 'pause', 'resume' and 'cancel' control a print\n"
+        "running from the printer's SD card (Milestone 8; see Print session\n"
+        "control below for host streams). '--dry-run print FILE' parses and\n"
+        "normalizes the file without opening any serial device (Milestone 3).\n"
+        "'home' is not implemented yet (see roadmap.md).\n"
         "\n"
         "Global options (must appear before COMMAND, at most once each):\n"
         "  --port VALUE      Serial device path (default: none)\n"
@@ -329,12 +335,24 @@ static void print_help(FILE *out)
         "                                       and report only, no serial access)\n"
         "  send COMMAND                        Send one raw command\n"
         "  home [--i-understand-no-endstops]   Home all axes (see Safety below)\n"
-        "  pause                                Pause an active print\n"
-        "  resume                               Resume a paused print\n"
-        "  cancel                               Cancel an active print\n"
+        "  pause                                Pause the printer's SD print (M25)\n"
+        "  resume                               Resume the printer's SD print (M24)\n"
+        "  cancel                               Abort the printer's SD print (M524)\n"
         "  temp                                 Query temperatures\n"
         "  position                             Query current position\n"
         "  info                                 Query printer information\n"
+        "\n"
+        "Print session control:\n"
+        "  While 'print FILE' streams, signal the printerctl process to control\n"
+        "  the session (e.g. 'kill -USR1 PID' from another terminal):\n"
+        "    SIGUSR1          pause after the current command is acknowledged\n"
+        "    SIGUSR2          resume from the next unsent command\n"
+        "    SIGINT/SIGTERM   cancel gracefully (Ctrl+C; summary still printed)\n"
+        "  Nothing is sent to the printer on pause/resume/cancel of a host\n"
+        "  stream: it never moves, heats or parks on its own. The 'pause',\n"
+        "  'resume' and 'cancel' commands instead talk to a print running from\n"
+        "  the printer's SD card; they cannot reach a host stream, whose serial\n"
+        "  port is held exclusively while it runs.\n"
         "\n"
         "Other:\n"
         "  --help     Show this help message and exit\n"
@@ -357,7 +375,8 @@ static void print_help(FILE *out)
         "  5  parsed successfully but not yet available in this build\n"
         "  6  G-code file error (unreadable, malformed, oversized line, ...)\n"
         "  7  communication error (cannot open port, I/O failure, timeout)\n"
-        "  8  printer error (Error:/Resend: reply, or missing report)\n",
+        "  8  printer error (Error:/Resend: reply, or missing report)\n"
+        "  9  print cancelled by the operator (SIGINT/SIGTERM during 'print')\n",
         PRINTERCTL_CONFIG_MIN_BAUD, PRINTERCTL_CONFIG_MAX_BAUD, PRINTERCTL_CONFIG_DEFAULT_BAUD,
         PRINTERCTL_CONFIG_MIN_TIMEOUT_MS, PRINTERCTL_CONFIG_MAX_TIMEOUT_MS, PRINTERCTL_CONFIG_DEFAULT_TIMEOUT_MS);
 }
@@ -553,6 +572,7 @@ static const char *printer_status_name(printerctl_printer_status_t status)
     case PRINTERCTL_PRINTER_ERR_RESEND: return "resend";
     case PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE: return "unexpected_response";
     case PRINTERCTL_PRINTER_ERR_GCODE: return "gcode";
+    case PRINTERCTL_PRINTER_CANCELLED: return "cancelled";
     }
     return "unknown";
 }
@@ -578,6 +598,8 @@ static int printer_status_to_exit_code(printerctl_printer_status_t status)
         return PRINTERCTL_EXIT_PRINTER_ERROR;
     case PRINTERCTL_PRINTER_ERR_GCODE:
         return PRINTERCTL_EXIT_GCODE_ERROR;
+    case PRINTERCTL_PRINTER_CANCELLED:
+        return PRINTERCTL_EXIT_PRINT_CANCELLED;
     }
     return PRINTERCTL_EXIT_COMM_ERROR;
 }
@@ -698,6 +720,34 @@ static int run_single_command(const printerctl_command_args_t *args,
         break;
     }
 
+    /* Milestone 8 SD-print controls: explicit operator commands sent to
+     * a print running from the printer's SD card. A host stream is
+     * controlled with signals inside its own process, never from here —
+     * its serial port is held exclusively while it runs. */
+    case PRINTERCTL_COMMAND_PAUSE:
+        fprintf(out, "> M25\n");
+        status = printerctl_printer_pause_sd_print(&session, render_received_line, out, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            fprintf(out, "printerctl: SD print pause requested (M25 acknowledged)\n");
+        }
+        break;
+
+    case PRINTERCTL_COMMAND_RESUME:
+        fprintf(out, "> M24\n");
+        status = printerctl_printer_resume_sd_print(&session, render_received_line, out, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            fprintf(out, "printerctl: SD print resume requested (M24 acknowledged)\n");
+        }
+        break;
+
+    case PRINTERCTL_COMMAND_CANCEL:
+        fprintf(out, "> M524\n");
+        status = printerctl_printer_cancel_sd_print(&session, render_received_line, out, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            fprintf(out, "printerctl: SD print abort requested (M524 acknowledged)\n");
+        }
+        break;
+
     case PRINTERCTL_COMMAND_SEND:
     default:
         fprintf(out, "> %s\n", args->send_command);
@@ -732,16 +782,100 @@ static void render_print_progress(const printerctl_gcode_result_t *result, void 
                 result->progress_percent,
                 (unsigned long long)result->line_number,
                 (unsigned long long)result->command_number);
+        fflush(renderer->out);
         renderer->last_percent = result->progress_percent;
     }
 }
 
 /*
- * Milestone 7 execution of `print FILE` (without --dry-run): connect,
+ * Milestone 8 host-print session controls. While `print FILE` streams,
+ * the operator drives the session with signals — the MVP has no daemon,
+ * so a second printerctl invocation cannot reach this process's session
+ * (and the serial port is held exclusively while the stream runs):
+ *
+ *   SIGUSR1          pause after the current command's acknowledgement
+ *   SIGUSR2          resume from the next unsent command
+ *   SIGINT/SIGTERM   cancel gracefully (summary rendered, exit code 9)
+ *
+ * The handlers only set flags; print_control_poll() below turns them
+ * into decisions between acknowledged commands. sig_atomic_t flags are
+ * the one place the CLI keeps mutable file-scope state — signal
+ * handlers cannot reach anything else. They are reset at every
+ * run_print_command() entry, so repeated in-process runs (the test
+ * harness) start clean.
+ */
+static volatile sig_atomic_t g_print_cancel_requested;
+static volatile sig_atomic_t g_print_pause_requested;
+static volatile sig_atomic_t g_print_resume_requested;
+
+static void handle_print_cancel_signal(int signum)
+{
+    (void)signum;
+    g_print_cancel_requested = 1;
+}
+
+static void handle_print_pause_signal(int signum)
+{
+    (void)signum;
+    g_print_pause_requested = 1;
+}
+
+static void handle_print_resume_signal(int signum)
+{
+    (void)signum;
+    g_print_resume_requested = 1;
+}
+
+/* Reports pause/resume once per edge, alongside the control decision. */
+typedef struct {
+    FILE *out;
+    bool paused;
+} print_control_reporter_t;
+
+static printerctl_print_control_t print_control_poll(void *context)
+{
+    print_control_reporter_t *reporter = context;
+
+    if (g_print_cancel_requested) {
+        return PRINTERCTL_PRINT_CONTROL_CANCEL;
+    }
+
+    /* A resume answers a pause; both flags set means the pair resolved.
+     * A stray resume with nothing paused must not neutralize a later
+     * pause, so it is dropped here. */
+    if (g_print_resume_requested) {
+        g_print_resume_requested = 0;
+        g_print_pause_requested = 0;
+    }
+
+    if (g_print_pause_requested) {
+        if (!reporter->paused) {
+            reporter->paused = true;
+            fprintf(reporter->out,
+                "printerctl: print paused — SIGUSR2 resumes, SIGINT cancels\n");
+            fflush(reporter->out);
+        }
+        return PRINTERCTL_PRINT_CONTROL_PAUSE;
+    }
+
+    if (reporter->paused) {
+        reporter->paused = false;
+        fprintf(reporter->out, "printerctl: print resumed\n");
+        fflush(reporter->out);
+    }
+
+    return PRINTERCTL_PRINT_CONTROL_CONTINUE;
+}
+
+/*
+ * Milestone 7/8 execution of `print FILE` (without --dry-run): connect,
  * stream the file one acknowledged command at a time, render progress
  * on every whole-percent change and a session summary at the end, then
- * disconnect. The summary is rendered on success and on failure alike,
- * naming the file, the final state and the last acknowledged line.
+ * disconnect. The summary is rendered on every outcome — completed,
+ * cancelled or failed — naming the file, the final state and the last
+ * acknowledged line. For the duration of the stream the operator's
+ * session-control signals are handled (see print_control_poll above);
+ * the previous handlers are restored before returning.
  */
 static int run_print_command(const printerctl_command_args_t *args,
                               const printerctl_config_t *config,
@@ -751,34 +885,75 @@ static int run_print_command(const printerctl_command_args_t *args,
     printerctl_printer_session_t session;
     printerctl_printer_error_t error;
 
+    g_print_cancel_requested = 0;
+    g_print_pause_requested = 0;
+    g_print_resume_requested = 0;
+
+    struct sigaction control_action;
+    memset(&control_action, 0, sizeof(control_action));
+    sigemptyset(&control_action.sa_mask);
+
+    struct sigaction old_int, old_term, old_usr1, old_usr2;
+    control_action.sa_handler = handle_print_cancel_signal;
+    sigaction(SIGINT, &control_action, &old_int);
+    sigaction(SIGTERM, &control_action, &old_term);
+    control_action.sa_handler = handle_print_pause_signal;
+    sigaction(SIGUSR1, &control_action, &old_usr1);
+    control_action.sa_handler = handle_print_resume_signal;
+    sigaction(SIGUSR2, &control_action, &old_usr2);
+
     printerctl_printer_status_t status =
         printerctl_printer_connect(&session, config, logger_ready ? logger : NULL, &error);
     if (status != PRINTERCTL_PRINTER_OK) {
+        sigaction(SIGINT, &old_int, NULL);
+        sigaction(SIGTERM, &old_term, NULL);
+        sigaction(SIGUSR1, &old_usr1, NULL);
+        sigaction(SIGUSR2, &old_usr2, NULL);
         report_printer_failure(err, logger, logger_ready, "print", status, &error);
         return printer_status_to_exit_code(status);
     }
 
-    fprintf(out, "printerctl: printing '%s'\n", args->print_file);
+    fprintf(out, "printerctl: printing '%s' — SIGUSR1 pauses, SIGINT cancels\n",
+            args->print_file);
+    fflush(out);
 
     print_progress_renderer_t renderer = {.out = out, .last_percent = (unsigned)-1};
+    print_control_reporter_t control = {.out = out, .paused = false};
     printerctl_print_summary_t summary;
     status = printerctl_printer_print_file(&session, args->print_file,
                                             render_print_progress, &renderer,
+                                            print_control_poll, &control,
                                             &summary, &error);
 
-    if (status != PRINTERCTL_PRINTER_OK) {
+    sigaction(SIGINT, &old_int, NULL);
+    sigaction(SIGTERM, &old_term, NULL);
+    sigaction(SIGUSR1, &old_usr1, NULL);
+    sigaction(SIGUSR2, &old_usr2, NULL);
+
+    /* A cancel is the operator's own request carried out, not a failure:
+     * no error report, no ERROR record — the summary and the module's
+     * state=print_cancelled transition tell the story. */
+    if (status != PRINTERCTL_PRINTER_OK && status != PRINTERCTL_PRINTER_CANCELLED) {
         report_printer_failure(err, logger, logger_ready, "print", status, &error);
+    }
+
+    const char *state_name = "failed";
+    if (summary.state == PRINTERCTL_PRINT_COMPLETED) {
+        state_name = "completed";
+    } else if (summary.state == PRINTERCTL_PRINT_CANCELLED) {
+        state_name = "cancelled";
     }
 
     fprintf(out,
         "printerctl: print %s: '%s' — %llu command(s) sent, %llu acknowledged, "
         "last acknowledged line %llu, %u%%\n",
-        summary.state == PRINTERCTL_PRINT_COMPLETED ? "completed" : "failed",
+        state_name,
         args->print_file,
         (unsigned long long)summary.commands_sent,
         (unsigned long long)summary.commands_acknowledged,
         (unsigned long long)summary.last_acknowledged_line,
         summary.progress_percent);
+    fflush(out);
 
     printerctl_printer_error_t disconnect_error;
     if (printerctl_printer_disconnect(&session, &disconnect_error) != PRINTERCTL_PRINTER_OK) {
@@ -795,6 +970,9 @@ static const char *single_command_tx_line(const printerctl_command_args_t *args)
     case PRINTERCTL_COMMAND_TEMP: return "M105";
     case PRINTERCTL_COMMAND_POSITION: return "M114";
     case PRINTERCTL_COMMAND_INFO: return "M115";
+    case PRINTERCTL_COMMAND_PAUSE: return "M25";
+    case PRINTERCTL_COMMAND_RESUME: return "M24";
+    case PRINTERCTL_COMMAND_CANCEL: return "M524";
     case PRINTERCTL_COMMAND_SEND: return args->send_command;
     default: return NULL;
     }
@@ -881,7 +1059,10 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
         request.command_args.command == PRINTERCTL_COMMAND_TEMP ||
         request.command_args.command == PRINTERCTL_COMMAND_POSITION ||
         request.command_args.command == PRINTERCTL_COMMAND_INFO ||
-        request.command_args.command == PRINTERCTL_COMMAND_SEND;
+        request.command_args.command == PRINTERCTL_COMMAND_SEND ||
+        request.command_args.command == PRINTERCTL_COMMAND_PAUSE ||
+        request.command_args.command == PRINTERCTL_COMMAND_RESUME ||
+        request.command_args.command == PRINTERCTL_COMMAND_CANCEL;
 
     int exit_code;
 

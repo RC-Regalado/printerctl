@@ -19,6 +19,7 @@
 #define PRINTERCTL_EXIT_GCODE_ERROR 6
 #define PRINTERCTL_EXIT_COMM_ERROR 7
 #define PRINTERCTL_EXIT_PRINTER_ERROR 8
+#define PRINTERCTL_EXIT_PRINT_CANCELLED 9
 
 #define PRINTERCTL_CLI_ERROR_MAX 256
 
@@ -126,9 +127,18 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * commands sent/acknowledged, last acknowledged line) on every outcome.
  * Exit codes follow the same mapping as the single commands, plus
  * PRINTERCTL_EXIT_GCODE_ERROR for a file that fails mid-stream and
- * PRINTERCTL_EXIT_SAFETY_ERROR for a G28 found in the file. Only
- * `home`, `pause`, `resume` and `cancel` still end in
- * PRINTERCTL_EXIT_UNAVAILABLE.
+ * PRINTERCTL_EXIT_SAFETY_ERROR for a G28 found in the file.
+ *
+ * As of Milestone 8, a streaming `print` is an operator-controllable
+ * session: SIGUSR1 pauses after the current command's acknowledgement,
+ * SIGUSR2 resumes from the next unsent command, and SIGINT/SIGTERM
+ * cancels gracefully — the summary reports the cancelled state and the
+ * process exits PRINTERCTL_EXIT_PRINT_CANCELLED. The `pause`, `resume`
+ * and `cancel` commands execute for real as direct Marlin SD-print
+ * controls (M25, M24, M524) with the same exit-code mapping as `send`;
+ * they target a print running from the printer's SD card, never a host
+ * stream (the serial port of an active stream is held exclusively).
+ * Only `home` still ends in PRINTERCTL_EXIT_UNAVAILABLE.
  */
 int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err);
 

@@ -62,7 +62,8 @@ typedef enum {
     PRINTERCTL_PRINTER_ERR_PRINTER_ERROR,   /* Marlin replied Error: */
     PRINTERCTL_PRINTER_ERR_RESEND,          /* Marlin requested a resend (unsupported in MVP) */
     PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE,
-    PRINTERCTL_PRINTER_ERR_GCODE            /* the G-code file itself failed (Milestone 7) */
+    PRINTERCTL_PRINTER_ERR_GCODE,           /* the G-code file itself failed (Milestone 7) */
+    PRINTERCTL_PRINTER_CANCELLED            /* the operator cancelled the print (Milestone 8; not an error) */
 } printerctl_printer_status_t;
 
 typedef struct {
@@ -187,7 +188,8 @@ printerctl_printer_status_t printerctl_printer_send(
  * printerctl_printer_print_file(), on success and on every failure, so
  * the caller can render a session summary regardless of how the print
  * ended: `state` is the final state, `status` the cause when it is
- * PRINTERCTL_PRINT_FAILED (PRINTERCTL_PRINTER_OK when completed).
+ * PRINTERCTL_PRINT_FAILED (PRINTERCTL_PRINTER_OK when completed,
+ * PRINTERCTL_PRINTER_CANCELLED when the operator cancelled).
  *
  * `commands_sent` counts commands transmitted; `commands_acknowledged`
  * counts those that received `ok` (they differ by at most one — the MVP
@@ -199,7 +201,8 @@ printerctl_printer_status_t printerctl_printer_send(
  */
 typedef enum {
     PRINTERCTL_PRINT_COMPLETED = 0,
-    PRINTERCTL_PRINT_FAILED
+    PRINTERCTL_PRINT_FAILED,
+    PRINTERCTL_PRINT_CANCELLED
 } printerctl_print_final_state_t;
 
 typedef struct {
@@ -222,6 +225,34 @@ typedef void (*printerctl_printer_progress_fn)(
     const printerctl_gcode_result_t *result, void *context);
 
 /*
+ * Milestone 8 session control. `on_control` (optional) is consulted
+ * before each command is read from the file — that is, only between
+ * acknowledged commands, never mid-exchange, so pause and cancel always
+ * take effect after the current acknowledgement:
+ *
+ *   - CONTINUE: stream the next command.
+ *   - PAUSE: transmit nothing; the callback is re-polled (roughly every
+ *     100 ms) until it stops returning PAUSE. Resuming continues from
+ *     the next unsent command; the file position is untouched.
+ *   - CANCEL: stop gracefully with PRINTERCTL_PRINTER_CANCELLED, the
+ *     summary state set to PRINTERCTL_PRINT_CANCELLED and a
+ *     `state=print_cancelled` transition logged. Cancelling is honored
+ *     both while streaming and while paused.
+ *
+ * The printer itself is never sent anything on pause/resume/cancel: the
+ * software must not move, heat or park automatically (Agents.md safety
+ * policy). While paused, Marlin simply executes what it already
+ * acknowledged and then idles.
+ */
+typedef enum {
+    PRINTERCTL_PRINT_CONTROL_CONTINUE = 0,
+    PRINTERCTL_PRINT_CONTROL_PAUSE,
+    PRINTERCTL_PRINT_CONTROL_CANCEL
+} printerctl_print_control_t;
+
+typedef printerctl_print_control_t (*printerctl_printer_control_fn)(void *context);
+
+/*
  * Streams the G-code file at `path`, one normalized command at a time,
  * over the connected session: each command is transmitted and the next
  * one is not read from the file — let alone sent — until Marlin
@@ -237,11 +268,14 @@ typedef void (*printerctl_printer_progress_fn)(
  * unsupported status), response timeout (ERR_TIMEOUT), serial failure
  * or disconnect (ERR_SERIAL), or a G-code file error mid-stream
  * (ERR_GCODE, with the reader's message and line in *out_error).
+ * An operator cancel through `on_control` follows the same graceful
+ * path with PRINTERCTL_PRINTER_CANCELLED.
  *
  * Progress: `on_progress` (optional) runs after every acknowledged
  * command; a DEBUG `progress` record is logged per acknowledgement and
  * an INFO `progress` record whenever the whole-percent value changes,
- * with INFO `state_transition` records at print start and end.
+ * with INFO `state_transition` records at print start and end (and
+ * `state=print_paused` / `state=printing` around a pause).
  *
  * `session` must be connected, and `path`, `out_summary` and
  * `out_error` non-NULL. The session remains connected afterwards; the
@@ -251,8 +285,40 @@ printerctl_printer_status_t printerctl_printer_print_file(
     printerctl_printer_session_t *session,
     const char *path,
     printerctl_printer_progress_fn on_progress,
-    void *context,
+    void *progress_context,
+    printerctl_printer_control_fn on_control,
+    void *control_context,
     printerctl_print_summary_t *out_summary,
+    printerctl_printer_error_t *out_error);
+
+/*
+ * Milestone 8 direct Marlin SD-print controls: `pause` (M25), `resume`
+ * (M24) and `cancel`/abort (M524) for a print running from the
+ * printer's SD card. These are explicit operator commands with the same
+ * exchange semantics as printerctl_printer_send() — they do NOT reach a
+ * host print streamed by another printerctl process (the MVP has no
+ * daemon; a host stream is controlled in-process via `on_control`
+ * above). On firmware without SD support Marlin typically answers
+ * `echo:Unknown command` followed by `ok`; the echo line reaches
+ * `on_line` so the caller can surface it. A successful exchange logs an
+ * INFO `state_transition` record naming the requested control.
+ */
+printerctl_printer_status_t printerctl_printer_pause_sd_print(
+    printerctl_printer_session_t *session,
+    printerctl_printer_line_fn on_line,
+    void *context,
+    printerctl_printer_error_t *out_error);
+
+printerctl_printer_status_t printerctl_printer_resume_sd_print(
+    printerctl_printer_session_t *session,
+    printerctl_printer_line_fn on_line,
+    void *context,
+    printerctl_printer_error_t *out_error);
+
+printerctl_printer_status_t printerctl_printer_cancel_sd_print(
+    printerctl_printer_session_t *session,
+    printerctl_printer_line_fn on_line,
+    void *context,
     printerctl_printer_error_t *out_error);
 
 /*
