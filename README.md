@@ -6,12 +6,12 @@ Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
 
 ## Status
 
-This repository currently implements Milestone 8 (Pause, Resume and
-Cancel); see `roadmap.md` for the milestone plan and
-`docs/milestones/milestone-8.md` /
-`docs/design/milestone-8-pause-resume-cancel.md` for what this
-milestone covers and why (earlier milestones are covered by their own
-reports under `docs/milestones/`).
+This repository currently implements Milestone 9 (Fault Tolerance and
+Recovery Records); see `roadmap.md` for the milestone plan and
+`docs/milestones/milestone-9.md` /
+`docs/design/milestone-9-recovery-records.md` for what this milestone
+covers and why (earlier milestones are covered by their own reports
+under `docs/milestones/`).
 
 The CLI parses the full command grammar and resolves configuration from
 defaults, an optional `--config` file and CLI overrides, and every command
@@ -31,7 +31,10 @@ cancels gracefully with exit code `9`). `pause`, `resume` and `cancel`
 send `M25`/`M24`/`M524` to a print running from the printer's SD card.
 `--dry-run print FILE` parses and normalizes the file without opening a
 serial device; `--dry-run` with a single command prints the line it
-would transmit and exits `0`. Only `home` still exits `5`.
+would transmit and exits `0`. A print that started but did not complete
+leaves an interrupted-session record under
+`$XDG_STATE_HOME/printerctl` (see Session records below); printerctl
+never resumes a print automatically. Only `home` still exits `5`.
 
 ## Requirements
 
@@ -61,15 +64,15 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. Seven
+Use `build-clang` instead of `build` if you configured with Clang. Eight
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 logging integration and end-to-end commands against forked mock
 printers), `printerctl_config_tests` (configuration module),
 `printerctl_gcode_tests` (G-code reader), `printerctl_marlin_tests`
 (Marlin response parser), `printerctl_serial_tests` (serial transport
 over pseudo-terminals), `printerctl_printer_tests` (printer session
-against scripted mock printers) and `printerctl_logging_tests`
-(logging module).
+against scripted mock printers), `printerctl_record_tests` (session
+records) and `printerctl_logging_tests` (logging module).
 
 ## Usage
 
@@ -159,6 +162,40 @@ reply and render it. `send` refuses `G28` (exit code `4`, no bypass).
 Under `--dry-run` they print the line they would send and exit `0`
 without touching any device. Only `home` still exits `5`.
 
+### Session records
+
+A `print` that opened its file but did not complete — failed or
+cancelled — writes one interrupted-session record to
+`$XDG_STATE_HOME/printerctl` (default `~/.local/state/printerctl`), and
+names the file it wrote on stdout:
+
+```ini
+# printerctl interrupted print session record
+# printerctl never resumes a print automatically (safety policy);
+# use this record to decide how to restart the job manually.
+version=1
+timestamp=2026-07-10T23:39:36.159Z
+event=print_interrupted
+state=cancelled
+cause=cancelled
+file=job.gcode
+commands_sent=4
+commands_acknowledged=4
+last_acknowledged_line=4
+bytes_consumed=26
+file_size=44
+progress_percent=59
+```
+
+Records are private (0600), fsync'd and never overwritten (one
+timestamped file per interruption). printerctl never reads them back:
+there is no automatic resume and no automatic reconnect — a serial
+failure or disconnect ends the session gracefully with a record, and
+restarting the job is always the operator's explicit decision.
+Completed prints and files that could not be opened at all leave no
+record. A record that cannot be written is a warning on stderr and
+never changes the print's exit code.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -202,7 +239,7 @@ structured, timestamped log lines to `stderr`, alongside the existing
 human-readable messages. `--verbose` additionally enables `DEBUG`-level
 records: `command_parsed`, and for the printer commands the full wire
 exchange as `serial_tx`/`serial_rx` records. Logs never include the raw
-`--port` value, the `--config` path or `print`'s file argument; the
+`--port` value, the `--config` path, a session record's path or `print`'s file argument; the
 `command_parsed`/`command_unavailable` events carry only the command
 name (never `send`'s text — the wire exchange is visible only through
 the `serial_tx`/`serial_rx` records under `--verbose`). See

@@ -5,6 +5,7 @@
 #include "printerctl/gcode.h"
 #include "printerctl/logging.h"
 #include "printerctl/printer.h"
+#include "printerctl/record.h"
 #include "printerctl/version.h"
 
 #include <signal.h>
@@ -868,6 +869,66 @@ static printerctl_print_control_t print_control_poll(void *context)
 }
 
 /*
+ * Milestone 9: persist an interrupted-session record — file, last
+ * acknowledged line, progress, timestamp, state — so the operator can
+ * decide how to restart the job manually. printerctl never reads these
+ * records back: automatic resume is forbidden by the safety policy.
+ *
+ * Best-effort relative to the print's outcome: a record failure warns
+ * the operator but never changes the exit code. The record path and the
+ * G-code path appear only in human-readable output; the structured log
+ * gets path-free records (Milestone 2 privacy rules).
+ */
+static void write_session_record(const printerctl_print_summary_t *summary,
+                                  const char *file,
+                                  printerctl_logger_t *logger, bool logger_ready,
+                                  FILE *out, FILE *err)
+{
+    printerctl_session_record_t record;
+    memset(&record, 0, sizeof(record));
+    snprintf(record.state, sizeof(record.state), "%s",
+             summary->state == PRINTERCTL_PRINT_CANCELLED ? "cancelled" : "failed");
+    snprintf(record.cause, sizeof(record.cause), "%s", printer_status_name(summary->status));
+    snprintf(record.file, sizeof(record.file), "%s", file);
+    record.commands_sent = summary->commands_sent;
+    record.commands_acknowledged = summary->commands_acknowledged;
+    record.last_acknowledged_line = summary->last_acknowledged_line;
+    record.bytes_consumed = summary->bytes_consumed;
+    record.file_size = summary->file_size;
+    record.progress_percent = summary->progress_percent;
+
+    printerctl_record_error_t record_error;
+    char dir[PRINTERCTL_RECORD_DIR_MAX];
+    char path[PRINTERCTL_RECORD_PATH_MAX];
+    printerctl_record_status_t status =
+        printerctl_record_resolve_state_dir(dir, sizeof(dir), &record_error);
+    if (status == PRINTERCTL_RECORD_OK) {
+        status = printerctl_record_write_session(dir, &record, path, sizeof(path),
+                                                  &record_error);
+    }
+
+    if (status == PRINTERCTL_RECORD_OK) {
+        fprintf(out, "printerctl: session record written to '%s'\n", path);
+        fflush(out);
+        if (logger_ready) {
+            warn_on_log_failure(err,
+                printerctl_log_state_transition(logger, "state=session_recorded"),
+                "failed to record state_transition log");
+        }
+    } else {
+        fprintf(err, "printerctl: warning: no session record written: %s\n",
+                record_error.message);
+        if (logger_ready) {
+            warn_on_log_failure(err,
+                printerctl_log_record(logger, PRINTERCTL_LOG_WARNING,
+                                       PRINTERCTL_LOG_EVENT_WARNING,
+                                       "session record not written"),
+                "failed to record warning log");
+        }
+    }
+}
+
+/*
  * Milestone 7/8 execution of `print FILE` (without --dry-run): connect,
  * stream the file one acknowledged command at a time, render progress
  * on every whole-percent change and a session summary at the end, then
@@ -954,6 +1015,13 @@ static int run_print_command(const printerctl_command_args_t *args,
         (unsigned long long)summary.last_acknowledged_line,
         summary.progress_percent);
     fflush(out);
+
+    /* An interrupted session — the print started (the file opened) but
+     * did not complete — leaves a durable record. Open failures leave
+     * none: nothing was ever streamed, so there is nothing to recover. */
+    if (summary.state != PRINTERCTL_PRINT_COMPLETED && summary.file_size > 0) {
+        write_session_record(&summary, args->print_file, logger, logger_ready, out, err);
+    }
 
     printerctl_printer_error_t disconnect_error;
     if (printerctl_printer_disconnect(&session, &disconnect_error) != PRINTERCTL_PRINTER_OK) {

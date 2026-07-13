@@ -1,0 +1,104 @@
+[
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_config.dir/src/config/config.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/config/config.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/config/config.c",
+  "output": "CMakeFiles/printerctl_config.dir/src/config/config.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_logging.dir/src/logging/logging.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/logging/logging.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/logging/logging.c",
+  "output": "CMakeFiles/printerctl_logging.dir/src/logging/logging.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_gcode.dir/src/gcode/gcode.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/gcode/gcode.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/gcode/gcode.c",
+  "output": "CMakeFiles/printerctl_gcode.dir/src/gcode/gcode.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_marlin.dir/src/marlin/marlin.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/marlin/marlin.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/marlin/marlin.c",
+  "output": "CMakeFiles/printerctl_marlin.dir/src/marlin/marlin.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_serial.dir/src/serial/serial.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/serial/serial.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/serial/serial.c",
+  "output": "CMakeFiles/printerctl_serial.dir/src/serial/serial.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_record.dir/src/record/record.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/record/record.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/record/record.c",
+  "output": "CMakeFiles/printerctl_record.dir/src/record/record.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_printer.dir/src/printer/printer.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/printer/printer.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/printer/printer.c",
+  "output": "CMakeFiles/printerctl_printer.dir/src/printer/printer.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -I/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_cli.dir/src/cli/cli.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/cli/cli.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/cli/cli.c",
+  "output": "CMakeFiles/printerctl_cli.dir/src/cli/cli.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -I/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl.dir/src/main.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/src/main.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/src/main.c",
+  "output": "CMakeFiles/printerctl.dir/src/main.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/tests",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -I/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_tests.dir/test_cli.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/tests/test_cli.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/tests/test_cli.c",
+  "output": "tests/CMakeFiles/printerctl_tests.dir/test_cli.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/tests",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_config_tests.dir/test_config.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/tests/test_config.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/tests/test_config.c",
+  "output": "tests/CMakeFiles/printerctl_config_tests.dir/test_config.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/tests",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_gcode_tests.dir/test_gcode.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/tests/test_gcode.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/tests/test_gcode.c",
+  "output": "tests/CMakeFiles/printerctl_gcode_tests.dir/test_gcode.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/tests",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_marlin_tests.dir/test_marlin.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/tests/test_marlin.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/tests/test_marlin.c",
+  "output": "tests/CMakeFiles/printerctl_marlin_tests.dir/test_marlin.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/tests",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_serial_tests.dir/test_serial.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/tests/test_serial.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/tests/test_serial.c",
+  "output": "tests/CMakeFiles/printerctl_serial_tests.dir/test_serial.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/tests",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_printer_tests.dir/test_printer.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/tests/test_printer.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/tests/test_printer.c",
+  "output": "tests/CMakeFiles/printerctl_printer_tests.dir/test_printer.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/tests",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_record_tests.dir/test_record.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/tests/test_record.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/tests/test_record.c",
+  "output": "tests/CMakeFiles/printerctl_record_tests.dir/test_record.c.o"
+},
+{
+  "directory": "/home/rc-regalado/git/cpp_projects/printerctl/build-gcc/tests",
+  "command": "/usr/bin/gcc  -I/home/rc-regalado/git/cpp_projects/printerctl/include -g -std=c17 -Wall -Wextra -Wpedantic -o CMakeFiles/printerctl_logging_tests.dir/test_logging.c.o -c /home/rc-regalado/git/cpp_projects/printerctl/tests/test_logging.c",
+  "file": "/home/rc-regalado/git/cpp_projects/printerctl/tests/test_logging.c",
+  "output": "tests/CMakeFiles/printerctl_logging_tests.dir/test_logging.c.o"
+}
+]

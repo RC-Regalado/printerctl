@@ -6,6 +6,7 @@
 #include "printerctl/config.h"
 #include "printerctl/version.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -16,6 +17,14 @@
 #include <unistd.h>
 
 static int g_failures = 0;
+
+/*
+ * Milestone 9 session records land in $XDG_STATE_HOME/printerctl. The
+ * whole suite runs against a disposable state home so no test ever
+ * touches the developer's real ~/.local/state; record-specific tests
+ * create their own and restore this default afterwards.
+ */
+static char g_default_state_home[64];
 
 static void check(int condition, const char *description)
 {
@@ -818,6 +827,69 @@ static void write_temp_gcode(const char *content, char *path, size_t path_size)
     FILE *file = fdopen(fd, "w");
     fputs(content, file);
     fclose(file);
+}
+
+/* Points XDG_STATE_HOME at a fresh temp directory; records land there. */
+static bool set_temp_state_home(char *dir, size_t dir_size)
+{
+    snprintf(dir, dir_size, "/tmp/printerctl_cli_state_XXXXXX");
+    if (mkdtemp(dir) == NULL) {
+        fprintf(stderr, "FAIL: mkdtemp() failed for the state home fixture\n");
+        g_failures++;
+        return false;
+    }
+    setenv("XDG_STATE_HOME", dir, 1);
+    return true;
+}
+
+/* Restores the suite-wide disposable state home and removes `dir`. */
+static void drop_temp_state_home(const char *dir)
+{
+    char command[128];
+    snprintf(command, sizeof(command), "rm -rf '%s'", dir);
+    if (system(command) != 0) {
+        fprintf(stderr, "FAIL: cannot remove the state home fixture\n");
+        g_failures++;
+    }
+    setenv("XDG_STATE_HOME", g_default_state_home, 1);
+}
+
+/* Finds a session record under `state_home`/printerctl; returns the count. */
+static int find_session_records(const char *state_home, char *out_path, size_t out_size)
+{
+    char record_dir[128];
+    snprintf(record_dir, sizeof(record_dir), "%s/printerctl", state_home);
+
+    DIR *dir = opendir(record_dir);
+    if (dir == NULL) {
+        return 0;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "session-", 8) == 0) {
+            count++;
+            if (out_path != NULL) {
+                snprintf(out_path, out_size, "%s/%s", record_dir, entry->d_name);
+            }
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
+/* Reads a whole file into `buffer`; returns false when it cannot be read. */
+static bool read_whole_file(const char *path, char *buffer, size_t buffer_size)
+{
+    FILE *file = fopen(path, "r");
+    if (file == NULL) {
+        return false;
+    }
+    size_t n = fread(buffer, 1, buffer_size - 1, file);
+    buffer[n] = '\0';
+    fclose(file);
+    return true;
 }
 
 static void test_dry_run_print_success(void)
@@ -1808,6 +1880,11 @@ static void test_print_pause_and_resume_by_signal_end_to_end(void)
 
 static void test_print_cancel_by_signal_end_to_end(void)
 {
+    char state_home[64];
+    if (!set_temp_state_home(state_home, sizeof(state_home))) {
+        return;
+    }
+
     char path[64];
     write_temp_gcode("G21\nG90\nM105\nM400\n", path, sizeof(path));
 
@@ -1815,6 +1892,7 @@ static void test_print_cancel_by_signal_end_to_end(void)
     cli_mock_printer_t mock;
     if (!cli_mock_start_script_delayed(&mock, replies, 4, 150)) {
         remove(path);
+        drop_temp_state_home(state_home);
         return;
     }
 
@@ -1842,9 +1920,225 @@ static void test_print_cancel_by_signal_end_to_end(void)
     check(strstr(output, "4 command(s) sent") == NULL,
           "the cancel stopped the stream before the whole file went out");
 
+    /* A cancelled print is an interrupted session: it leaves a record. */
+    char record_path[256];
+    check(find_session_records(state_home, record_path, sizeof(record_path)) == 1,
+          "the cancelled print left exactly one session record");
+    char content[2048];
+    check(read_whole_file(record_path, content, sizeof(content)) &&
+              strstr(content, "state=cancelled\n") != NULL &&
+              strstr(content, "cause=cancelled\n") != NULL,
+          "the record carries the cancelled state and cause");
+
     cli_mock_stop(&mock);
     remove(proc.out_path);
     remove(path);
+    drop_temp_state_home(state_home);
+}
+
+static void test_print_failure_writes_session_record(void)
+{
+    char state_home[64];
+    if (!set_temp_state_home(state_home, sizeof(state_home))) {
+        return;
+    }
+
+    char path[64];
+    write_temp_gcode("G21\nG90\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n"}; /* then silence */
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script(&mock, replies, 1)) {
+        remove(path);
+        drop_temp_state_home(state_home);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"--timeout", (char *)"150", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(7, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "the session record never changes the print's exit code");
+    check(out != NULL && strstr(out, "session record written to") != NULL,
+          "the operator is told where the record was written");
+
+    char record_path[256];
+    check(find_session_records(state_home, record_path, sizeof(record_path)) == 1,
+          "exactly one session record was written");
+
+    char content[2048];
+    check(read_whole_file(record_path, content, sizeof(content)),
+          "the session record can be read back");
+    check(strstr(content, "state=failed\n") != NULL, "the record carries the failed state");
+    check(strstr(content, "cause=timeout\n") != NULL, "the record carries the timeout cause");
+    check(content[0] != '\0' && strstr(content, path) != NULL,
+          "the record names the G-code file");
+    check(strstr(content, "commands_sent=2\n") != NULL &&
+              strstr(content, "commands_acknowledged=1\n") != NULL &&
+              strstr(content, "last_acknowledged_line=1\n") != NULL,
+          "the record shows exactly where streaming stopped");
+    check(strstr(content, "timestamp=") != NULL, "the record carries a timestamp");
+    check(strstr(content, "never resumes") != NULL,
+          "the record states the no-automatic-resume policy");
+
+    /* Privacy: the structured log names neither the record path nor the
+     * state directory — only the path-free state transition. */
+    check(err != NULL && strstr(err, "state=session_recorded") != NULL,
+          "the record is logged as a path-free state transition");
+    check(err != NULL && strstr(err, state_home) == NULL,
+          "logs never contain the state directory or record path");
+
+    cli_mock_stop(&mock);
+    remove(path);
+    drop_temp_state_home(state_home);
+    free(out);
+    free(err);
+}
+
+static void test_print_completed_writes_no_record(void)
+{
+    char state_home[64];
+    if (!set_temp_state_home(state_home, sizeof(state_home))) {
+        return;
+    }
+
+    char path[64];
+    write_temp_gcode("G21\nG90\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n", "ok\n"};
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script(&mock, replies, 2)) {
+        remove(path);
+        drop_temp_state_home(state_home);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(5, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "the clean print completes");
+    check(out != NULL && strstr(out, "session record") == NULL,
+          "a completed print mentions no session record");
+    check(find_session_records(state_home, NULL, 0) == 0,
+          "a completed print writes no session record");
+
+    cli_mock_stop(&mock);
+    remove(path);
+    drop_temp_state_home(state_home);
+    free(out);
+    free(err);
+}
+
+static void test_print_never_resumes_automatically(void)
+{
+    char state_home[64];
+    if (!set_temp_state_home(state_home, sizeof(state_home))) {
+        return;
+    }
+
+    char path[64];
+    write_temp_gcode("G21\nG90\n", path, sizeof(path));
+
+    /* First run: interrupted by acknowledgement silence, record written. */
+    {
+        static const char *const replies[] = {"ok\n"};
+        cli_mock_printer_t mock;
+        if (!cli_mock_start_script(&mock, replies, 1)) {
+            remove(path);
+            drop_temp_state_home(state_home);
+            return;
+        }
+
+        char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                         (char *)"--timeout", (char *)"150", (char *)"print", path};
+        char *out = NULL;
+        char *err = NULL;
+        run_cli(7, argv, &out, &err);
+        cli_mock_stop(&mock);
+        free(out);
+        free(err);
+    }
+    check(find_session_records(state_home, NULL, 0) == 1,
+          "the interrupted run left a session record");
+
+    /* Second run of the same file: the record present, the whole file
+     * streams again from its first command — printerctl never resumes
+     * from a record (power or serial failure must not trigger resume). */
+    {
+        static const char *const replies[] = {"ok\n", "ok\n"};
+        cli_mock_printer_t mock;
+        if (!cli_mock_start_script(&mock, replies, 2)) {
+            remove(path);
+            drop_temp_state_home(state_home);
+            return;
+        }
+
+        char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                         (char *)"print", path};
+        char *out = NULL;
+        char *err = NULL;
+
+        int status = run_cli(5, argv, &out, &err);
+
+        check(status == PRINTERCTL_EXIT_OK, "the rerun completes");
+        check(out != NULL && strstr(out, "2 command(s) sent, 2 acknowledged") != NULL,
+              "the rerun streamed the whole file from its first command, not a suffix");
+
+        cli_mock_stop(&mock);
+        free(out);
+        free(err);
+    }
+    check(find_session_records(state_home, NULL, 0) == 1,
+          "the completed rerun added no record and consumed none");
+
+    remove(path);
+    drop_temp_state_home(state_home);
+}
+
+static void test_session_record_failure_is_only_a_warning(void)
+{
+    /* An absolute but uncreatable state home: the record cannot be
+     * written, the print outcome must not change. */
+    setenv("XDG_STATE_HOME", "/dev/null/printerctl-state", 1);
+
+    char path[64];
+    write_temp_gcode("G21\nG90\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n"};
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script(&mock, replies, 1)) {
+        remove(path);
+        setenv("XDG_STATE_HOME", g_default_state_home, 1);
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"--timeout", (char *)"150", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(7, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "a failed record write never changes the print's exit code");
+    check(err != NULL && strstr(err, "no session record written") != NULL,
+          "the operator is warned that no record was written");
+    check(out != NULL && strstr(out, "session record written") == NULL,
+          "no record path is claimed when the write failed");
+
+    cli_mock_stop(&mock);
+    remove(path);
+    setenv("XDG_STATE_HOME", g_default_state_home, 1);
+    free(out);
+    free(err);
 }
 
 static void test_dry_run_single_commands(void)
@@ -1905,6 +2199,15 @@ static void test_safety_error_adds_single_error_log_line(void)
 
 int main(void)
 {
+    /* No test may write into the developer's real state directory. */
+    snprintf(g_default_state_home, sizeof(g_default_state_home),
+             "/tmp/printerctl_cli_state_XXXXXX");
+    if (mkdtemp(g_default_state_home) == NULL) {
+        fprintf(stderr, "FAIL: cannot create the suite state home\n");
+        return EXIT_FAILURE;
+    }
+    setenv("XDG_STATE_HOME", g_default_state_home, 1);
+
     test_help();
     test_version();
     test_missing_command();
@@ -1970,7 +2273,20 @@ int main(void)
     test_dry_run_sd_controls();
     test_print_pause_and_resume_by_signal_end_to_end();
     test_print_cancel_by_signal_end_to_end();
+    test_print_failure_writes_session_record();
+    test_print_completed_writes_no_record();
+    test_print_never_resumes_automatically();
+    test_session_record_failure_is_only_a_warning();
     test_dry_run_single_commands();
+
+    {
+        char command[128];
+        snprintf(command, sizeof(command), "rm -rf '%s'", g_default_state_home);
+        if (system(command) != 0) {
+            fprintf(stderr, "FAIL: cannot remove the suite state home\n");
+            g_failures++;
+        }
+    }
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

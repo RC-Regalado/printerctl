@@ -12,6 +12,7 @@
 
 #include "printerctl/printer.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -1183,6 +1184,94 @@ static void test_sd_print_controls_send_marlin_commands(void)
     }
 }
 
+/* Counts this process's open descriptors via /proc/self/fd. */
+static int count_open_fds(void)
+{
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir == NULL) {
+        return -1;
+    }
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] != '.') {
+            count++;
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
+/*
+ * Milestone 9 resource-cleanup acceptance: every failure path must
+ * close both the G-code file and the serial port. Each scenario runs a
+ * full session — connect, failed print, disconnect — and the process's
+ * descriptor count must end exactly where it started.
+ */
+static void test_failure_paths_release_all_descriptors(void)
+{
+    int before = count_open_fds();
+    if (before < 0) {
+        return; /* no /proc: nothing to measure */
+    }
+
+    /* Timeout mid-stream. */
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 150)) {
+            return;
+        }
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG90\n", path, sizeof(path));
+        mock_reply(&mock, "ok\n"); /* then silence */
+
+        printerctl_print_summary_t summary;
+        check(printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL,
+                                             &summary, &error) ==
+                  PRINTERCTL_PRINTER_ERR_TIMEOUT,
+              "the cleanup scenario fails with the expected timeout");
+
+        printerctl_printer_disconnect(&session, &error);
+        mock_close(&mock);
+        remove(path);
+    }
+
+    /* Disconnect mid-stream (the printer vanishes). */
+    {
+        mock_printer_t mock;
+        if (!mock_open(&mock, 500)) {
+            return;
+        }
+        printerctl_printer_session_t session;
+        printerctl_printer_error_t error;
+        printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+        char path[64];
+        write_temp_gcode("G21\nG90\n", path, sizeof(path));
+        mock_close(&mock);
+
+        printerctl_print_summary_t summary;
+        printerctl_printer_status_t status = printerctl_printer_print_file(
+            &session, path, NULL, NULL, NULL, NULL, &summary, &error);
+        check(status != PRINTERCTL_PRINTER_OK,
+              "the vanished-printer scenario fails explicitly");
+        check(summary.state == PRINTERCTL_PRINT_FAILED,
+              "the vanished-printer summary reports the failed state");
+
+        printerctl_printer_disconnect(&session, &error);
+        remove(path);
+    }
+
+    int after = count_open_fds();
+    check(after == before,
+          "every failure path released its file and serial descriptors");
+}
+
 static void test_print_file_guards(void)
 {
     printerctl_printer_session_t session;
@@ -1228,6 +1317,7 @@ int main(void)
     test_print_file_cancel_stops_after_current_acknowledgement();
     test_print_file_cancel_before_first_command_and_while_paused();
     test_sd_print_controls_send_marlin_commands();
+    test_failure_paths_release_all_descriptors();
     test_print_file_guards();
 
     if (g_failures > 0) {

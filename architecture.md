@@ -45,6 +45,7 @@ The MVP focuses on reliable, observable and fault-tolerant G-code transmission f
   /printer
   /logging
   /config
+  /record
   /apcupsd
 /tests
   /unit
@@ -231,7 +232,14 @@ prefix, every call takes an explicit error out-parameter, and close is
 idempotent and returns a status. Timeouts and disconnects are distinct
 explicit statuses (`ERR_TIMEOUT`, `ERR_DISCONNECTED`), and only the
 standard Linux `Bxxx` baud rates are supported (Marlin's nonstandard
-250000 is rejected as `ERR_UNSUPPORTED_BAUD`).
+250000 is rejected as `ERR_UNSUPPORTED_BAUD`). Milestone 8 added
+exclusive open (TIOCEXCL, released on close). Milestone 9 resolved the
+deferred reconnect policy: **no automatic reconnect in the MVP** —
+reopening a USB CDC device toggles DTR and resets the controller, so a
+reconnected session would face a printer with all state lost, and
+automatic resume is forbidden regardless; a disconnect ends the session
+gracefully with an interrupted-session record. See
+[[docs/design/milestone-9-recovery-records]] §6.
 
 ### 6.5 `marlin`
 
@@ -353,6 +361,21 @@ On power restoration:
 - Notify operator through logs or terminal output.
 
 The software must never automatically resume a print after power restoration.
+
+### 6.9 `record` (added in Milestone 9)
+
+Write-only persistence of interrupted-session metadata, dependency-free
+(`include/printerctl/record.h`, `src/record/record.c`). Any `print`
+that opened its file but did not complete — failed or cancelled —
+leaves one private, fsync'd, never-overwritten `key=value` record
+(`session-<UTC timestamp>.record`) in `$XDG_STATE_HOME/printerctl`
+(default `$HOME/.local/state/printerctl`) carrying timestamp, state,
+cause, the G-code file path, commands sent/acknowledged, last
+acknowledged line and byte/percent progress. Nothing in printerctl ever
+reads a record back — automatic resume is forbidden (§8 rule 6), and
+each record states so in its header. The `cli` module is the Milestone
+9 consumer; Milestone 10's APCUPSD power events reuse this module. See
+[[docs/design/milestone-9-recovery-records]].
 
 ## 7. Runtime Flows
 
