@@ -7,12 +7,14 @@
 #include "printerctl/version.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -102,15 +104,22 @@ static void test_help(void)
     check(out != NULL && strstr(out, "--config") != NULL, "help documents --config");
     check(out != NULL && strstr(out, "print FILE") != NULL, "help documents print");
     check(out != NULL && strstr(out, "send COMMAND") != NULL, "help documents send");
-    check(out != NULL && strstr(out, "--i-understand-no-endstops") != NULL, "help documents home confirmation flag");
+    check(out != NULL && strstr(out, "home [X|Y|Z]") != NULL, "help documents home and its single-axis variants");
+    check(out != NULL && strstr(out, "--i-understand-no-endstops") == NULL,
+          "help no longer documents the retired home confirmation flag");
     check(out != NULL && strstr(out, "pause") != NULL, "help documents pause");
     check(out != NULL && strstr(out, "resume") != NULL, "help documents resume");
     check(out != NULL && strstr(out, "cancel") != NULL, "help documents cancel");
     check(out != NULL && strstr(out, "temp") != NULL, "help documents temp");
     check(out != NULL && strstr(out, "position") != NULL, "help documents position");
     check(out != NULL && strstr(out, "info") != NULL, "help documents info");
+    check(out != NULL && strstr(out, "power low-battery") != NULL, "help documents power low-battery");
+    check(out != NULL && strstr(out, "SIGPWR") != NULL, "help documents the SIGPWR power-failure signal");
     check(out != NULL && strstr(out, "Safety:") != NULL, "help documents the home safety policy");
-    check(out != NULL && strstr(out, "Milestone 1") == NULL, "help no longer claims to be Milestone 1");
+    /* A trailing space distinguishes the old "Milestone 1 ..." tag this
+     * checks for from later, legitimate "(Milestone 10; ...)" mentions,
+     * which also start with the substring "Milestone 1". */
+    check(out != NULL && strstr(out, "Milestone 1 ") == NULL, "help no longer claims to be Milestone 1");
     check(err != NULL && err[0] == '\0', "help produces no error output");
 
     free(out);
@@ -422,7 +431,13 @@ static void test_send_missing_argument(void)
     free(err);
 }
 
-static void test_home_without_confirmation(void)
+/*
+ * Min end-stops are now enabled on all three axes: 'home' needs no
+ * confirmation flag and runs like temp/position/info, requiring only a
+ * configured --port (see test_printer_commands_need_port for the
+ * shared no-port-is-a-config-error assertion 'home' now joins).
+ */
+static void test_home_no_longer_mentions_retired_confirmation_flag(void)
 {
     char *argv[] = {(char *)"printerctl", (char *)"home"};
     char *out = NULL;
@@ -430,62 +445,91 @@ static void test_home_without_confirmation(void)
 
     int status = run_cli(2, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "'home' without confirmation exits with safety error");
-    check(err != NULL && strstr(err, "i-understand-no-endstops") != NULL,
-          "safety error mentions the confirmation flag");
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "'home' without a port is a configuration error, not a safety rejection");
+    check(err != NULL && strstr(err, "i-understand-no-endstops") == NULL,
+          "the retired confirmation flag is never mentioned");
 
     free(out);
     free(err);
 }
 
-static void test_home_with_confirmation(void)
+static void test_home_axis_argument_grammar(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"--i-understand-no-endstops"};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(3, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "confirmed 'home' parses and reports unavailable");
-
-    free(out);
-    free(err);
+    /* An unrecognized axis letter is a usage error. */
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"W"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(3, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'home W' (not X/Y/Z) exits with usage error");
+        check(err != NULL && strstr(err, "'X', 'Y' or 'Z'") != NULL,
+              "the usage error names the accepted axis letters");
+        free(out);
+        free(err);
+    }
+    /* The retired confirmation flag is now just an unrecognized argument. */
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"--i-understand-no-endstops"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(3, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR,
+              "the retired confirmation flag is now an unrecognized argument, not accepted");
+        free(out);
+        free(err);
+    }
+    /* Only a single trailing argument is accepted. */
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"X", (char *)"Y"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(4, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'home X Y' (two axes) exits with usage error");
+        free(out);
+        free(err);
+    }
 }
 
-static void test_home_with_wrong_flag(void)
+static void test_dry_run_home(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"--yes"};
-    char *out = NULL;
-    char *err = NULL;
+    static const struct {
+        const char *argument;
+        const char *would_send;
+    } cases[] = {
+        {NULL, "would send 'G28'"},
+        {"X", "would send 'G28 X'"},
+        {"Y", "would send 'G28 Y'"},
+        {"Z", "would send 'G28 Z'"},
+    };
 
-    int status = run_cli(3, argv, &out, &err);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *argv[4] = {(char *)"printerctl", (char *)"--dry-run", (char *)"home", NULL};
+        int argc = 3;
+        if (cases[i].argument != NULL) {
+            argv[3] = (char *)cases[i].argument;
+            argc = 4;
+        }
+        char *out = NULL;
+        char *err = NULL;
 
-    check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'home --yes' exits with usage error");
+        int status = run_cli(argc, argv, &out, &err);
 
-    free(out);
-    free(err);
-}
+        check(status == PRINTERCTL_EXIT_OK, "'--dry-run home' exits with success without a port");
+        check(out != NULL && strstr(out, cases[i].would_send) != NULL,
+              "the dry-run home reports the G28 variant it would send");
 
-static void test_dry_run_home_without_confirmation_still_fails(void)
-{
-    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"home"};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(3, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "'--dry-run home' without confirmation still exits with safety error");
-
-    free(out);
-    free(err);
+        free(out);
+        free(err);
+    }
 }
 
 static void test_printer_commands_need_port(void)
 {
-    /* Since Milestone 6 (queries/send) and Milestone 8 (SD-print
-     * controls) these commands execute for real; without a configured
-     * port they are a configuration error, not "unavailable". */
-    const char *commands[] = {"pause", "resume", "cancel", "temp", "position", "info"};
+    /* Since Milestone 6 (queries/send), Milestone 8 (SD-print controls)
+     * and the end-stop hardware update (home) these commands execute
+     * for real; without a configured port they are a configuration
+     * error, not "unavailable". */
+    const char *commands[] = {"pause", "resume", "cancel", "temp", "position", "info", "home"};
 
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
         char *argv[] = {(char *)"printerctl", (char *)commands[i]};
@@ -518,17 +562,19 @@ static void test_global_option_after_command_rejected(void)
 
 static void test_cli_value_equal_to_default(void)
 {
-    /* 'home' with confirmation is the one remaining unavailable command,
-     * so it still renders the resolved configuration. */
+    /* Every resolved command logs a config_summary line with the baud
+     * value; 'power low-battery' is the simplest one that always
+     * succeeds without needing a --port at all (unlike every other
+     * command, now that 'home' is fully implemented too). */
     char *argv[] = {(char *)"printerctl", (char *)"--baud", (char *)"115200",
-                     (char *)"home", (char *)"--i-understand-no-endstops"};
+                     (char *)"power", (char *)"low-battery"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(5, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "explicit --baud equal to the default still parses successfully");
-    check(out != NULL && strstr(out, "baud=115200") != NULL, "resolved config reflects the explicit default value");
+    check(status == PRINTERCTL_EXIT_OK, "explicit --baud equal to the default still parses successfully");
+    check(err != NULL && strstr(err, "baud=115200") != NULL, "resolved config reflects the explicit default value");
 
     free(out);
     free(err);
@@ -539,17 +585,26 @@ static void test_config_file_precedence(void)
     char path[64];
     write_temp_config("port=/dev/from-file\nbaud=57600\n", path, sizeof(path));
 
+    /* 'home' now genuinely attempts a connection, so the port it
+     * resolved to is observable in the connection-failure message
+     * (Milestone 2 privacy rules: the human-readable message may name
+     * the port; the structured log never does -- see
+     * test_config_summary_omits_raw_port_and_config_path). */
     char *argv[] = {(char *)"printerctl", (char *)"--config", path,
                      (char *)"--port", (char *)"/dev/from-cli",
-                     (char *)"home", (char *)"--i-understand-no-endstops"};
+                     (char *)"home"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(7, argv, &out, &err);
+    int status = run_cli(6, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "valid --config with CLI override parses successfully");
-    check(out != NULL && strstr(out, "port=/dev/from-cli") != NULL, "CLI port overrides the config file port");
-    check(out != NULL && strstr(out, "baud=57600") != NULL, "config file baud is applied when CLI does not override it");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "'home' with the resolved config attempts to open /dev/from-cli, which does not exist");
+    check(err != NULL && strstr(err, "/dev/from-cli") != NULL,
+          "CLI port overrides the config file port (the connection failure names the CLI port)");
+    check(err != NULL && strstr(err, "/dev/from-file") == NULL, "the config file's port never took effect");
+    check(err != NULL && strstr(err, "baud=57600") != NULL,
+          "config file baud is applied when CLI does not override it");
 
     remove(path);
     free(out);
@@ -680,17 +735,21 @@ static void test_help_and_version_produce_no_logs(void)
 
 static void test_successful_command_logs_session_lifecycle(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"home", (char *)"--i-understand-no-endstops"};
+    /* 'power low-battery' always succeeds without a --port, making it
+     * the simplest real command for a generic "successful command"
+     * lifecycle check now that 'home' (like everything else) requires
+     * one and no command is ever "unavailable" in ordinary use. */
+    char *argv[] = {(char *)"printerctl", (char *)"power", (char *)"low-battery"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "non-verbose confirmed 'home' still resolves and reports unavailable");
+    check(status == PRINTERCTL_EXIT_OK, "non-verbose 'power low-battery' succeeds");
     check(err != NULL && strstr(err, "\tINFO\tsession_start\t") != NULL, "log includes a session_start line");
     check(err != NULL && strstr(err, "\tINFO\tconfig_summary\t") != NULL, "log includes a config_summary line");
-    check(err != NULL && strstr(err, "\tWARNING\tcommand_unavailable\tcommand=home") != NULL,
-          "log includes a command_unavailable line naming the command");
+    check(err != NULL && strstr(err, "\tINFO\tstate_transition\tstate=power_low_battery_no_active_print") != NULL,
+          "log includes the power low-battery state transition");
     check(err != NULL && strstr(err, "\tINFO\tsession_end\t") != NULL, "log includes a session_end line");
     check(err != NULL && strstr(err, "command_parsed") == NULL,
           "non-verbose run does not log the DEBUG command_parsed line");
@@ -702,15 +761,14 @@ static void test_successful_command_logs_session_lifecycle(void)
 
 static void test_verbose_adds_command_parsed_log(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"--verbose",
-                     (char *)"home", (char *)"--i-understand-no-endstops"};
+    char *argv[] = {(char *)"printerctl", (char *)"--verbose", (char *)"power", (char *)"low-battery"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(4, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "verbose confirmed 'home' still resolves and reports unavailable");
-    check(err != NULL && strstr(err, "\tDEBUG\tcommand_parsed\tcommand=home") != NULL,
+    check(status == PRINTERCTL_EXIT_OK, "verbose 'power low-battery' succeeds");
+    check(err != NULL && strstr(err, "\tDEBUG\tcommand_parsed\tcommand=power") != NULL,
           "verbose run logs the DEBUG command_parsed line naming the command");
     check(err != NULL && count_occurrences(err, "\n") == 5, "verbose run logs exactly five lines");
 
@@ -723,20 +781,47 @@ static void test_config_summary_omits_raw_port_and_config_path(void)
     char path[64];
     write_temp_config("baud=57600\n", path, sizeof(path));
 
+    /* 'home' now genuinely attempts a connection and fails (the port
+     * does not exist), so the port legitimately appears in the
+     * human-readable failure message elsewhere in `err` -- the
+     * assertions below check the config_summary log line specifically,
+     * not the whole buffer, matching the Milestone 2 privacy rules
+     * (structured log never leaks it; human-readable output may). */
     char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"/dev/ttyACM0",
                      (char *)"--config", path,
-                     (char *)"home", (char *)"--i-understand-no-endstops"};
+                     (char *)"home"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(7, argv, &out, &err);
+    int status = run_cli(6, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_UNAVAILABLE, "port+config confirmed 'home' still resolves and reports unavailable");
-    check(err != NULL && strstr(err, "port_set=true") != NULL, "config_summary reports port_set=true as a boolean");
-    check(err != NULL && strstr(err, "config_file_set=true") != NULL,
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "port+config resolved 'home' attempts a real connection and fails to open the nonexistent port");
+
+    const char *summary_line = err != NULL ? strstr(err, "\tINFO\tconfig_summary\t") : NULL;
+    check(summary_line != NULL, "log includes a config_summary line");
+
+    char summary_text[256];
+    summary_text[0] = '\0';
+    if (summary_line != NULL) {
+        const char *end = strchr(summary_line, '\n');
+        size_t length = end != NULL ? (size_t)(end - summary_line) : strlen(summary_line);
+        if (length >= sizeof(summary_text)) {
+            length = sizeof(summary_text) - 1;
+        }
+        memcpy(summary_text, summary_line, length);
+        summary_text[length] = '\0';
+    }
+
+    check(strstr(summary_text, "port_set=true") != NULL, "config_summary reports port_set=true as a boolean");
+    check(strstr(summary_text, "config_file_set=true") != NULL,
           "config_summary reports config_file_set=true as a boolean");
-    check(err != NULL && strstr(err, "/dev/ttyACM0") == NULL, "config_summary never contains the raw port value");
-    check(err != NULL && strstr(err, path) == NULL, "config_summary never contains the config file path");
+    check(strstr(summary_text, "/dev/ttyACM0") == NULL,
+          "the config_summary log line itself never contains the raw port value");
+    check(strstr(summary_text, path) == NULL,
+          "the config_summary log line itself never contains the config file path");
+    check(err != NULL && strstr(err, "/dev/ttyACM0") != NULL,
+          "the human-readable connection-failure message may still name the port");
 
     remove(path);
     free(out);
@@ -1390,7 +1475,7 @@ static void test_send_g28_blocked_end_to_end(void)
 
     check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "'send G28' exits with the safety error code");
     check(err != NULL && strstr(err, "G28") != NULL, "the rejection names G28");
-    check(err != NULL && strstr(err, "endstop") != NULL, "the rejection explains why");
+    check(err != NULL && strstr(err, "'home' command") != NULL, "the rejection explains why");
 
     cli_mock_stop(&mock);
     free(out);
@@ -2179,18 +2264,252 @@ static void test_dry_run_single_commands(void)
     }
 }
 
-static void test_safety_error_adds_single_error_log_line(void)
+/* Milestone 10: `power` grammar -- a required, fixed subcommand. */
+static void test_power_requires_low_battery_subcommand(void)
 {
-    char *argv[] = {(char *)"printerctl", (char *)"home"};
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"power"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(2, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'power' alone is a usage error");
+        check(err != NULL && strstr(err, "low-battery") != NULL,
+              "the usage error names the expected subcommand");
+        free(out);
+        free(err);
+    }
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"power", (char *)"nonsense"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(3, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR, "an unrecognized 'power' subcommand is a usage error");
+        free(out);
+        free(err);
+    }
+    {
+        char *argv[] = {(char *)"printerctl", (char *)"power", (char *)"low-battery", (char *)"extra"};
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(4, argv, &out, &err);
+        check(status == PRINTERCTL_EXIT_USAGE_ERROR, "extra arguments after 'low-battery' are a usage error");
+        free(out);
+        free(err);
+    }
+}
+
+/* `power low-battery` never needs a port and never opens a serial device. */
+static void test_power_low_battery_dry_run(void)
+{
+    char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"power", (char *)"low-battery"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(2, argv, &out, &err);
+    int status = run_cli(4, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "unconfirmed home still exits with safety error");
+    check(status == PRINTERCTL_EXIT_OK, "'--dry-run power low-battery' exits with success without a port");
+    check(out != NULL && strstr(out, "dry run") != NULL, "the dry run reports itself as such");
+
+    free(out);
+    free(err);
+}
+
+static void test_power_low_battery_with_no_active_print(void)
+{
+    char state_home[64];
+    if (!set_temp_state_home(state_home, sizeof(state_home))) {
+        return;
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"power", (char *)"low-battery"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK,
+          "'power low-battery' with no print running is a safe no-op, not an error");
+    check(out != NULL && strstr(out, "no active print") != NULL,
+          "the operator is told nothing was cancelled");
+    check(err != NULL && strstr(err, "\tWARNING\t") == NULL,
+          "no warning is produced when there is simply nothing to cancel");
+
+    /* Running it again must behave identically: idempotent. */
+    free(out);
+    free(err);
+    out = NULL;
+    err = NULL;
+    status = run_cli(3, argv, &out, &err);
+    check(status == PRINTERCTL_EXIT_OK, "'power low-battery' is idempotent with no active print");
+
+    free(out);
+    free(err);
+    drop_temp_state_home(state_home);
+}
+
+static void test_power_low_battery_cleans_up_a_stale_marker(void)
+{
+    char state_home[64];
+    if (!set_temp_state_home(state_home, sizeof(state_home))) {
+        return;
+    }
+
+    /* A marker naming a PID that is guaranteed not to exist: fork a
+     * child that exits immediately and reap it, so its PID is free. */
+    pid_t dead = fork();
+    if (dead == 0) {
+        _exit(0);
+    }
+    int child_status = 0;
+    waitpid(dead, &child_status, 0);
+
+    char record_dir[128];
+    snprintf(record_dir, sizeof(record_dir), "%s/printerctl", state_home);
+    if (mkdir(record_dir, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr, "FAIL: cannot create the record directory fixture\n");
+        g_failures++;
+        drop_temp_state_home(state_home);
+        return;
+    }
+    char marker_path[192];
+    snprintf(marker_path, sizeof(marker_path), "%s/active-print.pid", record_dir);
+    FILE *marker = fopen(marker_path, "w");
+    check(marker != NULL, "the stale marker fixture is created");
+    if (marker != NULL) {
+        fprintf(marker, "%ld\n", (long)dead);
+        fclose(marker);
+    }
+
+    char *argv[] = {(char *)"printerctl", (char *)"power", (char *)"low-battery"};
+    char *out = NULL;
+    char *err = NULL;
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_OK, "a stale marker is not an error");
+    check(out != NULL && strstr(out, "stale marker") != NULL,
+          "the operator is told the marker was stale");
+
+    struct stat info;
+    check(stat(marker_path, &info) != 0, "the stale marker is removed");
+
+    free(out);
+    free(err);
+    drop_temp_state_home(state_home);
+}
+
+/*
+ * Full Milestone 10 acceptance scenario: a real streaming print, still
+ * in flight, is cancelled by `printerctl power low-battery` acting on
+ * the same active-print marker the print published -- exactly the path
+ * an APCUPSD script drives through scripts/apcupsd/printerctl-low-battery.sh.
+ */
+static void test_power_low_battery_cancels_active_print_end_to_end(void)
+{
+    char state_home[64];
+    if (!set_temp_state_home(state_home, sizeof(state_home))) {
+        return;
+    }
+
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\nM400\n", path, sizeof(path));
+
+    static const char *const replies[] = {"ok\n", "ok\n", "ok\n", "ok\n"};
+    cli_mock_printer_t mock;
+    if (!cli_mock_start_script_delayed(&mock, replies, 4, 150)) {
+        remove(path);
+        drop_temp_state_home(state_home);
+        return;
+    }
+
+    char *print_argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                           (char *)"print", path};
+    cli_print_process_t proc;
+    if (!cli_print_start(&proc, 5, print_argv)) {
+        cli_mock_stop(&mock);
+        remove(path);
+        drop_temp_state_home(state_home);
+        return;
+    }
+
+    check(cli_print_wait_for_output(&proc, "printerctl: printing"), "the print announces itself");
+
+    /* The active-print marker is published early in the stream; give it
+     * a moment to land before asking for it. */
+    char *power_argv[] = {(char *)"printerctl", (char *)"power", (char *)"low-battery"};
+    char *out = NULL;
+    char *err = NULL;
+    int power_status = -1;
+    for (int attempt = 0; attempt < 300; attempt++) {
+        power_status = run_cli(3, power_argv, &out, &err);
+        if (out != NULL && strstr(out, "no active print") == NULL) {
+            break;
+        }
+        free(out);
+        free(err);
+        out = NULL;
+        err = NULL;
+        poll(NULL, 0, 10);
+    }
+
+    check(power_status == PRINTERCTL_EXIT_OK, "'power low-battery' itself reports success");
+    check(out != NULL && strstr(out, "signalled the active print") != NULL,
+          "'power low-battery' found and signalled the running print");
+
+    int code = -1;
+    check(cli_print_wait_exit(&proc, &code), "the power-cancelled print finishes promptly");
+    check(code == PRINTERCTL_EXIT_PRINT_CANCELLED_POWER_FAILURE,
+          "the print exits with the power-failure cancellation code, not the operator one");
+
+    char output[4096];
+    cli_print_read_output(&proc, output, sizeof(output));
+    check(strstr(output, "print cancelled_power_failure") != NULL,
+          "the summary names the power-failure cancellation specifically");
+    check(strstr(output, "print completed") == NULL, "a power-cancelled print never reports completion");
+
+    char record_path[256];
+    check(find_session_records(state_home, record_path, sizeof(record_path)) == 1,
+          "the power-cancelled print left exactly one session record");
+    char content[2048];
+    check(read_whole_file(record_path, content, sizeof(content)) &&
+              strstr(content, "state=cancelled_power_failure\n") != NULL &&
+              strstr(content, "cause=apcupsd_low_battery\n") != NULL,
+          "the record distinguishes a power-failure cancellation from an operator one");
+
+    /* The marker is removed once the print ends: a second notification
+     * now finds nothing to cancel. */
+    free(out);
+    free(err);
+    out = NULL;
+    err = NULL;
+    int second_status = run_cli(3, power_argv, &out, &err);
+    check(second_status == PRINTERCTL_EXIT_OK && out != NULL &&
+              strstr(out, "no active print") != NULL,
+          "the marker is cleaned up once the print ends, so a later notification is a no-op");
+
+    cli_mock_stop(&mock);
+    remove(proc.out_path);
+    remove(path);
+    free(out);
+    free(err);
+    drop_temp_state_home(state_home);
+}
+
+static void test_safety_error_adds_single_error_log_line(void)
+{
+    /* 'home' no longer produces a safety rejection now that min
+     * end-stops are enabled; 'send "G28"' is still unconditionally
+     * refused (see test_send_g28_blocked_end_to_end) and remains a
+     * safety-rejection vehicle. */
+    char *argv[] = {(char *)"printerctl", (char *)"send", (char *)"G28"};
+    char *out = NULL;
+    char *err = NULL;
+
+    int status = run_cli(3, argv, &out, &err);
+
+    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "sending G28 still exits with safety error");
     check(err != NULL && count_occurrences(err, "\tERROR\terror\t") == 1,
           "safety rejection adds exactly one ERROR log line alongside the human-readable message");
-    check(err != NULL && strstr(err, "i-understand-no-endstops") != NULL,
+    check(err != NULL && strstr(err, "only available through the 'home' command") != NULL,
           "human-readable safety message is preserved");
 
     free(out);
@@ -2228,10 +2547,9 @@ int main(void)
     test_print_extra_arguments();
     test_send_command();
     test_send_missing_argument();
-    test_home_without_confirmation();
-    test_home_with_confirmation();
-    test_home_with_wrong_flag();
-    test_dry_run_home_without_confirmation_still_fails();
+    test_home_no_longer_mentions_retired_confirmation_flag();
+    test_home_axis_argument_grammar();
+    test_dry_run_home();
     test_printer_commands_need_port();
     test_global_option_after_command_rejected();
     test_cli_value_equal_to_default();
@@ -2278,6 +2596,11 @@ int main(void)
     test_print_never_resumes_automatically();
     test_session_record_failure_is_only_a_warning();
     test_dry_run_single_commands();
+    test_power_requires_low_battery_subcommand();
+    test_power_low_battery_dry_run();
+    test_power_low_battery_with_no_active_print();
+    test_power_low_battery_cleans_up_a_stale_marker();
+    test_power_low_battery_cancels_active_print_end_to_end();
 
     {
         char command[128];

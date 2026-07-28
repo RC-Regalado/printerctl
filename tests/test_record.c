@@ -63,6 +63,9 @@ static printerctl_session_record_t sample_record(void)
     snprintf(record.state, sizeof(record.state), "failed");
     snprintf(record.cause, sizeof(record.cause), "timeout");
     snprintf(record.file, sizeof(record.file), "/tmp/job.gcode");
+    snprintf(record.job_id, sizeof(record.job_id), "job-4242");
+    snprintf(record.serial_device, sizeof(record.serial_device), "/dev/ttyACM0");
+    snprintf(record.printer_state, sizeof(record.printer_state), "unknown");
     record.commands_sent = 42;
     record.commands_acknowledged = 41;
     record.last_acknowledged_line = 57;
@@ -141,6 +144,11 @@ static void test_write_session_creates_dir_and_record(void)
     check(strstr(content, "state=failed\n") != NULL, "the record carries the final state");
     check(strstr(content, "cause=timeout\n") != NULL, "the record carries the cause");
     check(strstr(content, "file=/tmp/job.gcode\n") != NULL, "the record carries the G-code file path");
+    check(strstr(content, "job_id=job-4242\n") != NULL, "the record carries the job id");
+    check(strstr(content, "serial_device=/dev/ttyACM0\n") != NULL,
+          "the record carries the serial device");
+    check(strstr(content, "printer_state=unknown\n") != NULL,
+          "the record carries the printer state (never live-queried)");
     check(strstr(content, "commands_sent=42\n") != NULL, "the record carries commands_sent");
     check(strstr(content, "commands_acknowledged=41\n") != NULL,
           "the record carries commands_acknowledged");
@@ -219,12 +227,89 @@ static void test_write_session_failures(void)
           "an empty state is rejected");
 }
 
+/* Milestone 10: the active-print PID marker used to target the
+ * low-battery signal at the right process. */
+static void test_active_pid_round_trips(void)
+{
+    char dir[64];
+    if (!make_temp_dir(dir, sizeof(dir))) {
+        return;
+    }
+
+    /* One level below the fixture: created on demand, like write_session(). */
+    char nested[96];
+    snprintf(nested, sizeof(nested), "%s/state", dir);
+
+    printerctl_record_error_t error;
+    check(printerctl_record_write_active_pid(nested, &error) == PRINTERCTL_RECORD_OK,
+          "the marker writes into a directory that did not exist yet");
+
+    char path[PRINTERCTL_RECORD_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/active-print.pid", nested);
+    struct stat info;
+    check(stat(path, &info) == 0 && (info.st_mode & 0777) == 0600,
+          "the marker file is private (mode 0600)");
+
+    pid_t read_pid = 0;
+    check(printerctl_record_read_active_pid(nested, &read_pid, &error) == PRINTERCTL_RECORD_OK,
+          "the marker reads back successfully");
+    check(read_pid == getpid(), "the marker carries this process's own PID");
+
+    printerctl_record_remove_active_pid(nested);
+    check(printerctl_record_read_active_pid(nested, &read_pid, &error) ==
+              PRINTERCTL_RECORD_ERR_NOT_FOUND,
+          "a removed marker reads back as NOT_FOUND");
+    check(read_pid == 0, "a NOT_FOUND read leaves the output PID at 0");
+
+    /* Idempotent: removing an already-absent marker is not an error. */
+    printerctl_record_remove_active_pid(nested);
+    printerctl_record_remove_active_pid(NULL);
+
+    remove_dir_recursive(dir);
+}
+
+static void test_active_pid_absent_directory_is_not_found(void)
+{
+    printerctl_record_error_t error;
+    pid_t read_pid = 0;
+    check(printerctl_record_read_active_pid("/tmp/printerctl-record-never-created", &read_pid,
+                                             &error) == PRINTERCTL_RECORD_ERR_NOT_FOUND,
+          "a directory that was never created also reads back as NOT_FOUND");
+}
+
+static void test_active_pid_overwrites_a_stale_marker(void)
+{
+    char dir[64];
+    if (!make_temp_dir(dir, sizeof(dir))) {
+        return;
+    }
+
+    printerctl_record_error_t error;
+    /* A stale marker naming some other, arbitrary PID... */
+    check(printerctl_record_write_active_pid(dir, &error) == PRINTERCTL_RECORD_OK,
+          "the first write succeeds");
+    /* ...is silently replaced by the current process's own PID, never
+     * appended or rejected as already-existing. */
+    check(printerctl_record_write_active_pid(dir, &error) == PRINTERCTL_RECORD_OK,
+          "a second write overwrites rather than failing");
+
+    pid_t read_pid = 0;
+    check(printerctl_record_read_active_pid(dir, &read_pid, &error) == PRINTERCTL_RECORD_OK &&
+              read_pid == getpid(),
+          "the marker still carries exactly one, current PID after being overwritten");
+
+    remove_dir_recursive(dir);
+}
+
 int main(void)
 {
     test_resolve_state_dir_prefers_xdg_state_home();
     test_write_session_creates_dir_and_record();
     test_write_session_never_overwrites();
     test_write_session_failures();
+    test_active_pid_round_trips();
+    test_active_pid_absent_directory_is_not_found();
+    test_active_pid_overwrites_a_stale_marker();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

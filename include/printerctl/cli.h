@@ -20,6 +20,7 @@
 #define PRINTERCTL_EXIT_COMM_ERROR 7
 #define PRINTERCTL_EXIT_PRINTER_ERROR 8
 #define PRINTERCTL_EXIT_PRINT_CANCELLED 9
+#define PRINTERCTL_EXIT_PRINT_CANCELLED_POWER_FAILURE 10
 
 #define PRINTERCTL_CLI_ERROR_MAX 256
 
@@ -38,8 +39,21 @@ typedef enum {
     PRINTERCTL_COMMAND_CANCEL,
     PRINTERCTL_COMMAND_TEMP,
     PRINTERCTL_COMMAND_POSITION,
-    PRINTERCTL_COMMAND_INFO
+    PRINTERCTL_COMMAND_INFO,
+    PRINTERCTL_COMMAND_POWER_LOW_BATTERY /* `power low-battery` (Milestone 10) */
 } printerctl_command_t;
+
+/*
+ * `home` targets all axes by default; `home X`/`home Y`/`home Z` (added
+ * once min end-stops were enabled on all three axes, 2026-07-21) home a
+ * single one, sending `G28`/`G28 X`/`G28 Y`/`G28 Z` respectively.
+ */
+typedef enum {
+    PRINTERCTL_HOME_ALL = 0,
+    PRINTERCTL_HOME_X,
+    PRINTERCTL_HOME_Y,
+    PRINTERCTL_HOME_Z
+} printerctl_home_axis_t;
 
 /*
  * `print_file` and `send_command` point directly into the argv array given
@@ -53,7 +67,7 @@ typedef struct {
     printerctl_command_t command;
     const char *print_file;
     const char *send_command;
-    bool home_confirmed;
+    printerctl_home_axis_t home_axis;
 } printerctl_command_args_t;
 
 typedef struct {
@@ -94,8 +108,8 @@ bool printerctl_cli_parse(int argc, char *const argv[],
 /*
  * Composition entry point used by main(): parses argv, resolves
  * configuration (defaults, optional --config file, then CLI overrides),
- * enforces the `home` safety confirmation, renders human-readable output to
- * `out`/`err` and returns the process exit code.
+ * renders human-readable output to `out`/`err` and returns the process
+ * exit code.
  *
  * As of Milestone 3, `print FILE` under --dry-run (from the CLI flag or
  * the config file) is the first command with a real execution path: the
@@ -138,7 +152,29 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * controls (M25, M24, M524) with the same exit-code mapping as `send`;
  * they target a print running from the printer's SD card, never a host
  * stream (the serial port of an active stream is held exclusively).
- * Only `home` still ends in PRINTERCTL_EXIT_UNAVAILABLE.
+ *
+ * As of Milestone 10, a streaming `print` also reacts to SIGPWR as a
+ * distinct, non-operator cancellation: the summary reports
+ * PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE and the process exits
+ * PRINTERCTL_EXIT_PRINT_CANCELLED_POWER_FAILURE. `power low-battery`
+ * is the command an external notifier (the APCUPSD low-battery script)
+ * runs to deliver that signal: it never opens a serial device itself --
+ * it looks up the PID of the printerctl process currently streaming a
+ * print (if any) and sends it SIGPWR. No active print is not an error
+ * (PRINTERCTL_EXIT_OK): the command is idempotent, safe to run whether
+ * or not a print happens to be in progress, and safe to run more than
+ * once.
+ *
+ * Revised 2026-07-21: min end-stops are now enabled on all three axes,
+ * so `home` executes for real like `temp`/`position`/`info` -- no
+ * confirmation flag, only a configured `--port` -- sending `G28`.
+ * `home X`/`home Y`/`home Z` send `G28 X`/`G28 Y`/`G28 Z` to home a
+ * single axis. `G28` remains refused everywhere else (`send`, and
+ * inside a `print` G-code file) with PRINTERCTL_EXIT_SAFETY_ERROR, no
+ * bypass: homing is only ever available through the dedicated `home`
+ * command. With `home` now fully implemented, no command reaches
+ * PRINTERCTL_EXIT_UNAVAILABLE in ordinary use; the fallback path
+ * remains only as a defensive default.
  */
 int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err);
 

@@ -2,16 +2,24 @@
 
 Command-line application written in C17 that controls 3D printers running
 Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
-`roadmap.md` for project background, architecture and the development plan.
+`roadmap.md` for project background, architecture and the development
+plan; `docs/safety.md`, `docs/testing.md` and `docs/apcupsd.md` for the
+consolidated safety policy, test suite and power-failure references.
 
 ## Status
 
-This repository currently implements Milestone 9 (Fault Tolerance and
-Recovery Records); see `roadmap.md` for the milestone plan and
-`docs/milestones/milestone-9.md` /
-`docs/design/milestone-9-recovery-records.md` for what this milestone
-covers and why (earlier milestones are covered by their own reports
-under `docs/milestones/`).
+This repository currently implements Milestone 11 (core documentation
+completion, ahead of the revised roadmap's Phase II daemon
+transformation); see `roadmap.md` for the milestone plan (milestones 10
+and later were replaced by a revised roadmap; milestones 0-9 keep their
+original scope) and `docs/milestones/milestone-11.md` for what this
+milestone covers. Milestone 10 (Low-Battery Cancellation) is covered by
+`docs/milestones/milestone-10.md` /
+`docs/design/milestone-10-low-battery-cancellation.md` (earlier
+milestones have their own reports under `docs/milestones/`). Since
+Milestone 10 (2026-07-21), min end-stops were installed and enabled on
+all three axes, so `home` is now a real, unconfirmed command — see
+`Agents.md`'s Home amendment.
 
 The CLI parses the full command grammar and resolves configuration from
 defaults, an optional `--config` file and CLI overrides, and every command
@@ -34,7 +42,11 @@ serial device; `--dry-run` with a single command prints the line it
 would transmit and exits `0`. A print that started but did not complete
 leaves an interrupted-session record under
 `$XDG_STATE_HOME/printerctl` (see Session records below); printerctl
-never resumes a print automatically. Only `home` still exits `5`.
+never resumes a print automatically. `power low-battery` notifies a
+running print of an external low-battery condition (meant to be run by
+an APCUPSD script; see Power events below), cancelling it gracefully
+with its own distinct exit code. `home` sends `G28` (all axes); `home
+X`/`home Y`/`home Z` home a single axis — see Homing below.
 
 ## Requirements
 
@@ -72,7 +84,9 @@ printers), `printerctl_config_tests` (configuration module),
 (Marlin response parser), `printerctl_serial_tests` (serial transport
 over pseudo-terminals), `printerctl_printer_tests` (printer session
 against scripted mock printers), `printerctl_record_tests` (session
-records) and `printerctl_logging_tests` (logging module).
+records and the active-print marker) and `printerctl_logging_tests`
+(logging module). See `docs/testing.md` for what each covers in detail,
+the patterns behind them and the hardware-validation record.
 
 ## Usage
 
@@ -100,21 +114,31 @@ Commands:
 printerctl --dry-run print file.gcode
 printerctl print file.gcode
 printerctl send "M115"
-printerctl home --i-understand-no-endstops
+printerctl home
+printerctl home X
 printerctl pause
 printerctl resume
 printerctl cancel
 printerctl temp
 printerctl position
 printerctl info
+printerctl power low-battery
 ```
 
 `print FILE` and `send COMMAND` reject an empty `FILE`/`COMMAND` argument
 as a usage error (exit code `2`).
 
-`home` is refused (exit code `4`) unless `--i-understand-no-endstops` is
-given explicitly, because endstop sensors are not available on the target
-printer. This applies even under `--dry-run`.
+### Homing
+
+Min end-stops are enabled on all three axes (X, Y, Z), so `home` needs
+no confirmation flag: it runs like `temp`/`position`/`info`, requiring
+only a configured `--port`, and sends `G28`. `home X`, `home Y` and
+`home Z` home a single axis, sending `G28 X`, `G28 Y` and `G28 Z`
+respectively. `G28` remains refused everywhere else — `send "G28"` and
+a `print` file containing `G28` both still fail with exit code `4`, no
+bypass — so homing is only ever available through the dedicated `home`
+command, never an unexpected side effect of a raw command or a sliced
+file. See `docs/safety.md` for the full safety policy reference.
 
 `--dry-run print FILE` exits `0` when the file parses cleanly and writes
 the normalized command stream with source line numbers and whole-percent
@@ -139,13 +163,14 @@ the session (e.g. `kill -USR1 PID` from another terminal):
 | `SIGUSR1` | Pause after the current command is acknowledged |
 | `SIGUSR2` | Resume from the next unsent command |
 | `SIGINT` / `SIGTERM` | Cancel gracefully (Ctrl+C; summary still printed, exit code `9`) |
+| `SIGPWR` | Cancel gracefully as a power-failure/low-battery event, exit code `10` (see Power events below; not meant to be sent by the operator directly) |
 
-Nothing is sent to the printer on pause/resume/cancel of a host stream:
-it never moves, heats or parks on its own, so a long pause leaves the
-nozzle hot where it stopped — the operator decides. The serial port is
-held exclusively while a session runs; a concurrent printerctl
-invocation against the same port fails to open it (exit `7`) instead of
-corrupting the stream.
+Nothing is sent to the printer on pause/resume/cancel/power-cancel of a
+host stream: it never moves, heats or parks on its own, so a long pause
+leaves the nozzle hot where it stopped — the operator decides. The
+serial port is held exclusively while a session runs; a concurrent
+printerctl invocation against the same port fails to open it (exit `7`)
+instead of corrupting the stream.
 
 `pause`, `resume` and `cancel` instead control a print running from the
 **printer's SD card**, as direct Marlin commands: `M25` (pause SD
@@ -154,13 +179,36 @@ render the exchange like `send` and cannot reach a host stream. On
 firmware without SD support Marlin answers `echo:Unknown command`
 (rendered) and still acknowledges, so the command is a visible no-op.
 
-`temp`, `position`, `info`, `send COMMAND`, `pause`, `resume` and
-`cancel` require a configured port (`--port` or the config file; exit
-code `3` otherwise), transmit their Marlin command (`M105`, `M114`,
-`M115`, `M25`, `M24`, `M524`, or the raw text), wait for the terminal
-reply and render it. `send` refuses `G28` (exit code `4`, no bypass).
-Under `--dry-run` they print the line they would send and exit `0`
-without touching any device. Only `home` still exits `5`.
+`temp`, `position`, `info`, `send COMMAND`, `home`, `pause`, `resume`
+and `cancel` require a configured port (`--port` or the config file;
+exit code `3` otherwise), transmit their Marlin command (`M105`,
+`M114`, `M115`, the raw text, `G28`/`G28 X`/`G28 Y`/`G28 Z`, `M25`,
+`M24`, `M524`), wait for the terminal reply and render it. `send`
+refuses `G28` (exit code `4`, no bypass). Under `--dry-run` they print
+the line they would send and exit `0` without touching any device.
+
+`power low-battery` never requires a port and never opens a serial
+device itself — see Power events below.
+
+### Power events
+
+`printerctl power low-battery` is the command an external notifier (the
+APCUPSD script at `scripts/apcupsd/printerctl-low-battery.sh`, see
+`docs/scripts/printerctl-low-battery.md`) runs when the UPS reports a
+low battery. It looks up the printerctl process currently streaming a
+print — via a live marker at
+`$XDG_STATE_HOME/printerctl/active-print.pid`, published only while a
+print streams — and delivers it `SIGPWR`, which that process turns into
+a graceful cancellation exactly like an operator's Ctrl+C, but recorded
+and reported as its own distinct cause. No active print is not an
+error: the command always exits `0` in that case, and running it more
+than once is safe. See `docs/apcupsd.md` for the full mechanism and how
+to inspect a job cancelled this way.
+
+```bash
+printerctl power low-battery
+printerctl --dry-run power low-battery
+```
 
 ### Session records
 
@@ -176,25 +224,33 @@ names the file it wrote on stdout:
 version=1
 timestamp=2026-07-10T23:39:36.159Z
 event=print_interrupted
-state=cancelled
-cause=cancelled
+job_id=job-48213
+state=cancelled_power_failure
+cause=apcupsd_low_battery
 file=job.gcode
+serial_device=/dev/ttyACM0
 commands_sent=4
 commands_acknowledged=4
 last_acknowledged_line=4
 bytes_consumed=26
 file_size=44
 progress_percent=59
+printer_state=unknown
 ```
 
 Records are private (0600), fsync'd and never overwritten (one
 timestamped file per interruption). printerctl never reads them back:
 there is no automatic resume and no automatic reconnect — a serial
 failure or disconnect ends the session gracefully with a record, and
-restarting the job is always the operator's explicit decision.
-Completed prints and files that could not be opened at all leave no
-record. A record that cannot be written is a warning on stderr and
-never changes the print's exit code.
+restarting the job is always the operator's explicit decision. `state`
+and `cause` distinguish an operator cancel (`cancelled`/`cancelled`)
+from a power-failure cancel (`cancelled_power_failure`/
+`apcupsd_low_battery`) from an ordinary failure (`failed`/the specific
+cause). `job_id` is a placeholder (`job-<pid>`) ahead of a real job
+model; `printer_state` is always `unknown` — no live query is sent to
+populate it. Completed prints and files that could not be opened at all
+leave no record. A record that cannot be written is a warning on stderr
+and never changes the print's exit code.
 
 ### Exit codes
 
@@ -209,6 +265,7 @@ never changes the print's exit code.
 | `7` | Communication error (cannot open port, I/O failure, timeout) |
 | `8` | Printer error (`Error:`/`Resend:` reply, or missing report) |
 | `9` | Print cancelled by the operator (SIGINT/SIGTERM during `print`) |
+| `10` | Print cancelled by a power-failure/low-battery signal (SIGPWR) |
 
 ### Configuration file
 
@@ -259,7 +316,9 @@ the `serial_tx`/`serial_rx` records under `--verbose`). See
 ./build/printerctl --port /dev/ttyACM0 pause
 ./build/printerctl --port /dev/ttyACM0 resume
 ./build/printerctl --port /dev/ttyACM0 cancel
-./build/printerctl home
+./build/printerctl power low-battery
+./build/printerctl --port /dev/ttyACM0 home
+./build/printerctl --port /dev/ttyACM0 home X
 ```
 
 ## Versioning

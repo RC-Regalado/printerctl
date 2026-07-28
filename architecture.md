@@ -99,7 +99,8 @@ printerctl --port /dev/ttyACM0 position
 printerctl --port /dev/ttyACM0 info
 printerctl --port /dev/ttyACM0 send "M115"
 printerctl --dry-run print file.gcode
-printerctl home --i-understand-no-endstops
+printerctl --port /dev/ttyUSB0 home
+printerctl --port /dev/ttyUSB0 home X
 ```
 
 Responsibilities:
@@ -128,8 +129,17 @@ typedef struct {
 ```
 
 Milestone 1 implements only `port`, `baud_rate`, `timeout_ms`, `dry_run`
-and `verbose`. The APCUPSD fields enter the model with Milestone 10, when
-they have a real consumer and tests.
+and `verbose`. **Revised in Milestone 10:** the roadmap that originally
+scheduled `apcupsd_enabled`/`apcupsd_auto_resume` for this milestone was
+superseded by a new roadmap (see
+[[docs/design/milestone-10-low-battery-cancellation|docs/design/milestone-10-low-battery-cancellation.md]]
+§0). The new Milestone 10 adds no config keys: there is still no code
+path anywhere in printerctl that reads a record or a marker back to
+resume or gate anything automatically, so there is nothing an
+`auto_resume` flag would need to disable, and `apcupsd_enabled` would
+gate a script the operator already controls by whether they wire it into
+APCUPSD at all. Both fields remain aspirational; add them only if a
+future milestone gives them an actual behavior to switch.
 
 Precedence:
 
@@ -340,42 +350,78 @@ Initial command mapping:
 | `pause` | `M25` if SD-print semantics are configured; otherwise local streaming pause |
 | `cancel` | `M524` when applicable; otherwise stop local streaming gracefully |
 | `emergency-stop` | `M112`, manual explicit command only |
-| `home` | `G28`, disabled unless `--i-understand-no-endstops` is present |
+| `home` | `G28` (all axes); `home X`/`home Y`/`home Z` send `G28 X`/`G28 Y`/`G28 Z` (single axis). Revised 2026-07-21: min end-stops are now enabled on all three axes, so `home` needs no confirmation flag, only a configured `--port` — see [[Agents]]'s Home amendment. `G28` remains disabled everywhere else (`send`, and inside a `print` G-code file). |
 
 ### 6.8 `apcupsd`
 
-Records UPS power events. This integration is informational only because the printer is not connected to the UPS.
+See [[docs/apcupsd]] for the full operator-facing reference (the
+triggering event, the script-to-process communication, what closes,
+what is preserved, why no auto-resume, and how to inspect a cancelled
+job). The summary below stays here for module-responsibility context.
 
-On power failure:
+Originally scoped as informational-only, because the printer itself is
+not connected to the UPS and its own power is unaffected by the host's
+battery level. **Revised in Milestone 10:** a low-battery signal now
+also stops the host from sending further G-code, which does not depend
+on the printer's power at all — it is the host's own decision to stop
+cleanly before it, not the printer, may lose power. See
+[[docs/design/milestone-10-low-battery-cancellation]] §0 for the full
+rationale and how it reconciles with the original statement. What has
+not changed, and is not weakened by this: `auto_resume` is not just
+`false`, it does not exist as a code path anywhere in printerctl — there
+is nothing for a config flag to gate.
 
-- Record timestamp.
-- Record current file.
-- Record last acknowledged line.
-- Record estimated progress.
-- Record printer state.
-- Mark session as interrupted.
+On a low-battery notification (`printerctl power low-battery`, run by
+`scripts/apcupsd/printerctl-low-battery.sh`):
 
-On power restoration:
+- Deliver `SIGPWR` to the printerctl process currently streaming a
+  print, found via the active-print marker (`record.h`'s
+  `printerctl_record_write_active_pid()`/`_read_active_pid()`).
+- That process stops sending further G-code after the current
+  acknowledgement (never mid-exchange), closes the G-code file and the
+  serial port, and records the session as
+  `state=cancelled_power_failure` / `cause=apcupsd_low_battery` —
+  timestamp, current file, last acknowledged line, progress and (as
+  `unknown`, since no live query is sent) printer state, all via the
+  `record` module below.
+- No print running is not an error: the command is idempotent, safe to
+  run whether or not a print is active, and safe to run more than once.
 
-- Record event.
-- Notify operator through logs or terminal output.
+On power restoration: nothing happens automatically, by construction —
+see §6.9. Notifying the operator of a restoration event, distinct from
+the cancellation record already on disk, is deferred (see the Milestone
+10 design note §7).
 
-The software must never automatically resume a print after power restoration.
+The software must never automatically resume a print after power
+restoration, and never sends anything beyond "stop transmitting" on a
+low-battery cancellation: no `M112`, no `M410`, no homing, no resume, no
+additional movement (§8).
 
-### 6.9 `record` (added in Milestone 9)
+### 6.9 `record` (added in Milestone 9, extended in Milestone 10)
 
 Write-only persistence of interrupted-session metadata, dependency-free
 (`include/printerctl/record.h`, `src/record/record.c`). Any `print`
-that opened its file but did not complete — failed or cancelled —
-leaves one private, fsync'd, never-overwritten `key=value` record
-(`session-<UTC timestamp>.record`) in `$XDG_STATE_HOME/printerctl`
-(default `$HOME/.local/state/printerctl`) carrying timestamp, state,
-cause, the G-code file path, commands sent/acknowledged, last
-acknowledged line and byte/percent progress. Nothing in printerctl ever
-reads a record back — automatic resume is forbidden (§8 rule 6), and
-each record states so in its header. The `cli` module is the Milestone
-9 consumer; Milestone 10's APCUPSD power events reuse this module. See
-[[docs/design/milestone-9-recovery-records]].
+that opened its file but did not complete — failed or cancelled, by the
+operator or by a power-failure signal — leaves one private, fsync'd,
+never-overwritten `key=value` record (`session-<UTC timestamp>.record`)
+in `$XDG_STATE_HOME/printerctl` (default
+`$HOME/.local/state/printerctl`) carrying timestamp, a placeholder
+`job_id` (`job-<pid>`; a real job model arrives with Milestone 13), state,
+cause, the G-code file path, the serial device, commands
+sent/acknowledged, last acknowledged line, byte/percent progress and
+printer state (always `unknown` — never populated from a live query).
+Nothing in printerctl ever reads a record back — automatic resume is
+forbidden (§8 rule 6), and each record states so in its header. The
+`cli` module is the Milestone 9/10 consumer.
+
+Milestone 10 also adds a second, unrelated concern to the same module
+for its shared state-directory plumbing: a live **active-print marker**
+(`active-print.pid`, plain PID, silently overwritten, removed when the
+stream ends) that an external notifier reads to find the right process
+to signal — not an interrupted-session record, and never durable in the
+way a record is (no `fsync`; see the design note §6). See
+[[docs/design/milestone-9-recovery-records]] and
+[[docs/design/milestone-10-low-battery-cancellation]].
 
 ## 7. Runtime Flows
 
@@ -439,17 +485,88 @@ every session, so a second invocation cannot interleave bytes into an
 active stream — it fails to open the device with EBUSY instead. See
 [[docs/design/milestone-8-pause-resume-cancel]].
 
+### 7.4 Low-Battery Cancellation (added in Milestone 10)
+
+```text
+APCUPSD detects low battery / imminent shutdown
+    v
+runs scripts/apcupsd/printerctl-low-battery.sh
+    v
+script runs `printerctl power low-battery` (bounded by a timeout)
+    v
+CLI resolves the active-print marker, verifies the process is alive
+    v
+CLI sends SIGPWR to that process
+    v
+print_control_poll() (checked ahead of pause/resume) returns
+CANCEL_POWER_FAILURE
+    v
+identical graceful-stop path as an operator cancel:
+  no further G-code sent, file and serial closed, session recorded
+  as state=cancelled_power_failure / cause=apcupsd_low_battery
+    v
+process exits PRINTERCTL_EXIT_PRINT_CANCELLED_POWER_FAILURE (10)
+```
+
+No print running is not an error anywhere in this flow: `printerctl
+power low-battery` is idempotent by design (§6.8), matching the later
+Milestone 19 acceptance criteria for the same command once it moves onto
+the Unix socket transport. See
+[[docs/design/milestone-10-low-battery-cancellation]].
+
+### 7.5 Printing Lifecycle States (Milestone 11)
+
+The roadmap's Phase II job model names nine lifecycle states
+(`queued`, `starting`, `printing`, `paused`, `completed`,
+`cancelled_operator`, `cancelled_power_failure`, `failed_serial`,
+`failed_printer`). This table maps each to what exists today, ahead of
+Milestone 13's actual job queue:
+
+| Roadmap state | Current reality |
+|---|---|
+| `queued` | Does not exist yet: a `print` invocation is not enqueued, it starts as soon as the process runs. Arrives with Milestone 13's job queue. |
+| `starting` | The gap between dispatch and the first transmitted command: connecting the serial port and opening the G-code file. Not a named log state today (no `state=` transition is emitted for it specifically); implicit in the absence of a `state=printing` transition yet. |
+| `printing` | `state=printing` (INFO `state_transition`), emitted once streaming begins and again after a pause resolves. |
+| `paused` | `state=print_paused` (INFO `state_transition`), host streams only, entered via `SIGUSR1` and exited via `SIGUSR2` or a cancel. |
+| `completed` | `PRINTERCTL_PRINT_COMPLETED`, `state=print_completed`, exit `0`. |
+| `cancelled_operator` | `PRINTERCTL_PRINT_CANCELLED`, `state=print_cancelled`, exit `9`; session record `state=cancelled` / `cause=cancelled`. |
+| `cancelled_power_failure` | `PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE`, `state=print_cancelled_power_failure`, exit `10`; session record `state=cancelled_power_failure` / `cause=apcupsd_low_battery`. See §7.4. |
+| `failed_serial` | `PRINTERCTL_PRINT_FAILED` with `status` in `{serial, timeout}`, exit `7`; session record `cause=serial` or `cause=timeout`. |
+| `failed_printer` | `PRINTERCTL_PRINT_FAILED` with `status` in `{printer_error, resend, gcode, unsafe_command}`, exit `8` (`6`/`4` for a G-code file problem or an unsafe `G28`); session record's `cause` names the specific one. |
+
+Every state past `starting` is already observable today, either as a
+structured log transition or as the summary/record `state`/`cause`
+fields — the roadmap's job-model states are a renaming and grouping of
+what `printer.h`'s `printerctl_print_final_state_t` and
+`printerctl_printer_status_t` already distinguish, not new behavior.
+See `docs/safety.md` for the safety guarantees tied to each failure
+state and `docs/testing.md` for how each is exercised.
+
 ## 8. Safety Rules
+
+See [[docs/safety]] for the full operator-facing safety reference
+(rationale, exit-code mapping and worked examples); the rules below are
+the acceptance-criteria summary.
 
 The following rules are mandatory acceptance criteria:
 
-1. `G28` is disabled by default.
-2. `home` requires `--i-understand-no-endstops`.
+1. `G28` is disabled by default via `send` and inside a `print` G-code
+   file; it is only ever available through the dedicated `home` command
+   and its single-axis variants.
+2. `home` (and `home X`/`home Y`/`home Z`) requires no confirmation flag
+   as of 2026-07-21: min end-stops are now enabled on all three axes,
+   so homing moves into a physical switch rather than crashing. See
+   [[Agents]]'s Home amendment.
 3. `M112` is never sent automatically.
-4. No automatic homing, heating, movement or extrusion is allowed.
+4. No automatic homing, heating, movement or extrusion is allowed —
+   `home` is still only ever an explicit, operator-requested action,
+   never a side effect of anything else.
 5. G-code streaming must stop gracefully on timeout, Marlin error or unsupported resend request.
 6. Power restoration must not trigger automatic print resume.
 7. Dry-run must never open or write to a serial device.
+8. A low-battery/power-failure cancellation (Milestone 10) only ever
+   stops transmitting further G-code; it never sends `M112`, `M410`,
+   homing, a resume command or any additional movement automatically.
 
 ## 9. Error Handling
 
@@ -495,6 +612,11 @@ Required layers:
 6. **Build tests**: GCC and Clang with `-Wall -Wextra -Wpedantic`.
 
 Mock Marlin server behavior should be scriptable so tests can define response sequences per transmitted line.
+
+See [[docs/testing]] for the concrete test binaries, what each covers,
+the hardware-validation policy (harmless commands only, and which
+milestones confirmed which behavior on real hardware) and how to run
+everything from a clean checkout.
 
 ## 11. Build and Quality Gates
 
@@ -554,10 +676,13 @@ These decisions should be resolved early by Codex before broad implementation:
 
 1. ~~Whether MVP pause/resume/cancel targets only direct Marlin commands, only local streaming sessions, or both.~~ Resolved in Milestone 8: both, through distinct mechanisms. A host streaming session is controlled in-process with signals (SIGUSR1 pause, SIGUSR2 resume, SIGINT/SIGTERM graceful cancel) because the MVP has no daemon; the `pause`/`resume`/`cancel` CLI commands are direct Marlin SD-print commands (M25/M24/M524). The serial port is opened exclusively (TIOCEXCL) so the two worlds cannot collide. See [[docs/design/milestone-8-pause-resume-cancel]].
 2. ~~Whether structured logs default to plain text or JSON Lines.~~ Resolved in Milestone 2: plain TSV, hidden behind the logging API. See [[docs/design/milestone-2-logging]].
-3. Test framework choice for C unit tests.
+3. ~~Test framework choice for C unit tests.~~ Resolved de facto by
+   Milestone 11: a small hand-rolled `check(condition, description)`
+   harness per test binary (no external dependency), consistent across
+   all eight test binaries since Milestone 0. See [[docs/testing]].
 4. ~~Maximum G-code line length and command normalization rules.~~ Resolved in Milestone 3: 4096-byte source-line limit and the normalization contract in [[docs/design/milestone-3-gcode-dry-run]].
 5. ~~Whether `send` should block known unsafe commands by default.~~ Resolved in Milestone 6: `send` blocks G28 (all variants, no bypass, shared detection with the G-code reader); M112 passes through as the operator's explicit emergency stop. See [[docs/design/milestone-6-printer-commands]].
-6. Whether a future daemon mode is required for external pause/resume/cancel of active prints.
+6. ~~Whether a future daemon mode is required for external pause/resume/cancel of active prints.~~ Resolved by the revised roadmap: yes. Phase II (Milestones 12-27) extracts a daemon-agnostic print engine, then builds `printerctld` around it with a Unix socket protocol; `printerctl` becomes a thin client. See `roadmap.md` and [[docs/design/unix-socket-service-analysis]] (an earlier proposal now superseded in its protocol specifics — RESP-like frames, not the key=value ones proposed there — but aligned on the daemon-owns-the-serial-port shape).
 
 Resolved decisions are recorded in milestone design notes. Configuration
 path and format were resolved in [[docs/design/milestone-1-cli-config]].

@@ -1044,6 +1044,106 @@ static void test_print_file_cancel_stops_after_current_acknowledgement(void)
     remove(path);
 }
 
+/*
+ * Milestone 10: an external power-failure/low-battery notification
+ * cancels exactly like an operator cancel structurally, but must be
+ * distinguishable afterwards -- a different status and a different
+ * final state -- so the CLI's summary and session record can say which
+ * one actually happened.
+ */
+static void test_print_file_cancel_power_failure_stops_after_current_acknowledgement(void)
+{
+    mock_printer_t mock;
+    if (!mock_open(&mock, 1000)) {
+        return;
+    }
+
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\n", path, sizeof(path));
+    mock_reply(&mock, "ok\n");
+
+    static const printerctl_print_control_t decisions[] = {
+        PRINTERCTL_PRINT_CONTROL_CONTINUE,
+        PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE,
+    };
+    control_script_t script = {
+        .decisions = decisions,
+        .count = sizeof(decisions) / sizeof(decisions[0]),
+        .master = -1,
+    };
+
+    printerctl_print_summary_t summary;
+    printerctl_printer_status_t status = printerctl_printer_print_file(
+        &session, path, NULL, NULL, scripted_control, &script, &summary, &error);
+
+    check(status == PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE,
+          "a power-failure cancel returns its own distinct status, not the operator one");
+    check(summary.state == PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE &&
+              summary.status == PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE,
+          "the summary reports the power-failure cancelled state and status");
+    check(summary.commands_sent == 1 && summary.commands_acknowledged == 1 &&
+              summary.last_acknowledged_line == 1,
+          "the power-failure cancel took effect after the current acknowledgement");
+    check(strstr(error.message, "power") != NULL,
+          "the power-failure cancel carries a message naming the real cause");
+
+    char transmitted[64];
+    mock_received(&mock, transmitted, sizeof(transmitted));
+    check(strcmp(transmitted, "G21\n") == 0, "nothing after the cancel point was transmitted");
+
+    printerctl_printer_disconnect(&session, &error);
+    mock_close(&mock);
+    remove(path);
+}
+
+/*
+ * A power-failure signal must win even while paused: it must not have
+ * to wait for a resume that respects the operator's pause first.
+ */
+static void test_print_file_cancel_power_failure_takes_priority_while_paused(void)
+{
+    mock_printer_t mock;
+    if (!mock_open(&mock, 1000)) {
+        return;
+    }
+
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_connect(&session, &mock.config, NULL, &error);
+
+    char path[64];
+    write_temp_gcode("G21\nG90\nM105\n", path, sizeof(path));
+    mock_reply(&mock, "ok\n");
+
+    static const printerctl_print_control_t decisions[] = {
+        PRINTERCTL_PRINT_CONTROL_CONTINUE,
+        PRINTERCTL_PRINT_CONTROL_PAUSE,
+        PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE,
+    };
+    control_script_t script = {
+        .decisions = decisions,
+        .count = sizeof(decisions) / sizeof(decisions[0]),
+        .master = -1,
+    };
+
+    printerctl_print_summary_t summary;
+    printerctl_printer_status_t status = printerctl_printer_print_file(
+        &session, path, NULL, NULL, scripted_control, &script, &summary, &error);
+
+    check(status == PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE,
+          "a power-failure signal cancels a paused print instead of waiting for resume");
+    check(summary.state == PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE,
+          "the summary reports the power-failure cancelled state");
+
+    printerctl_printer_disconnect(&session, &error);
+    mock_close(&mock);
+    remove(path);
+}
+
 static void test_print_file_cancel_before_first_command_and_while_paused(void)
 {
     {
@@ -1315,6 +1415,8 @@ int main(void)
     test_print_file_waits_out_busy_and_handles_empty_file();
     test_print_file_pause_transmits_nothing_and_resume_continues();
     test_print_file_cancel_stops_after_current_acknowledgement();
+    test_print_file_cancel_power_failure_stops_after_current_acknowledgement();
+    test_print_file_cancel_power_failure_takes_priority_while_paused();
     test_print_file_cancel_before_first_command_and_while_paused();
     test_sd_print_controls_send_marlin_commands();
     test_failure_paths_release_all_descriptors();

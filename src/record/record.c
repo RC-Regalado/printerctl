@@ -223,25 +223,31 @@ printerctl_record_status_t printerctl_record_write_session(
         "version=1\n"
         "timestamp=%s\n"
         "event=print_interrupted\n"
+        "job_id=%s\n"
         "state=%s\n"
         "cause=%s\n"
         "file=%s\n"
+        "serial_device=%s\n"
         "commands_sent=%llu\n"
         "commands_acknowledged=%llu\n"
         "last_acknowledged_line=%llu\n"
         "bytes_consumed=%llu\n"
         "file_size=%llu\n"
-        "progress_percent=%u\n",
+        "progress_percent=%u\n"
+        "printer_state=%s\n",
         timestamp,
+        record->job_id,
         record->state,
         record->cause,
         record->file,
+        record->serial_device,
         (unsigned long long)record->commands_sent,
         (unsigned long long)record->commands_acknowledged,
         (unsigned long long)record->last_acknowledged_line,
         (unsigned long long)record->bytes_consumed,
         (unsigned long long)record->file_size,
-        record->progress_percent);
+        record->progress_percent,
+        record->printer_state);
 
     /* The record exists to survive exactly the failures it describes:
      * flush it to the kernel and the kernel's copy to the device before
@@ -260,4 +266,140 @@ printerctl_record_status_t printerctl_record_write_session(
 
     snprintf(out_path, out_path_size, "%s", path);
     return PRINTERCTL_RECORD_OK;
+}
+
+#define ACTIVE_PID_FILENAME "active-print.pid"
+
+/* Builds <dir>/active-print.pid into `path`; false if it does not fit. */
+static bool active_pid_path(const char *dir, char *path, size_t path_size)
+{
+    int written = snprintf(path, path_size, "%s/" ACTIVE_PID_FILENAME, dir);
+    return written > 0 && (size_t)written < path_size;
+}
+
+printerctl_record_status_t printerctl_record_write_active_pid(
+    const char *dir,
+    printerctl_record_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_RECORD_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    out_error->status = PRINTERCTL_RECORD_OK;
+
+    if (dir == NULL) {
+        set_error(out_error, PRINTERCTL_RECORD_ERR_INVALID_ARGUMENT, "dir must not be NULL");
+        return out_error->status;
+    }
+
+    if (!create_dir_tree(dir, out_error)) {
+        return out_error->status;
+    }
+
+    char path[PRINTERCTL_RECORD_PATH_MAX];
+    if (!active_pid_path(dir, path, sizeof(path))) {
+        set_error(out_error, PRINTERCTL_RECORD_ERR_INVALID_ARGUMENT,
+                   "the active-print marker path exceeds the %zu-byte buffer", sizeof(path) - 1);
+        return out_error->status;
+    }
+
+    /* Overwritten, not exclusive: a marker left behind by a crashed
+     * earlier run must not block the current one from publishing its
+     * own PID. printerctl_cli_run() reads it back only through
+     * printerctl_record_read_active_pid(), which validates liveness. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        set_error(out_error, PRINTERCTL_RECORD_ERR_IO,
+                   "cannot create active-print marker '%s': %s", path, strerror(errno));
+        return out_error->status;
+    }
+
+    FILE *file = fdopen(fd, "w");
+    if (file == NULL) {
+        set_error(out_error, PRINTERCTL_RECORD_ERR_IO,
+                   "cannot open active-print marker '%s' for writing: %s", path, strerror(errno));
+        close(fd);
+        return out_error->status;
+    }
+
+    bool ok = fprintf(file, "%ld\n", (long)getpid()) > 0 && fflush(file) == 0;
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+
+    if (!ok) {
+        set_error(out_error, PRINTERCTL_RECORD_ERR_IO,
+                   "cannot write active-print marker '%s': %s", path, strerror(errno));
+        return out_error->status;
+    }
+
+    return PRINTERCTL_RECORD_OK;
+}
+
+printerctl_record_status_t printerctl_record_read_active_pid(
+    const char *dir,
+    pid_t *out_pid,
+    printerctl_record_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_RECORD_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    out_error->status = PRINTERCTL_RECORD_OK;
+
+    if (out_pid != NULL) {
+        *out_pid = 0;
+    }
+
+    if (dir == NULL || out_pid == NULL) {
+        set_error(out_error, PRINTERCTL_RECORD_ERR_INVALID_ARGUMENT,
+                   "dir and out_pid must not be NULL");
+        return out_error->status;
+    }
+
+    char path[PRINTERCTL_RECORD_PATH_MAX];
+    if (!active_pid_path(dir, path, sizeof(path))) {
+        set_error(out_error, PRINTERCTL_RECORD_ERR_INVALID_ARGUMENT,
+                   "the active-print marker path exceeds the %zu-byte buffer", sizeof(path) - 1);
+        return out_error->status;
+    }
+
+    FILE *file = fopen(path, "r");
+    if (file == NULL) {
+        if (errno == ENOENT) {
+            set_error(out_error, PRINTERCTL_RECORD_ERR_NOT_FOUND,
+                       "no active print: no marker at '%s'", path);
+        } else {
+            set_error(out_error, PRINTERCTL_RECORD_ERR_IO,
+                       "cannot open active-print marker '%s': %s", path, strerror(errno));
+        }
+        return out_error->status;
+    }
+
+    long value = -1;
+    int scanned = fscanf(file, "%ld", &value);
+    fclose(file);
+
+    if (scanned != 1 || value <= 0) {
+        set_error(out_error, PRINTERCTL_RECORD_ERR_IO,
+                   "active-print marker '%s' does not contain a valid process id", path);
+        return out_error->status;
+    }
+
+    *out_pid = (pid_t)value;
+    return PRINTERCTL_RECORD_OK;
+}
+
+void printerctl_record_remove_active_pid(const char *dir)
+{
+    if (dir == NULL) {
+        return;
+    }
+
+    char path[PRINTERCTL_RECORD_PATH_MAX];
+    if (!active_pid_path(dir, path, sizeof(path))) {
+        return;
+    }
+
+    (void)remove(path);
 }

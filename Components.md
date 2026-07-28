@@ -14,17 +14,30 @@ cliente host.
 ## 1. Propósito del proyecto
 
 `printerctl` es una CLI Linux escrita en C17 para controlar impresoras 3D
-con firmware Marlin por USB serial. El MVP actual llega hasta el
-Milestone 7: puede leer archivos G-code, normalizarlos y transmitirlos
-línea por línea esperando `ok` antes de enviar el siguiente comando.
+con firmware Marlin por USB serial. El estado actual llega hasta el
+Milestone 10 (cancelación por batería baja) más una actualización de
+hardware (2026-07-21: end-stops min habilitados en los tres ejes, ver
+la enmienda "Home" en `Agents.md`). Puede leer archivos G-code,
+normalizarlos, transmitirlos línea por línea esperando `ok` antes de
+enviar el siguiente comando, pausar/reanudar/cancelar una sesión
+(operador o SD), hacer home (todos los ejes o uno solo) y reaccionar a
+una notificación externa de batería baja.
 
 La prioridad del host es seguridad y observabilidad, no throughput:
 
-- no hace homing automático;
+- no hace homing automático (`home` es siempre una acción explícita del
+  operador, nunca un efecto colateral de `send` o de un archivo);
 - no calienta, mueve ejes ni extruye salvo acción explícita del operador;
 - no abre serial en `--dry-run`;
-- detiene el streaming ante `Error:`, `Resend:`, timeout o desconexión;
+- detiene el streaming ante `Error:`, `Resend:`, timeout, desconexión o
+  una señal de batería baja — siempre de forma elegante, nunca enviando
+  nada adicional al detenerse;
+- nunca reanuda un trabajo automáticamente, ni tras una desconexión ni
+  tras el regreso de la energía;
 - registra TX/RX, progreso, errores y cambios de estado.
+
+Ver `docs/safety.md` para el detalle completo de esta política y
+`architecture.md` §7.5 para el mapeo de estados del ciclo de vida.
 
 ## 2. Vista general
 
@@ -32,7 +45,7 @@ La prioridad del host es seguridad y observabilidad, no throughput:
 CLI
  |
  v
-Config + Logger
+Config + Logger + Record
  |
  v
 Printer session
@@ -43,6 +56,12 @@ reader  parser   transport
                   |
                   v
              USB serial / firmware
+
+Fuera de la sesión de impresión:
+  scripts/apcupsd/printerctl-low-battery.sh
+    -> printerctl power low-battery
+    -> lee record.h's active-print marker
+    -> SIGPWR al proceso que transmite (si existe)
 ```
 
 ## 3. Componentes del host
@@ -54,9 +73,11 @@ reader  parser   transport
 | Logging | `src/logging`, `include/printerctl/logging.h` | Emitir logs TSV estructurados con timestamp, niveles y eventos. |
 | G-code | `src/gcode`, `include/printerctl/gcode.h` | Leer archivos regulares, normalizar líneas, remover comentarios, calcular progreso y bloquear `G28`. |
 | Marlin | `src/marlin`, `include/printerctl/marlin.h` | Clasificar respuestas: `ok`, `Error:`, `busy:`, `echo:`, `Resend:` e info. Parsear `M105`, `M114`, `M115`. |
-| Serial | `src/serial`, `include/printerctl/serial.h` | Abrir/configurar USB serial, escribir líneas, leer respuestas por línea, reportar timeout/I/O. |
-| Printer | `src/printer`, `include/printerctl/printer.h` | Orquestar sesión: conectar, ejecutar comandos, consultar estado y hacer streaming confiable. |
-| Tests | `tests` | Validar CLI, parser, serial con pseudo-terminales y mock Marlin. |
+| Serial | `src/serial`, `include/printerctl/serial.h` | Abrir/configurar USB serial, escribir líneas, leer respuestas por línea, reportar timeout/I/O, acceso exclusivo (`TIOCEXCL`). |
+| Printer | `src/printer`, `include/printerctl/printer.h` | Orquestar sesión: conectar, ejecutar comandos, consultar estado, streaming confiable y control (pausa/reanudación/cancelación, operador o batería baja). |
+| Record | `src/record`, `include/printerctl/record.h` | Persistir registros de sesiones interrumpidas (write-only, nunca leídos) y el marcador de PID del print activo. |
+| Tests | `tests` | Validar CLI, parser, serial con pseudo-terminales y mock Marlin (ver `docs/testing.md`). |
+| Scripts | `scripts/apcupsd` | Notificar a `printerctl` eventos de batería baja de APCUPSD (ver `docs/apcupsd.md`). |
 | Docs | `docs`, raíz | Documentar decisiones por milestone y contratos operativos. |
 
 ## 4. Contrato serial esperado por `printerctl`
@@ -92,27 +113,31 @@ emite `busy:` o información periódica, el host seguirá esperando.
 | `position` | `M114` | Implementado. |
 | `info` | `M115` | Implementado. |
 | `send "CMD"` | texto explícito del operador | Implementado, bloquea `G28`. |
-| `print FILE` | comandos normalizados del archivo | Implementado con un comando en vuelo. |
-| `pause` | por definir en M8 | Aún no disponible. |
-| `resume` | por definir en M8 | Aún no disponible. |
-| `cancel` | por definir en M8 | Aún no disponible. |
-| `home` | `G28` | Requiere confirmación en parser, ejecución aún no disponible. |
+| `print FILE` | comandos normalizados del archivo | Implementado con un comando en vuelo; bloquea `G28`. |
+| `pause`/`resume`/`cancel` | `M25`/`M24`/`M524` (impresión SD) | Implementado (Milestone 8). Un stream por host se controla con señales (SIGUSR1/SIGUSR2/SIGINT), no por estos comandos. |
+| `home` | `G28` (o `home X`/`Y`/`Z` -> `G28 X`/`Y`/`Z`) | Implementado sin confirmación (end-stops min habilitados en los tres ejes, 2026-07-21). Requiere `--port`. |
+| `power low-battery` | ninguno (nunca abre serial) | Implementado (Milestone 10). Envía `SIGPWR` al proceso que transmite, si existe. |
 
 ## 6. Seguridad relevante para firmware
 
 La impresora objetivo es una EasyThreed K9 con controlador STM32 y
-firmware Marlin. El hardware disponible solo posee home en Z-min. Por
-esa razón, las pruebas automáticas con hardware real deben limitarse a
-comandos inocuos como:
+firmware Marlin. Desde 2026-07-21 el hardware tiene end-stops min
+habilitados en los tres ejes (antes solo Z-min), lo que permitió
+habilitar `home` sin confirmación — ver la enmienda "Home" en
+`Agents.md`. Aun así, las pruebas automáticas con hardware real siguen
+limitándose a comandos inocuos:
 
 - `M105`
 - `M114`
 - `M115`
 - `G4 P<ms>`
+- `G28` (y sus variantes por eje) — solo a través del comando `home`
+  dedicado, nunca automáticamente ni como parte de otra prueba
 
-No se debe usar automáticamente:
+No se debe usar automáticamente (es decir, sin que el operador lo pida
+explícitamente vía `home`/`send`/`print`):
 
-- `G28`;
+- `G28` fuera de `home`;
 - movimientos `G0`/`G1`;
 - calentamiento;
 - extrusión;
@@ -138,7 +163,13 @@ pero no puede continuar si el firmware deja de emitir `ok`.
 
 - Recuperación real de `Resend:`.
 - Checksums y números de línea.
-- Reanudación automática.
-- Base de datos persistente de trabajos.
-- Daemon host para controlar prints desde otro proceso.
+- Reanudación automática (prohibida por política de seguridad, no solo
+  "no implementada" — ver `docs/safety.md` §7).
 - Alto throughput con ventana de comandos.
+
+Planificado, pero no implementado todavía (Fase II del roadmap
+revisado, Milestones 12+): un daemon host (`printerctld`) que posea el
+puerto serial y una cola de trabajos persistente, con `printerctl`
+convertido en cliente de un socket Unix. Esto sí está en el roadmap
+ahora, a diferencia de cuando este documento se escribió originalmente;
+ver `roadmap.md` y `docs/design/unix-socket-service-analysis.md`.

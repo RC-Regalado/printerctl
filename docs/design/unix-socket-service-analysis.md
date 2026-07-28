@@ -1,11 +1,22 @@
 ---
 title: Unix Socket Service Analysis
-status: proposed
+status: superseded
 date: 2026-07-10
 tags: [printerctl, design, daemon, unix-socket, docker, web]
 ---
 
 # Unix Socket Service Analysis
+
+**Status (Milestone 11, 2026-07-21): superseded in its protocol
+specifics.** The revised `roadmap.md` now formally schedules the daemon
+transition as Phase II (Milestones 12-27: extract the print engine,
+then build `printerctld` and its Unix socket, then the TUI and web
+gateway), with a RESP-inspired frame protocol rather than this
+document's proposed `key=value` frames. The analysis below correctly
+anticipated the daemon-owns-the-serial-port shape, the client/server
+split, and most of the safety rules Phase II must preserve — kept here
+as background, not as the current protocol design. See `roadmap.md`'s
+Phase II section and [[architecture]] §13 item 6 for the current plan.
 
 Source of truth: [[Agents]], [[architecture]], [[roadmap]].
 

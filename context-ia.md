@@ -28,23 +28,27 @@ el streaming seguro del host.
 
 ## 2. Estado actual del host
 
-Implementado hasta Milestone 7:
+Implementado hasta Milestone 10 más la actualización de end-stops
+(2026-07-21, ver `Agents.md`):
 
 - CLI y configuración.
 - Logs estructurados en `stderr`.
 - Parser G-code con `--dry-run`.
 - Parser de respuestas Marlin.
 - Transporte serial Linux.
-- Comandos únicos: `M105`, `M114`, `M115`, `send`.
-- Streaming `print FILE` con un solo comando en vuelo.
+- Comandos únicos: `M105`, `M114`, `M115`, `send`, `home` (todos los
+  ejes o uno solo).
+- Streaming `print FILE` con un solo comando en vuelo, con
+  pausa/reanudación/cancelación (operador vía señales, o batería baja
+  vía `SIGPWR`).
+- Registro de sesiones interrumpidas (write-only, nunca leído de vuelta).
 
 No implementado aún:
 
-- pausa/resume/cancel de sesión host;
-- persistencia de recuperación;
 - checksums;
 - números de línea;
-- recuperación automática de `Resend:`.
+- recuperación automática de `Resend:`;
+- daemon/socket Unix (planificado, Fase II del roadmap revisado).
 
 ## 3. Reglas que el firmware no debe romper
 
@@ -161,20 +165,23 @@ Reglas:
 
 ## 6. Seguridad de hardware
 
-La máquina objetivo disponible solo posee home en Z-min. Para pruebas
-automáticas o smoke tests desde `printerctl`, usar solo comandos inocuos:
+Desde 2026-07-21 la máquina objetivo tiene end-stops min habilitados en
+los tres ejes (antes solo Z-min). Para pruebas automáticas o smoke
+tests desde `printerctl`, usar solo comandos inocuos:
 
 ```text
 M105
 M114
 M115
 G4 P250
+G28          (solo a través del comando 'home' dedicado)
+G28 X / Y / Z
 ```
 
 Evitar sin autorización explícita:
 
 ```text
-G28
+G28          (fuera del comando 'home': send/print lo rechazan igual)
 G0
 G1
 M104

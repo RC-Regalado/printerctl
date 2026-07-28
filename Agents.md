@@ -244,6 +244,25 @@ Example:
 printerctl home --i-understand-no-endstops
 ```
 
+**Amendment (2026-07-21):** min end-stops are now installed and enabled
+on all three axes (X, Y, Z), connected at `/dev/ttyUSB0`. Homing now
+moves each axis into a physical switch instead of an unbounded crash, so
+`executing home requires explicit confirmation` above no longer applies:
+`home` runs like `temp`/`position`/`info`, needing only a configured
+`--port`. `home X`, `home Y` and `home Z` home a single axis (`G28 X`,
+`G28 Y`, `G28 Z`). `G28 must remain disabled by default` still applies
+everywhere *else*: `send` and G-code files streamed by `print` still
+reject `G28` unconditionally, with no bypass, so homing is only ever an
+explicit, direct request through the dedicated `home` command, never an
+unexpected side effect of a raw command or a sliced file.
+
+```bash
+printerctl --port /dev/ttyUSB0 home
+printerctl --port /dev/ttyUSB0 home X
+printerctl --port /dev/ttyUSB0 home Y
+printerctl --port /dev/ttyUSB0 home Z
+```
+
 ---
 
 ## Emergency Stop
@@ -363,6 +382,22 @@ on_online=record
 auto_resume=false
 ```
 
+**Amendment (Milestone 10, 2026-07-20):** the roadmap that originally
+scheduled this milestone as record-only was superseded by a revised
+`roadmap.md`, whose Milestone 10 requires actively cancelling the active
+print on a low-battery notification, not only recording it. This does
+not contradict "the printer is NOT connected to the UPS" above — that
+remains true, and is exactly why the action taken is *stop the host from
+sending more G-code*, never a printer-side command: the cancellation
+does not depend on the printer's own power at all, only on the host
+choosing to stop cleanly while it still can. See
+`docs/design/milestone-10-low-battery-cancellation.md` for the full
+reasoning. What is unchanged, and reinforced rather than weakened: the
+software must never automatically resume a print after power
+restoration, and a low-battery cancellation sends nothing to the printer
+beyond "stop transmitting" — no `M112`, no `M410`, no homing, no resume,
+no additional movement.
+
 ---
 
 # Testing
@@ -444,11 +479,12 @@ Maintain:
 
 README.md
 
-AGENTS.md
+Agents.md (this file)
 
-docs/architecture.md
-
-docs/marlin.md
+architecture.md (root, not `docs/architecture.md` — the project settled
+on this location starting with Milestone 0's bootstrap; the Marlin
+protocol contract lives in its §6.5, not a separate `docs/marlin.md`,
+which was never created)
 
 docs/testing.md
 
@@ -457,6 +493,8 @@ docs/safety.md
 docs/logging.md
 
 docs/apcupsd.md
+
+roadmap.md
 
 ---
 

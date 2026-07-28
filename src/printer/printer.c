@@ -388,8 +388,8 @@ printerctl_printer_status_t printerctl_printer_send(
      * not be inferred from logs). */
     if (printerctl_gcode_command_is_unsafe_g28(command)) {
         set_error(out_error, PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND,
-                   "refusing to send G28: homing is disabled because endstop sensors "
-                   "are not available (see the safety policy in Agents.md)");
+                   "refusing to send G28: homing is only available through the "
+                   "dedicated home command (see the safety policy in Agents.md)");
         if (session != NULL) {
             log_detail(session->logger, printerctl_log_error, "send rejected: unsafe G28");
         }
@@ -557,6 +557,12 @@ printerctl_printer_status_t printerctl_printer_print_file(
                 status = PRINTERCTL_PRINTER_CANCELLED;
                 break;
             }
+            if (control == PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE) {
+                set_error(out_error, PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE,
+                           "print cancelled: external power-failure/low-battery signal");
+                status = PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE;
+                break;
+            }
         }
 
         /* The next command is not even read from the file until the
@@ -624,6 +630,13 @@ printerctl_printer_status_t printerctl_printer_print_file(
         out_summary->state = PRINTERCTL_PRINT_CANCELLED;
         out_summary->status = status;
         log_print_end(session->logger, out_summary, "print_cancelled");
+        return status;
+    }
+
+    if (status == PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE) {
+        out_summary->state = PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE;
+        out_summary->status = status;
+        log_print_end(session->logger, out_summary, "print_cancelled_power_failure");
         return status;
     }
 

@@ -63,7 +63,12 @@ typedef enum {
     PRINTERCTL_PRINTER_ERR_RESEND,          /* Marlin requested a resend (unsupported in MVP) */
     PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE,
     PRINTERCTL_PRINTER_ERR_GCODE,           /* the G-code file itself failed (Milestone 7) */
-    PRINTERCTL_PRINTER_CANCELLED            /* the operator cancelled the print (Milestone 8; not an error) */
+    PRINTERCTL_PRINTER_CANCELLED,           /* the operator cancelled the print (Milestone 8; not an error) */
+    PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE /* an external low-battery/power-failure signal
+                                                 * cancelled the print (Milestone 10; not an
+                                                 * error, same treatment as
+                                                 * PRINTERCTL_PRINTER_CANCELLED but a distinct
+                                                 * cause) */
 } printerctl_printer_status_t;
 
 typedef struct {
@@ -202,7 +207,9 @@ printerctl_printer_status_t printerctl_printer_send(
 typedef enum {
     PRINTERCTL_PRINT_COMPLETED = 0,
     PRINTERCTL_PRINT_FAILED,
-    PRINTERCTL_PRINT_CANCELLED
+    PRINTERCTL_PRINT_CANCELLED,              /* cancelled by the operator (Milestone 8) */
+    PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE /* cancelled by an external power-failure/
+                                               * low-battery signal (Milestone 10) */
 } printerctl_print_final_state_t;
 
 typedef struct {
@@ -238,16 +245,28 @@ typedef void (*printerctl_printer_progress_fn)(
  *     summary state set to PRINTERCTL_PRINT_CANCELLED and a
  *     `state=print_cancelled` transition logged. Cancelling is honored
  *     both while streaming and while paused.
+ *   - CANCEL_POWER_FAILURE (Milestone 10): identical to CANCEL, but for
+ *     an external low-battery/power-failure notification rather than
+ *     the operator directly; stops gracefully with
+ *     PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE, the summary state set
+ *     to PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE and a
+ *     `state=print_cancelled_power_failure` transition logged. Also
+ *     honored both while streaming and while paused, and takes priority
+ *     over an unresolved pause.
  *
  * The printer itself is never sent anything on pause/resume/cancel: the
  * software must not move, heat or park automatically (Agents.md safety
  * policy). While paused, Marlin simply executes what it already
- * acknowledged and then idles.
+ * acknowledged and then idles. A power-failure cancellation follows the
+ * exact same rule: nothing extra (no M112, no M410, no homing, no
+ * resume) is ever sent — the goal is to stop transmitting, not to
+ * attempt a physically risky sequence while power may be compromised.
  */
 typedef enum {
     PRINTERCTL_PRINT_CONTROL_CONTINUE = 0,
     PRINTERCTL_PRINT_CONTROL_PAUSE,
-    PRINTERCTL_PRINT_CONTROL_CANCEL
+    PRINTERCTL_PRINT_CONTROL_CANCEL,
+    PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE
 } printerctl_print_control_t;
 
 typedef printerctl_print_control_t (*printerctl_printer_control_fn)(void *context);

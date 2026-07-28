@@ -124,16 +124,23 @@ multi-threaded daemon mode is built.
 error output:
 
 - `--help` and `--version` produce no log output at all.
-- A usage error, a configuration error, or the `home` safety rejection
-  each print their existing human-readable message and additionally
-  record one `ERROR`/`error` log line. For a usage error or the `home`
-  safety rejection, that line's detail is the same text as the
-  human-readable message. For a configuration error, the detail is the
-  generic string `configuration error` instead, because the
-  human-readable message may embed the `--config` path.
+- A usage error or a configuration error each print their existing
+  human-readable message and additionally record one `ERROR`/`error`
+  log line before logging is even initialized. For a usage error, that
+  line's detail is the same text as the human-readable message. For a
+  configuration error, the detail is the generic string
+  `configuration error` instead, because the human-readable message may
+  embed the `--config` path. (`home` no longer has a safety rejection of
+  its own now that min end-stops are enabled on all three axes — see
+  Agents.md's Home amendment; it resolves and executes like any other
+  command below.)
 - Every other valid, resolved command logs (in order) `session_start`,
   `config_summary`, `command_parsed` (`DEBUG`, only visible with
-  `--verbose`), `command_unavailable` (`WARNING`), then `session_end`.
+  `--verbose`), the command's own outcome record(s) — an `ERROR` line if
+  it failed, or a `state_transition`/`progress` record on success — then
+  `session_end`. `command_unavailable` (`WARNING`) is reserved for a
+  parsed command with no execution path at all; with every command now
+  implemented, it is not reached in ordinary use.
 
 `config_summary` never logs the raw `--port` value or the `--config`
 file path — only whether each was set (`port_set`, `config_file_set`),
