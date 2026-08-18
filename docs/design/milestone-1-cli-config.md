@@ -8,7 +8,7 @@ tags: [printerctl, milestone, design, cli, config]
 
 # Milestone 1 Design — CLI and Configuration
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 This note records the concrete design decisions behind the Milestone 1
 implementation, ahead of the milestone report in

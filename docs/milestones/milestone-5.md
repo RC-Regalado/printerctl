@@ -8,7 +8,7 @@ tags: [printerctl, milestone, serial]
 
 # Milestone 5 — Serial Transport
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]]. Design
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]]. Design
 details: [[milestone-5-serial|docs/design/milestone-5-serial.md]].
 
 ## 1. Technical summary

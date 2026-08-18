@@ -5,7 +5,7 @@ tags: [printerctl, testing, reference]
 
 # Testing
 
-Source of truth: [[Agents]], [[architecture]] §10. This document is the
+Source of truth: [[Agents]], [[Kernel/Architecture]] §10. This document is the
 concrete reference the roadmap's Milestone 11 requires: what each test
 binary covers, the patterns behind them, the hardware-validation policy,
 and how to run everything from a clean checkout.

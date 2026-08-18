@@ -18,6 +18,17 @@ A partir del hito 10, el proyecto evoluciona hacia una arquitectura basada en:
 * frontend Vue.js;
 * ejecución del gateway web mediante Docker.
 
+## Modelo de ejecución de agentes
+
+Claude deja de actuar como subagente activo del proyecto.
+
+La implementación, revisión y pruebas serán ejecutadas por subagentes Codex
+orquestados por Codex. Codex mantiene la responsabilidad final de arquitectura,
+alcance, integración, validación, documentación y commits.
+
+Las referencias históricas a cambios realizados por Claude deben preservarse en
+la documentación de milestones y reportes ya generados.
+
 ---
 
 # Milestone 10 — Cancelación por batería baja
@@ -118,7 +129,7 @@ serial_device=/dev/ttyACM0
 * Revisar condiciones de carrera entre confirmación serial y cancelación.
 * Confirmar que no existe reanudación automática.
 
-## Claude Tasks
+## Codex Implementation Subagent Tasks
 
 * Agregar el estado `PRINT_STATE_CANCELLED_POWER_FAILURE`.
 * Implementar la solicitud de cancelación asíncrona.
@@ -239,7 +250,7 @@ Cada `.sh` debe incluir:
 * Validar documentación de seguridad.
 * Revisar procedimientos de prueba.
 
-## Claude Tasks
+## Codex Documentation/Verification Subagent Tasks
 
 * Actualizar archivos Markdown.
 * Agregar ejemplos de uso.
@@ -394,7 +405,7 @@ int print_engine_tick(struct print_engine *engine);
 * Revisar máquina de estados.
 * Aprobar API pública.
 
-## Claude Tasks
+## Codex Implementation Subagent Tasks
 
 * Extraer lógica existente.
 * Eliminar dependencias del CLI.
@@ -556,7 +567,7 @@ Debe definirse una función de escape o un campo de longitud.
 * Revisar recuperación ante archivos incompletos.
 * Definir ownership y locking.
 
-## Claude Tasks
+## Codex Implementation Subagent Tasks
 
 * Implementar parser y serializer.
 * Implementar escritura atómica.

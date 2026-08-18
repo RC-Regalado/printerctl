@@ -8,7 +8,7 @@ tags: [printerctl, milestone, design, record, recovery, safety]
 
 # Milestone 9 Design — Fault Tolerance and Recovery Records
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 This note records the concrete design decisions behind the Milestone 9
 implementation, ahead of the milestone report in

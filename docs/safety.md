@@ -5,7 +5,7 @@ tags: [printerctl, safety, policy, reference]
 
 # Safety Policy
 
-Source of truth: [[Agents]], [[architecture]]. This is the
+Source of truth: [[Agents]], [[Kernel/Architecture]]. This is the
 operator-facing consolidation of the safety rules scattered across
 `Agents.md` (the directive) and `architecture.md` §8 (the acceptance
 criteria); read this document for the rationale and worked examples,
@@ -78,7 +78,7 @@ G-code streaming (`print`) stops gracefully — no further command is
 transmitted, the file and the serial port are closed, a summary is
 rendered — on every failure mode: `Error:`, `Resend:` (unsupported in
 the MVP), a response timeout, a serial disconnect, or a malformed/unsafe
-line found mid-file. See [[architecture]] §7.5 for the full state
+line found mid-file. See [[Kernel/Architecture]] §7.5 for the full state
 mapping and [[docs/testing]] for how each path is exercised.
 
 ## 6. Power-failure cancellation

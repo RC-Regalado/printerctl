@@ -8,7 +8,7 @@ tags: [printerctl, milestone, documentation]
 
 # Milestone 11 — Core Documentation Completion
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 ## 1. Technical summary
 

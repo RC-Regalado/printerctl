@@ -7,7 +7,7 @@ tags: [printerctl, milestone, design, gcode, dry-run, safety]
 
 # Milestone 3 Design — G-code Parser and Dry Run
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 ## Scope
 

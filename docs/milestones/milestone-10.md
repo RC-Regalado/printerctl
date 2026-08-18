@@ -8,7 +8,7 @@ tags: [printerctl, milestone, apcupsd, power, safety, record]
 
 # Milestone 10 — Low-Battery Cancellation
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]]. Design
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]]. Design
 details: [[milestone-10-low-battery-cancellation|docs/design/milestone-10-low-battery-cancellation.md]].
 
 ## 1. Technical summary

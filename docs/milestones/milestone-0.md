@@ -8,7 +8,7 @@ tags: [printerctl, milestone, bootstrap, cmake, cli]
 
 # Milestone 0 — Project Bootstrap
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 ## 1. Technical summary
 

@@ -8,7 +8,7 @@ tags: [printerctl, milestone, design, logging]
 
 # Milestone 2 Design — Logging Foundation
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 This note records the concrete design decisions behind the Milestone 2
 implementation, ahead of the milestone report in

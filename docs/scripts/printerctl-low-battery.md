@@ -1,6 +1,6 @@
 # `scripts/apcupsd/printerctl-low-battery.sh`
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]]. Implemented
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]]. Implemented
 as part of [[milestone-10|docs/milestones/milestone-10.md]].
 
 ## Purpose

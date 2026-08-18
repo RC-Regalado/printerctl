@@ -8,7 +8,7 @@ tags: [printerctl, milestone, printer, streaming, gcode]
 
 # Milestone 7 — Reliable G-code Streaming MVP
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]]. Design
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]]. Design
 details: [[milestone-7-streaming|docs/design/milestone-7-streaming.md]].
 
 ## 1. Technical summary

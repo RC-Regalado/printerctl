@@ -8,7 +8,7 @@ tags: [printerctl, milestone, printer, session, signals, sd]
 
 # Milestone 8 — Pause, Resume and Cancel
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]]. Design
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]]. Design
 details: [[milestone-8-pause-resume-cancel|docs/design/milestone-8-pause-resume-cancel.md]].
 
 ## 1. Technical summary

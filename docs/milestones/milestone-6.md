@@ -8,7 +8,7 @@ tags: [printerctl, milestone, printer, marlin, serial]
 
 # Milestone 6 — Single Marlin Commands
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]]. Design
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]]. Design
 details: [[milestone-6-printer-commands|docs/design/milestone-6-printer-commands.md]].
 
 ## 1. Technical summary

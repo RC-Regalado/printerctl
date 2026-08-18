@@ -7,7 +7,7 @@ tags: [printerctl, logging]
 
 # Logging
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]]. Design
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]]. Design
 rationale: [[milestone-2-logging|docs/design/milestone-2-logging.md]].
 Milestone report: [[milestone-2|docs/milestones/milestone-2.md]].
 

@@ -16,9 +16,9 @@ document's proposed `key=value` frames. The analysis below correctly
 anticipated the daemon-owns-the-serial-port shape, the client/server
 split, and most of the safety rules Phase II must preserve — kept here
 as background, not as the current protocol design. See `roadmap.md`'s
-Phase II section and [[architecture]] §13 item 6 for the current plan.
+Phase II section and [[Kernel/Architecture]] §13 item 6 for the current plan.
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 ## 1. Conclusion
 

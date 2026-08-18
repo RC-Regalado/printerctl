@@ -7,7 +7,7 @@ tags: [printerctl, milestone, gcode, dry-run]
 
 # Milestone 3 — G-code Parser and Dry Run
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]]. Design
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]]. Design
 details: [[milestone-3-gcode-dry-run|docs/design/milestone-3-gcode-dry-run.md]].
 
 ## 1. Technical summary

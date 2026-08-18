@@ -5,7 +5,7 @@ tags: [printerctl, apcupsd, power, safety, reference]
 
 # APCUPSD Integration
 
-Source of truth: [[Agents]], [[architecture]]. Implemented in
+Source of truth: [[Agents]], [[Kernel/Architecture]]. Implemented in
 [[milestone-10|docs/milestones/milestone-10.md]] /
 [[docs/design/milestone-10-low-battery-cancellation]]; this document is
 the operator-facing reference the roadmap's Milestone 11 requires

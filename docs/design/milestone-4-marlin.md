@@ -8,7 +8,7 @@ tags: [printerctl, milestone, design, marlin]
 
 # Milestone 4 Design — Marlin Response Parser
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 This note records the concrete design decisions behind the Milestone 4
 implementation, ahead of the milestone report in

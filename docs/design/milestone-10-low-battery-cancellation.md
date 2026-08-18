@@ -8,7 +8,7 @@ tags: [printerctl, milestone, design, apcupsd, power, safety]
 
 # Milestone 10 Design — Low-Battery Cancellation
 
-Source of truth: [[Agents]], [[architecture]], [[roadmap]].
+Source of truth: [[Agents]], [[Kernel/Architecture]], [[Kernel/Roadmap]].
 
 This note records the concrete design decisions behind the Milestone 10
 implementation, ahead of the milestone report in
