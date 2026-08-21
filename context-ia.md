@@ -28,7 +28,7 @@ el streaming seguro del host.
 
 ## 2. Estado actual del host
 
-Implementado hasta Milestone 10 más la actualización de end-stops
+Implementado hasta Milestone 12 más la actualización de end-stops
 (2026-07-21, ver `Agents.md`):
 
 - CLI y configuración.
@@ -42,13 +42,21 @@ Implementado hasta Milestone 10 más la actualización de end-stops
   pausa/reanudación/cancelación (operador vía señales, o batería baja
   vía `SIGPWR`).
 - Registro de sesiones interrumpidas (write-only, nunca leído de vuelta).
+- Milestone 12: el ciclo de vida de `print` se extrajo a un módulo host
+  interno (`core`/print engine). Es un refactor puramente del lado del
+  host -- no cambia nada de lo descrito en este documento (el protocolo
+  serial, el conjunto de comandos Marlin ni las reglas de seguridad de
+  §3-§9 siguen exactamente igual). Se menciona aquí solo por completitud;
+  el agente de firmware no necesita actuar sobre esto.
 
 No implementado aún:
 
 - checksums;
 - números de línea;
 - recuperación automática de `Resend:`;
-- daemon/socket Unix (planificado, Fase II del roadmap revisado).
+- daemon/socket Unix (planificado, Fase II del roadmap revisado;
+  Milestone 12 extrajo la pieza que ese daemon reutilizará, pero el
+  daemon en sí, el socket y la cola siguen sin implementarse).
 
 ## 3. Reglas que el firmware no debe romper
 

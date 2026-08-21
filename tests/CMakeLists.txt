@@ -54,6 +54,14 @@ target_link_libraries(printerctl_record_tests PRIVATE printerctl_record)
 
 add_test(NAME printerctl_record_tests COMMAND printerctl_record_tests)
 
+add_executable(printerctl_core_tests
+    test_print_engine.c
+)
+
+target_link_libraries(printerctl_core_tests PRIVATE printerctl_core)
+
+add_test(NAME printerctl_core_tests COMMAND printerctl_core_tests)
+
 add_executable(printerctl_logging_tests
     test_logging.c
 )

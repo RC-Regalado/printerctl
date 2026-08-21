@@ -1,8 +1,8 @@
 ---
 title: Milestone 12 Design - Print Engine Extraction
 milestone: 12
-status: in_progress
-date: 2026-07-28
+status: done
+date: 2026-08-21
 tags: [printerctl, milestone, design, core, print-engine, daemon]
 ---
 
@@ -215,3 +215,58 @@ The CLI behavior must remain compatible:
 - Multi-client access control: daemon milestones.
 - Non-blocking event loop integration: only if the daemon implementation
   proves the blocking engine cannot be isolated safely.
+
+## 10. Implementation notes (as built)
+
+Implemented in `include/printerctl/core/print_engine.h` and
+`src/core/print_engine.c`; see
+[[milestone-12|docs/milestones/milestone-12.md]] §2-§5 for the file list
+and verification results. A few points where the built engine differs
+from this note, each a deliberate simplification rather than a scope
+change:
+
+- **No separate `printerctl_print_engine_status_t`.** §3 sketched a
+  parallel status/error enum for the engine. The implementation reuses
+  `printerctl_printer_status_t`/`printerctl_printer_error_t` directly:
+  `connect()`, `run()` and `disconnect()` all return exactly what the
+  underlying `printer.h` calls would have returned. This means the CLI's
+  existing `printer_status_to_exit_code()` and `report_printer_failure()`
+  work unchanged against the engine's return value — the "narrow
+  contract" §3 asked for turned out to be narrower still: one
+  vocabulary, not two synchronized ones.
+- **Event enum grew by two members.** Beyond the 9 event types §3
+  proposed, the implementation adds `MARKER_WARNING` (the active-print
+  marker publish failure is exactly the kind of operator-facing
+  `fprintf()` the "surface all operator-facing messages as events" rule
+  targets, and §3's list simply omitted it) and
+  `CANCELLING_POWER_FAILURE` (see next point).
+- **The power-failure cancelling notice is edge-triggered.** The CLI's
+  pre-M12 `print_control_poll()` re-printed "print cancelling:
+  power-failure/low-battery signal received" on every ~100 ms control
+  poll for as long as the signal stayed set (e.g. while also paused).
+  The engine emits `CANCELLING_POWER_FAILURE` exactly once, the first
+  time the condition is observed, the same edge-triggered treatment
+  `PAUSED`/`RESUMED` already get. Compatibility is judged against
+  `docs/design/milestone-12-print-engine.md` §7's actual criteria (exit
+  codes, passing tests, working signal controls, unchanged record
+  schema) — all still hold; `tests/test_cli.c`'s live-signal integration
+  tests pass unchanged.
+- **`PROGRESS` is undeduplicated.** The engine forwards every
+  acknowledged-command callback as a `PROGRESS` event; the CLI's event
+  handler keeps its own `last_percent` state to reproduce the original
+  once-per-whole-percent terminal line. A live daemon subscriber may
+  want every acknowledgement, not just percent changes, so the dedup
+  stayed a client concern rather than moving into the core.
+- **Record/marker structured logging lives in the engine, not the CLI.**
+  `write_session_record()`'s `state_transition`/`WARNING` log calls
+  moved into `src/core/print_engine.c` alongside the record-writing code
+  they describe, matching the pattern `src/printer/printer.c` already
+  uses (a module logs its own operations through a borrowed logger). The
+  CLI's event handler renders text only; it performs no structured
+  logging for `print` anymore.
+- **Signal handlers install after `connect()`, not before.** The
+  pre-M12 CLI installed `sigaction()` before opening the serial port; the
+  adapter now installs them only once `printerctl_print_engine_connect()`
+  has succeeded. A Ctrl+C during the connect phase now behaves like every
+  other single-exchange command (`temp`, `send`, `home`, ...), none of
+  which ever installed custom handlers around their own connect either.

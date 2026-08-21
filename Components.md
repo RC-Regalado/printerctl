@@ -15,13 +15,21 @@ cliente host.
 
 `printerctl` es una CLI Linux escrita en C17 para controlar impresoras 3D
 con firmware Marlin por USB serial. El estado actual llega hasta el
-Milestone 10 (cancelación por batería baja) más una actualización de
-hardware (2026-07-21: end-stops min habilitados en los tres ejes, ver
-la enmienda "Home" en `Agents.md`). Puede leer archivos G-code,
-normalizarlos, transmitirlos línea por línea esperando `ok` antes de
-enviar el siguiente comando, pausar/reanudar/cancelar una sesión
-(operador o SD), hacer home (todos los ejes o uno solo) y reaccionar a
-una notificación externa de batería baja.
+Milestone 12 (extracción del print engine, primer paso de la Fase II)
+más una actualización de hardware (2026-07-21: end-stops min habilitados
+en los tres ejes, ver la enmienda "Home" en `Agents.md`). Puede leer
+archivos G-code, normalizarlos, transmitirlos línea por línea esperando
+`ok` antes de enviar el siguiente comando, pausar/reanudar/cancelar una
+sesión (operador o SD), hacer home (todos los ejes o uno solo) y
+reaccionar a una notificación externa de batería baja.
+
+Milestone 12 es un refactor puramente interno del host: extrae el ciclo
+de vida de `print` (conectar, marcador de PID activo, streaming, record
+de sesión interrumpida, desconectar) a un módulo nuevo, `core`, que la
+CLI ahora usa como cliente. No cambia el contrato serial, el conjunto de
+comandos Marlin ni ninguna regla de seguridad — nada de este documento
+relevante para el firmware (§4-§8) se ve afectado; solo se actualiza §3
+para listar el nuevo módulo.
 
 La prioridad del host es seguridad y observabilidad, no throughput:
 
@@ -46,6 +54,9 @@ CLI
  |
  v
 Config + Logger + Record
+ |
+ v
+core (print engine, Milestone 12) -- solo para `print`
  |
  v
 Printer session
@@ -75,6 +86,7 @@ Fuera de la sesión de impresión:
 | Marlin | `src/marlin`, `include/printerctl/marlin.h` | Clasificar respuestas: `ok`, `Error:`, `busy:`, `echo:`, `Resend:` e info. Parsear `M105`, `M114`, `M115`. |
 | Serial | `src/serial`, `include/printerctl/serial.h` | Abrir/configurar USB serial, escribir líneas, leer respuestas por línea, reportar timeout/I/O, acceso exclusivo (`TIOCEXCL`). |
 | Printer | `src/printer`, `include/printerctl/printer.h` | Orquestar sesión: conectar, ejecutar comandos, consultar estado, streaming confiable y control (pausa/reanudación/cancelación, operador o batería baja). |
+| Core (Milestone 12) | `src/core`, `include/printerctl/core/print_engine.h` | Ciclo de vida de aplicación de `print`: conectar, publicar/retirar el marcador de PID activo, streaming (reutilizando `printer` sin cambios), record de sesión interrumpida, desconectar. Sin `fprintf()` propio: emite eventos que la CLI (y, más adelante, el daemon) traduce a salida. No toca el contrato serial. |
 | Record | `src/record`, `include/printerctl/record.h` | Persistir registros de sesiones interrumpidas (write-only, nunca leídos) y el marcador de PID del print activo. |
 | Tests | `tests` | Validar CLI, parser, serial con pseudo-terminales y mock Marlin (ver `docs/testing.md`). |
 | Scripts | `scripts/apcupsd` | Notificar a `printerctl` eventos de batería baja de APCUPSD (ver `docs/apcupsd.md`). |
@@ -168,8 +180,11 @@ pero no puede continuar si el firmware deja de emitir `ok`.
 - Alto throughput con ventana de comandos.
 
 Planificado, pero no implementado todavía (Fase II del roadmap
-revisado, Milestones 12+): un daemon host (`printerctld`) que posea el
+revisado, Milestones 13+): un daemon host (`printerctld`) que posea el
 puerto serial y una cola de trabajos persistente, con `printerctl`
-convertido en cliente de un socket Unix. Esto sí está en el roadmap
-ahora, a diferencia de cuando este documento se escribió originalmente;
-ver `roadmap.md` y `docs/design/unix-socket-service-analysis.md`.
+convertido en cliente de un socket Unix. Milestone 12 ya extrajo la
+pieza que ese daemon reutilizará (`core`, ver §2 y §3) sin implementar
+todavía el daemon, el socket, la cola ni el protocolo — ver
+[[milestone-12|docs/milestones/milestone-12.md]] y
+[[milestone-12-print-engine|docs/design/milestone-12-print-engine.md]],
+`roadmap.md` y `docs/design/unix-socket-service-analysis.md`.

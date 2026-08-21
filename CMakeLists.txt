@@ -87,6 +87,19 @@ target_link_libraries(printerctl_printer
     PUBLIC printerctl_config printerctl_logging printerctl_marlin printerctl_serial printerctl_gcode
 )
 
+add_library(printerctl_core STATIC
+    src/core/print_engine.c
+)
+
+target_include_directories(printerctl_core
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_core
+    PUBLIC printerctl_config printerctl_logging printerctl_printer printerctl_record
+)
+
 add_library(printerctl_cli STATIC
     src/cli/cli.c
 )
@@ -97,7 +110,7 @@ target_include_directories(printerctl_cli
         "${CMAKE_CURRENT_BINARY_DIR}/include"
 )
 
-target_link_libraries(printerctl_cli PUBLIC printerctl_config printerctl_logging printerctl_gcode printerctl_printer printerctl_record)
+target_link_libraries(printerctl_cli PUBLIC printerctl_config printerctl_logging printerctl_gcode printerctl_printer printerctl_record printerctl_core)
 
 add_executable(printerctl
     src/main.c

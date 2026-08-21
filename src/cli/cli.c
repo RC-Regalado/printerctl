@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "printerctl/cli.h"
+#include "printerctl/core/print_engine.h"
 #include "printerctl/gcode.h"
 #include "printerctl/logging.h"
 #include "printerctl/printer.h"
@@ -864,230 +865,207 @@ static int run_single_command(const printerctl_command_args_t *args,
     return printer_status_to_exit_code(status);
 }
 
-/* Renders a progress line whenever the whole-percent value changes. */
+/*
+ * Milestone 12: the CLI's client adapter over printerctl_print_engine_t.
+ * Every operator-facing message the engine used to fprintf() directly
+ * (progress, pause/resume, the power-failure notice, the marker
+ * warning, the record outcome, the terminal summary) now arrives as a
+ * printerctl_print_event_t; this is the one place that turns those back
+ * into the exact same text run_print_command() used to print inline, so
+ * `print`'s output is unchanged even though the lifecycle that produces
+ * it now lives in `core/print_engine`.
+ */
 typedef struct {
     FILE *out;
-    unsigned last_percent;
-} print_progress_renderer_t;
+    FILE *err;
+    printerctl_logger_t *logger;
+    bool logger_ready;
+    const char *file;
+    unsigned last_percent; /* PROGRESS dedup, same rule the old renderer used. */
+} print_event_context_t;
 
-static void render_print_progress(const printerctl_gcode_result_t *result, void *context)
+static void render_print_event(const printerctl_print_event_t *event, void *context)
 {
-    print_progress_renderer_t *renderer = context;
-    if (result->progress_percent != renderer->last_percent) {
-        fprintf(renderer->out, "printerctl: printing: %u%% (line %llu, %llu command(s) acknowledged)\n",
-                result->progress_percent,
-                (unsigned long long)result->line_number,
-                (unsigned long long)result->command_number);
-        fflush(renderer->out);
-        renderer->last_percent = result->progress_percent;
+    print_event_context_t *ctx = context;
+
+    switch (event->type) {
+    case PRINTERCTL_PRINT_EVENT_STARTED:
+        fprintf(ctx->out, "printerctl: printing '%s' — SIGUSR1 pauses, SIGINT cancels\n",
+                event->path);
+        fflush(ctx->out);
+        break;
+
+    case PRINTERCTL_PRINT_EVENT_PROGRESS:
+        if (event->progress->progress_percent != ctx->last_percent) {
+            fprintf(ctx->out,
+                    "printerctl: printing: %u%% (line %llu, %llu command(s) acknowledged)\n",
+                    event->progress->progress_percent,
+                    (unsigned long long)event->progress->line_number,
+                    (unsigned long long)event->progress->command_number);
+            fflush(ctx->out);
+            ctx->last_percent = event->progress->progress_percent;
+        }
+        break;
+
+    case PRINTERCTL_PRINT_EVENT_PAUSED:
+        fprintf(ctx->out, "printerctl: print paused — SIGUSR2 resumes, SIGINT cancels\n");
+        fflush(ctx->out);
+        break;
+
+    case PRINTERCTL_PRINT_EVENT_RESUMED:
+        fprintf(ctx->out, "printerctl: print resumed\n");
+        fflush(ctx->out);
+        break;
+
+    case PRINTERCTL_PRINT_EVENT_CANCELLING_POWER_FAILURE:
+        fprintf(ctx->out,
+                "printerctl: print cancelling: power-failure/low-battery signal received (SIGPWR)\n");
+        fflush(ctx->out);
+        break;
+
+    case PRINTERCTL_PRINT_EVENT_MARKER_WARNING:
+        fprintf(ctx->err,
+            "printerctl: warning: cannot record the active-print marker (%s); an "
+            "APCUPSD low-battery notification will not be able to find this print\n",
+            event->message);
+        break;
+
+    case PRINTERCTL_PRINT_EVENT_RECORD_WRITTEN:
+        fprintf(ctx->out, "printerctl: session record written to '%s'\n", event->path);
+        fflush(ctx->out);
+        break;
+
+    case PRINTERCTL_PRINT_EVENT_RECORD_FAILED:
+        fprintf(ctx->err, "printerctl: warning: no session record written: %s\n", event->message);
+        break;
+
+    case PRINTERCTL_PRINT_EVENT_COMPLETED:
+    case PRINTERCTL_PRINT_EVENT_CANCELLED:
+    case PRINTERCTL_PRINT_EVENT_FAILED: {
+        /* A cancel is the operator's (or, for a power failure, the
+         * APCUPSD script's) own request carried out, not a failure: no
+         * error report, no ERROR record -- the summary and the engine's
+         * own state_transition logging (inherited from
+         * printerctl_printer_print_file()) tell the story. */
+        if (event->type == PRINTERCTL_PRINT_EVENT_FAILED) {
+            report_printer_failure(ctx->err, ctx->logger, ctx->logger_ready, "print",
+                                    event->summary->status, event->error);
+        }
+
+        const char *state_name = "failed";
+        if (event->summary->state == PRINTERCTL_PRINT_COMPLETED) {
+            state_name = "completed";
+        } else if (event->summary->state == PRINTERCTL_PRINT_CANCELLED) {
+            state_name = "cancelled";
+        } else if (event->summary->state == PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE) {
+            state_name = "cancelled_power_failure";
+        }
+
+        fprintf(ctx->out,
+            "printerctl: print %s: '%s' — %llu command(s) sent, %llu acknowledged, "
+            "last acknowledged line %llu, %u%%\n",
+            state_name,
+            ctx->file,
+            (unsigned long long)event->summary->commands_sent,
+            (unsigned long long)event->summary->commands_acknowledged,
+            (unsigned long long)event->summary->last_acknowledged_line,
+            event->summary->progress_percent);
+        fflush(ctx->out);
+        break;
+    }
     }
 }
 
 /*
- * Milestone 8 host-print session controls. While `print FILE` streams,
- * the operator drives the session with signals — the MVP has no daemon,
- * so a second printerctl invocation cannot reach this process's session
- * (and the serial port is held exclusively while the stream runs):
+ * Milestone 12: `print FILE` control signals now feed
+ * printerctl_print_engine_t directly instead of file-scope flags that a
+ * CLI-owned poll function used to translate. Each handler is a single
+ * call to a printerctl_print_engine_request_*() setter -- itself a
+ * single sig_atomic_t assignment (see print_engine.h) -- so this stays
+ * exactly as async-signal-safe as the flags it replaces. `g_active_engine`
+ * is only non-NULL for the duration of run_print_command()'s call to
+ * printerctl_print_engine_run(), the same window the old sigaction
+ * install/restore pair used to bound.
  *
  *   SIGUSR1          pause after the current command's acknowledgement
  *   SIGUSR2          resume from the next unsent command
  *   SIGINT/SIGTERM   cancel gracefully (summary rendered, exit code 9)
- *
- * Milestone 10 adds a fourth, distinct signal: SIGPWR, delivered not by
- * the operator directly but by `printerctl power low-battery` acting on
- * an APCUPSD low-battery notification. It cancels exactly like
- * SIGINT/SIGTERM, but as PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE
- * (exit code 10) rather than an operator cancel, so the summary and the
- * session record say why the print really stopped. It takes priority
- * over an unresolved pause: see print_control_poll() below.
- *
- * The handlers only set flags; print_control_poll() below turns them
- * into decisions between acknowledged commands. sig_atomic_t flags are
- * the one place the CLI keeps mutable file-scope state — signal
- * handlers cannot reach anything else. They are reset at every
- * run_print_command() entry, so repeated in-process runs (the test
- * harness) start clean.
+ *   SIGPWR           power-failure cancel (delivered by `printerctl
+ *                    power low-battery`, not the operator directly);
+ *                    takes priority over an unresolved pause -- see
+ *                    print_engine.c's on_control().
  */
-static volatile sig_atomic_t g_print_cancel_requested;
-static volatile sig_atomic_t g_print_pause_requested;
-static volatile sig_atomic_t g_print_resume_requested;
-static volatile sig_atomic_t g_print_power_failure_requested;
+static printerctl_print_engine_t *g_active_engine;
 
 static void handle_print_cancel_signal(int signum)
 {
     (void)signum;
-    g_print_cancel_requested = 1;
+    if (g_active_engine != NULL) {
+        printerctl_print_engine_request_cancel(g_active_engine);
+    }
 }
 
 static void handle_print_pause_signal(int signum)
 {
     (void)signum;
-    g_print_pause_requested = 1;
+    if (g_active_engine != NULL) {
+        printerctl_print_engine_request_pause(g_active_engine);
+    }
 }
 
 static void handle_print_resume_signal(int signum)
 {
     (void)signum;
-    g_print_resume_requested = 1;
+    if (g_active_engine != NULL) {
+        printerctl_print_engine_request_resume(g_active_engine);
+    }
 }
 
 static void handle_print_power_failure_signal(int signum)
 {
     (void)signum;
-    g_print_power_failure_requested = 1;
-}
-
-/* Reports pause/resume once per edge, alongside the control decision. */
-typedef struct {
-    FILE *out;
-    bool paused;
-} print_control_reporter_t;
-
-static printerctl_print_control_t print_control_poll(void *context)
-{
-    print_control_reporter_t *reporter = context;
-
-    /* Checked first, and unconditionally: a power-failure notification
-     * must win over an unresolved operator pause, not wait behind it. */
-    if (g_print_power_failure_requested) {
-        fprintf(reporter->out,
-            "printerctl: print cancelling: power-failure/low-battery signal received (SIGPWR)\n");
-        fflush(reporter->out);
-        return PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE;
-    }
-
-    if (g_print_cancel_requested) {
-        return PRINTERCTL_PRINT_CONTROL_CANCEL;
-    }
-
-    /* A resume answers a pause; both flags set means the pair resolved.
-     * A stray resume with nothing paused must not neutralize a later
-     * pause, so it is dropped here. */
-    if (g_print_resume_requested) {
-        g_print_resume_requested = 0;
-        g_print_pause_requested = 0;
-    }
-
-    if (g_print_pause_requested) {
-        if (!reporter->paused) {
-            reporter->paused = true;
-            fprintf(reporter->out,
-                "printerctl: print paused — SIGUSR2 resumes, SIGINT cancels\n");
-            fflush(reporter->out);
-        }
-        return PRINTERCTL_PRINT_CONTROL_PAUSE;
-    }
-
-    if (reporter->paused) {
-        reporter->paused = false;
-        fprintf(reporter->out, "printerctl: print resumed\n");
-        fflush(reporter->out);
-    }
-
-    return PRINTERCTL_PRINT_CONTROL_CONTINUE;
-}
-
-/*
- * Milestone 9: persist an interrupted-session record — file, last
- * acknowledged line, progress, timestamp, state — so the operator can
- * decide how to restart the job manually. printerctl never reads these
- * records back: automatic resume is forbidden by the safety policy.
- *
- * Best-effort relative to the print's outcome: a record failure warns
- * the operator but never changes the exit code. The record path and the
- * G-code path appear only in human-readable output; the structured log
- * gets path-free records (Milestone 2 privacy rules).
- *
- * Milestone 10 adds `serial_device` (private operator data, like
- * `file`), `job_id` (a placeholder "job-<pid>" handle -- there is no job
- * queue yet, see record.h) and `printer_state` (always "unknown": no
- * live query is sent after a fault or a power-event cancellation, by
- * design). A power-failure cancellation gets its own state/cause pair
- * (`cancelled_power_failure` / `apcupsd_low_battery`) distinct from an
- * operator cancel, so the record says which one actually happened.
- */
-static void write_session_record(const printerctl_print_summary_t *summary,
-                                  const char *file,
-                                  const char *serial_device,
-                                  printerctl_logger_t *logger, bool logger_ready,
-                                  FILE *out, FILE *err)
-{
-    printerctl_session_record_t record;
-    memset(&record, 0, sizeof(record));
-    if (summary->state == PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE) {
-        snprintf(record.state, sizeof(record.state), "cancelled_power_failure");
-        snprintf(record.cause, sizeof(record.cause), "apcupsd_low_battery");
-    } else if (summary->state == PRINTERCTL_PRINT_CANCELLED) {
-        snprintf(record.state, sizeof(record.state), "cancelled");
-        snprintf(record.cause, sizeof(record.cause), "%s", printer_status_name(summary->status));
-    } else {
-        snprintf(record.state, sizeof(record.state), "failed");
-        snprintf(record.cause, sizeof(record.cause), "%s", printer_status_name(summary->status));
-    }
-    snprintf(record.file, sizeof(record.file), "%s", file);
-    snprintf(record.serial_device, sizeof(record.serial_device), "%s", serial_device);
-    snprintf(record.job_id, sizeof(record.job_id), "job-%ld", (long)getpid());
-    snprintf(record.printer_state, sizeof(record.printer_state), "unknown");
-    record.commands_sent = summary->commands_sent;
-    record.commands_acknowledged = summary->commands_acknowledged;
-    record.last_acknowledged_line = summary->last_acknowledged_line;
-    record.bytes_consumed = summary->bytes_consumed;
-    record.file_size = summary->file_size;
-    record.progress_percent = summary->progress_percent;
-
-    printerctl_record_error_t record_error;
-    char dir[PRINTERCTL_RECORD_DIR_MAX];
-    char path[PRINTERCTL_RECORD_PATH_MAX];
-    printerctl_record_status_t status =
-        printerctl_record_resolve_state_dir(dir, sizeof(dir), &record_error);
-    if (status == PRINTERCTL_RECORD_OK) {
-        status = printerctl_record_write_session(dir, &record, path, sizeof(path),
-                                                  &record_error);
-    }
-
-    if (status == PRINTERCTL_RECORD_OK) {
-        fprintf(out, "printerctl: session record written to '%s'\n", path);
-        fflush(out);
-        if (logger_ready) {
-            warn_on_log_failure(err,
-                printerctl_log_state_transition(logger, "state=session_recorded"),
-                "failed to record state_transition log");
-        }
-    } else {
-        fprintf(err, "printerctl: warning: no session record written: %s\n",
-                record_error.message);
-        if (logger_ready) {
-            warn_on_log_failure(err,
-                printerctl_log_record(logger, PRINTERCTL_LOG_WARNING,
-                                       PRINTERCTL_LOG_EVENT_WARNING,
-                                       "session record not written"),
-                "failed to record warning log");
-        }
+    if (g_active_engine != NULL) {
+        printerctl_print_engine_request_cancel_power_failure(g_active_engine);
     }
 }
 
 /*
- * Milestone 7/8 execution of `print FILE` (without --dry-run): connect,
- * stream the file one acknowledged command at a time, render progress
- * on every whole-percent change and a session summary at the end, then
- * disconnect. The summary is rendered on every outcome — completed,
- * cancelled or failed — naming the file, the final state and the last
- * acknowledged line. For the duration of the stream the operator's
- * session-control signals are handled (see print_control_poll above);
- * the previous handlers are restored before returning.
+ * Milestone 7/8/12 execution of `print FILE` (without --dry-run): the
+ * CLI is now a thin client adapter over printerctl_print_engine_t,
+ * which owns the actual lifecycle (connect, publish the active-print
+ * marker, stream, interrupted-session record, disconnect) -- see
+ * core/print_engine.c and docs/design/milestone-12-print-engine.md.
+ * This function only wires argv/config to the engine, installs the
+ * operator's session-control signal handlers for the duration of the
+ * stream (restored before returning), and renders every event the
+ * engine emits through render_print_event() so `print`'s output stays
+ * exactly what it was before the extraction.
  */
 static int run_print_command(const printerctl_command_args_t *args,
                               const printerctl_config_t *config,
                               printerctl_logger_t *logger, bool logger_ready,
                               FILE *out, FILE *err)
 {
-    printerctl_printer_session_t session;
+    printerctl_print_engine_t engine;
     printerctl_printer_error_t error;
 
-    g_print_cancel_requested = 0;
-    g_print_pause_requested = 0;
-    g_print_resume_requested = 0;
-    g_print_power_failure_requested = 0;
+    print_event_context_t event_context = {
+        .out = out,
+        .err = err,
+        .logger = logger,
+        .logger_ready = logger_ready,
+        .file = args->print_file,
+        .last_percent = (unsigned)-1,
+    };
+
+    printerctl_printer_status_t status = printerctl_print_engine_connect(
+        &engine, config, logger, logger_ready, render_print_event, &event_context, &error);
+    if (status != PRINTERCTL_PRINTER_OK) {
+        report_printer_failure(err, logger, logger_ready, "print", status, &error);
+        return printer_status_to_exit_code(status);
+    }
+
+    g_active_engine = &engine;
 
     struct sigaction control_action;
     memset(&control_action, 0, sizeof(control_action));
@@ -1104,97 +1082,18 @@ static int run_print_command(const printerctl_command_args_t *args,
     control_action.sa_handler = handle_print_power_failure_signal;
     sigaction(SIGPWR, &control_action, &old_pwr);
 
-    printerctl_printer_status_t status =
-        printerctl_printer_connect(&session, config, logger_ready ? logger : NULL, &error);
-    if (status != PRINTERCTL_PRINTER_OK) {
-        sigaction(SIGINT, &old_int, NULL);
-        sigaction(SIGTERM, &old_term, NULL);
-        sigaction(SIGUSR1, &old_usr1, NULL);
-        sigaction(SIGUSR2, &old_usr2, NULL);
-        sigaction(SIGPWR, &old_pwr, NULL);
-        report_printer_failure(err, logger, logger_ready, "print", status, &error);
-        return printer_status_to_exit_code(status);
-    }
-
-    /* Milestone 10: publish this process's PID for the duration of the
-     * stream, so `printerctl power low-battery` can find it. A failure
-     * here is only a warning -- it means an external low-battery signal
-     * will not find this print, not that the print itself cannot run. */
-    char state_dir[PRINTERCTL_RECORD_DIR_MAX];
-    printerctl_record_error_t marker_error;
-    bool marker_active = false;
-    if (printerctl_record_resolve_state_dir(state_dir, sizeof(state_dir), &marker_error) ==
-            PRINTERCTL_RECORD_OK &&
-        printerctl_record_write_active_pid(state_dir, &marker_error) == PRINTERCTL_RECORD_OK) {
-        marker_active = true;
-    } else {
-        fprintf(err,
-            "printerctl: warning: cannot record the active-print marker (%s); an "
-            "APCUPSD low-battery notification will not be able to find this print\n",
-            marker_error.message);
-    }
-
-    fprintf(out, "printerctl: printing '%s' — SIGUSR1 pauses, SIGINT cancels\n",
-            args->print_file);
-    fflush(out);
-
-    print_progress_renderer_t renderer = {.out = out, .last_percent = (unsigned)-1};
-    print_control_reporter_t control = {.out = out, .paused = false};
     printerctl_print_summary_t summary;
-    status = printerctl_printer_print_file(&session, args->print_file,
-                                            render_print_progress, &renderer,
-                                            print_control_poll, &control,
-                                            &summary, &error);
-
-    if (marker_active) {
-        printerctl_record_remove_active_pid(state_dir);
-    }
+    status = printerctl_print_engine_run(&engine, args->print_file, &summary, &error);
 
     sigaction(SIGINT, &old_int, NULL);
     sigaction(SIGTERM, &old_term, NULL);
     sigaction(SIGUSR1, &old_usr1, NULL);
     sigaction(SIGUSR2, &old_usr2, NULL);
     sigaction(SIGPWR, &old_pwr, NULL);
-
-    /* A cancel is the operator's (or, for a power failure, the APCUPSD
-     * script's) own request carried out, not a failure: no error
-     * report, no ERROR record — the summary and the module's own
-     * state_transition tell the story. */
-    if (status != PRINTERCTL_PRINTER_OK && status != PRINTERCTL_PRINTER_CANCELLED &&
-        status != PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE) {
-        report_printer_failure(err, logger, logger_ready, "print", status, &error);
-    }
-
-    const char *state_name = "failed";
-    if (summary.state == PRINTERCTL_PRINT_COMPLETED) {
-        state_name = "completed";
-    } else if (summary.state == PRINTERCTL_PRINT_CANCELLED) {
-        state_name = "cancelled";
-    } else if (summary.state == PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE) {
-        state_name = "cancelled_power_failure";
-    }
-
-    fprintf(out,
-        "printerctl: print %s: '%s' — %llu command(s) sent, %llu acknowledged, "
-        "last acknowledged line %llu, %u%%\n",
-        state_name,
-        args->print_file,
-        (unsigned long long)summary.commands_sent,
-        (unsigned long long)summary.commands_acknowledged,
-        (unsigned long long)summary.last_acknowledged_line,
-        summary.progress_percent);
-    fflush(out);
-
-    /* An interrupted session — the print started (the file opened) but
-     * did not complete — leaves a durable record. Open failures leave
-     * none: nothing was ever streamed, so there is nothing to recover. */
-    if (summary.state != PRINTERCTL_PRINT_COMPLETED && summary.file_size > 0) {
-        write_session_record(&summary, args->print_file, config->port,
-                              logger, logger_ready, out, err);
-    }
+    g_active_engine = NULL;
 
     printerctl_printer_error_t disconnect_error;
-    if (printerctl_printer_disconnect(&session, &disconnect_error) != PRINTERCTL_PRINTER_OK) {
+    if (printerctl_print_engine_disconnect(&engine, &disconnect_error) != PRINTERCTL_PRINTER_OK) {
         fprintf(err, "printerctl: warning: failed to close the serial port cleanly\n");
     }
 
@@ -1206,11 +1105,12 @@ static int run_print_command(const printerctl_command_args_t *args,
  * (the APCUPSD low-battery script) runs to tell printerctl that the
  * host may be about to lose power. It never touches the serial port
  * itself: it looks up the PID of the printerctl process currently
- * streaming a print (published by run_print_command() to the
- * active-print marker) and sends it SIGPWR, which that process's
- * print_control_poll() turns into a graceful cancel -- no new G-code
- * transmitted, file and serial port closed normally, a session record
- * written with state=cancelled_power_failure.
+ * streaming a print (published by printerctl_print_engine_connect() to
+ * the active-print marker) and sends it SIGPWR, which that process's
+ * handle_print_power_failure_signal() turns into a graceful cancel via
+ * printerctl_print_engine_request_cancel_power_failure() -- no new
+ * G-code transmitted, file and serial port closed normally, a session
+ * record written with state=cancelled_power_failure.
  *
  * No print running is not an error: this command must be safely
  * idempotent for a script that may run with no print active, or run

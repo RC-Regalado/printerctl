@@ -43,6 +43,7 @@ The MVP focuses on reliable, observable and fault-tolerant G-code transmission f
   /marlin
   /gcode
   /printer
+  /core
   /logging
   /config
   /record
@@ -80,6 +81,12 @@ Config  Logger   G-code     APCUPSD Event Recorder
                     v
              USB Serial Device
 ```
+
+**Milestone 12 note:** for `print`, `CLI` no longer orchestrates the
+lifecycle directly over `Application / Printer Session`. It delegates
+to `core` (the print engine), which wraps the printer session, reuses
+it unchanged for ACK-driven streaming, and emits events instead of
+writing to the terminal itself. See §6.10.
 
 ## 6. Module Responsibilities
 
@@ -423,6 +430,38 @@ way a record is (no `fsync`; see the design note §6). See
 [[docs/design/milestone-9-recovery-records]] and
 [[docs/design/milestone-10-low-battery-cancellation]].
 
+### 6.10 `core` (added in Milestone 12)
+
+Owns the application-level print lifecycle that used to live inside
+`cli`'s `run_print_command()`: connect, publish the active-print
+marker, stream the file, write an interrupted-session record on an
+incomplete print, remove the marker, disconnect
+(`include/printerctl/core/print_engine.h`, `src/core/print_engine.c`).
+It reuses `printer`'s `printerctl_printer_print_file()` unchanged as
+the lower-level ACK-driven streamer — Milestone 12 is an extraction,
+not a rewrite; nothing in `printer`, `gcode`, `marlin` or `serial`
+changed.
+
+`printerctl_print_engine_t` knows nothing about `argv`, parsed CLI
+command structs, terminal rendering, TUI, HTTP, JSON or the future Unix
+socket protocol: every operator-facing message (print start, progress,
+pause/resume, a power-failure cancellation notice, an active-print
+marker warning, a record outcome, the terminal summary) is surfaced as
+a `printerctl_print_event_t` instead of `fprintf()`, so a client adapter
+decides how to present it. `cli` is the first such adapter
+(`render_print_event()` in `src/cli/cli.c`, reproducing the exact
+operator-facing text `print` always produced); the future daemon
+(Milestone 17+) is meant to be the second, over this same engine.
+
+Control (pause/resume/cancel/cancel-power-failure) is four
+async-signal-safe setter functions
+(`printerctl_print_engine_request_*()`), each a single `sig_atomic_t`
+assignment — the engine never calls `sigaction()` itself; `cli` still
+owns every signal installation, exactly as it did before this
+milestone. See [[docs/design/milestone-12-print-engine]] and
+[[docs/milestones/milestone-12]] for the full design and the as-built
+deviations from it.
+
 ## 7. Runtime Flows
 
 ### 7.1 Print Flow
@@ -485,6 +524,12 @@ every session, so a second invocation cannot interleave bytes into an
 active stream — it fails to open the device with EBUSY instead. See
 [[docs/design/milestone-8-pause-resume-cancel]].
 
+**Milestone 12 update:** the operator-facing signals are unchanged.
+Internally, each handler now calls one of
+`printerctl_print_engine_request_*()` on the active `core` print engine
+instead of setting a CLI-local flag polled by a CLI-owned callback — see
+§6.10.
+
 ### 7.4 Low-Battery Cancellation (added in Milestone 10)
 
 ```text
@@ -498,8 +543,9 @@ CLI resolves the active-print marker, verifies the process is alive
     v
 CLI sends SIGPWR to that process
     v
-print_control_poll() (checked ahead of pause/resume) returns
-CANCEL_POWER_FAILURE
+that process's SIGPWR handler calls
+printerctl_print_engine_request_cancel_power_failure() on the active
+print engine (checked ahead of pause/resume, per §6.10)
     v
 identical graceful-stop path as an operator cancel:
   no further G-code sent, file and serial closed, session recorded
@@ -693,7 +739,7 @@ These decisions should be resolved early by Codex before broad implementation:
    all eight test binaries since Milestone 0. See [[docs/testing]].
 4. ~~Maximum G-code line length and command normalization rules.~~ Resolved in Milestone 3: 4096-byte source-line limit and the normalization contract in [[docs/design/milestone-3-gcode-dry-run]].
 5. ~~Whether `send` should block known unsafe commands by default.~~ Resolved in Milestone 6: `send` blocks G28 (all variants, no bypass, shared detection with the G-code reader); M112 passes through as the operator's explicit emergency stop. See [[docs/design/milestone-6-printer-commands]].
-6. ~~Whether a future daemon mode is required for external pause/resume/cancel of active prints.~~ Resolved by the revised roadmap: yes. Phase II (Milestones 12-27) extracts a daemon-agnostic print engine, then builds `printerctld` around it with a Unix socket protocol; `printerctl` becomes a thin client. See `roadmap.md` and [[docs/design/unix-socket-service-analysis]] (an earlier proposal now superseded in its protocol specifics — RESP-like frames, not the key=value ones proposed there — but aligned on the daemon-owns-the-serial-port shape).
+6. ~~Whether a future daemon mode is required for external pause/resume/cancel of active prints.~~ Resolved by the revised roadmap: yes. Phase II (Milestones 12-27) extracts a daemon-agnostic print engine, then builds `printerctld` around it with a Unix socket protocol; `printerctl` becomes a thin client. See `roadmap.md` and [[docs/design/unix-socket-service-analysis]] (an earlier proposal now superseded in its protocol specifics — RESP-like frames, not the key=value ones proposed there — but aligned on the daemon-owns-the-serial-port shape). **Milestone 12 done:** the daemon-agnostic print engine itself (§6.10) is extracted and `cli` is its first client adapter; the daemon process, Unix socket protocol and job queue remain future milestones (13, 17+).
 
 Resolved decisions are recorded in milestone design notes. Configuration
 path and format were resolved in [[docs/design/milestone-1-cli-config]].
