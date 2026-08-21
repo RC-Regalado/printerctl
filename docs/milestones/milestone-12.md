@@ -59,27 +59,13 @@ No production code has been changed yet in this phase.
 - Initial production implementation should add only the core files that
   contain real behavior; no placeholder modules.
 
-## 5. External review
-
-Claude review was requested on 2026-07-28 with the required architecture
-review prompt. The command did not produce a technical response within
-the execution window and was interrupted. No external recommendations
-were incorporated. This remains as a point-in-time note.
-
-As of 2026-07-29, Claude is no longer part of the active workflow.
-Before code changes, Codex Lead should assign scoped Codex subagents for
-implementation and independent review, then integrate only changes that
-match
-[[milestone-12-print-engine|docs/design/milestone-12-print-engine.md]],
-`architecture.md` and `roadmap.md`.
-
-## 6. Verification
+## 5. Verification
 
 - `git status --short`: clean before M12 documents were added.
 - `git diff --check`: clean before M12 documents were added.
 - No build/test run was required for this documentation-only start step.
 
-## 7. Next steps
+## 6. Next steps
 
 1. Assign scoped Codex subagents for M12 implementation and review.
 2. Review the resulting public API before accepting it.

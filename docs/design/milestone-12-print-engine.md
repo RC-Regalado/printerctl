@@ -194,20 +194,7 @@ The CLI behavior must remain compatible:
 - New engine tests prove the core can run without CLI parsing or
   terminal output.
 
-## 8. Review status
-
-External architecture review was attempted with Claude on 2026-07-28
-using the required review prompt shape. The command did not return a
-technical review within the execution window and was interrupted to
-avoid leaving a stale process. No Claude feedback has been incorporated
-yet. This remains as a point-in-time note.
-
-As of 2026-07-29, Claude is no longer part of the active workflow.
-Before production code changes, Codex Lead should assign scoped Codex
-subagents for implementation and independent review, then integrate only
-the justified changes that match `architecture.md` and `roadmap.md`.
-
-## 9. Risks
+## 8. Risks
 
 - Rewriting `printerctl_printer_print_file()` would risk regressions in
   the most tested path. Reuse it.
@@ -220,7 +207,7 @@ the justified changes that match `architecture.md` and `roadmap.md`.
   the existing blocking streamer into a fake tick loop in M12 would add
   complexity before the daemon exists.
 
-## 10. Deferred
+## 9. Deferred
 
 - Unix domain socket command transport: Milestone 17.
 - Web gateway/WebSocket/SSE subscriptions: later Phase II milestones.
