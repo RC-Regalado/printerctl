@@ -5,7 +5,7 @@ tags: [printerctl, architecture, components, firmware-context]
 
 # Components
 
-Fuente de verdad: [[Agents]], [[architecture]], [[roadmap]], [[README]].
+Fuente de verdad: [[Agents]], [[docs/architecture|architecture]], [[docs/roadmap|roadmap]], [[README]].
 
 Este documento resume los componentes actuales de `printerctl` para un
 segundo agente que modificará firmware y necesita entender qué espera el
@@ -45,7 +45,7 @@ La prioridad del host es seguridad y observabilidad, no throughput:
 - registra TX/RX, progreso, errores y cambios de estado.
 
 Ver `docs/safety.md` para el detalle completo de esta política y
-`architecture.md` §7.5 para el mapeo de estados del ciclo de vida.
+`docs/architecture.md` §7.5 para el mapeo de estados del ciclo de vida.
 
 ## 2. Vista general
 
@@ -187,4 +187,4 @@ pieza que ese daemon reutilizará (`core`, ver §2 y §3) sin implementar
 todavía el daemon, el socket, la cola ni el protocolo — ver
 [[milestone-12|docs/milestones/milestone-12.md]] y
 [[milestone-12-print-engine|docs/design/milestone-12-print-engine.md]],
-`roadmap.md` y `docs/design/unix-socket-service-analysis.md`.
+`docs/roadmap.md` y `docs/design/unix-socket-service-analysis.md`.

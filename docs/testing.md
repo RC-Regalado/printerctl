@@ -5,7 +5,7 @@ tags: [printerctl, testing, reference]
 
 # Testing
 
-Source of truth: [[Agents]], [[Kernel/Architecture]] §10. This document is the
+Source of truth: [[Agents]], [[docs/architecture|architecture]] §18. This document is the
 concrete reference the roadmap's Milestone 11 requires: what each test
 binary covers, the patterns behind them, the hardware-validation policy,
 and how to run everything from a clean checkout.
@@ -20,7 +20,7 @@ primary verification method.
 
 ## Test binaries
 
-Eight independent CMake/ctest targets, one per module plus the CLI
+Fifteen independent CMake/ctest targets, one per module plus integration
 integration suite:
 
 | Binary | Covers |
@@ -33,6 +33,13 @@ integration suite:
 | `printerctl_printer_tests` | Printer session orchestration against scripted mock printers: connect, single-command exchange, streaming, pause/resume/cancel (operator and power-failure), descriptor-leak checks on failure paths |
 | `printerctl_record_tests` | Session records and the active-print marker: state-dir resolution, record content, exclusive creation, failure modes, PID marker round-trip |
 | `printerctl_logging_tests` | Logging module: formatting, level filtering |
+| `printerctl_core_tests` | Milestone 12 print engine extraction: lifecycle, dry-run behavior, control callbacks and session recording without CLI parsing |
+| `printerctl_daemon_ipc_tests` | Milestone 13 internal command/event pipe framing, correlation token validation and malformed/truncated message handling |
+| `printerctl_daemon_runtime_tests` | Milestone 13 runtime lifecycle: worker startup/shutdown handshakes, NOP round-trip, fault injection and repeated start/stop |
+| `printerctl_plp1_frame_tests` | Milestone 14 PLP/1 frame codec: byte-exact golden vectors, flags, versioning, bounds and message registry |
+| `printerctl_plp1_payload_tests` | Milestone 14 payload codecs: VERSION, STATUS, PRINT_START and error payload validation |
+| `printerctl_plp1_parser_tests` | Milestone 14 incremental parser: fragmentation, coalescing, malformed frames and parser recovery boundaries |
+| `printerctl_daemon_socket_tests` | Milestone 15 Unix socket transport: real `AF_UNIX`, fragmented/coalesced requests, stale/live socket paths, sequential clients and malformed-client containment |
 
 Run all of them:
 
@@ -85,6 +92,13 @@ to run the same suite under Clang; both must be warning-free with
   the whole file streams again from the first command — proving the
   record's presence changes nothing, rather than only asserting no
   read-path exists by inspection.
+- **In-memory binary protocol vectors**: the PLP/1 tests assert literal
+  wire bytes for stable protocol examples and run fragmentation/coalescing
+  through caller-owned buffers, without sockets or daemon dependencies.
+- **Real Unix socket integration**: the M15 test suite uses disposable
+  socket paths under `/tmp`, real `AF_UNIX`/`SOCK_STREAM` clients, and
+  pthread-backed `serve_one()` calls to verify stream behavior without
+  serial hardware or print execution.
 
 ## Hardware validation
 
@@ -124,7 +138,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-This should configure, build and pass all eight suites with no manual
+This should configure, build and pass all fifteen suites with no manual
 setup beyond a C17 compiler, CMake >= 3.16, and the standard POSIX
 tools the test suites use (`posix_openpt` and friends, already part of
 glibc on the project's Linux target).

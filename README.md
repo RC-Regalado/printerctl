@@ -1,21 +1,34 @@
 # printerctl
 
 Command-line application written in C17 that controls 3D printers running
-Marlin Firmware over USB serial. See `Agents.md`, `architecture.md` and
-`roadmap.md` for project background, architecture and the development
-plan; `docs/safety.md`, `docs/testing.md` and `docs/apcupsd.md` for the
-consolidated safety policy, test suite and power-failure references.
+Marlin Firmware over USB serial. See `Agents.md`, `docs/architecture.md`
+and `docs/roadmap.md` for project background, architecture and the
+development plan; `docs/safety.md`, `docs/testing.md` and
+`docs/apcupsd.md` for the consolidated safety policy, test suite and
+power-failure references.
 
 ## Status
 
-This repository currently implements Milestone 11 (core documentation
-completion, ahead of the revised roadmap's Phase II daemon
-transformation); see `roadmap.md` for the milestone plan (milestones 10
-and later were replaced by a revised roadmap; milestones 0-9 keep their
-original scope) and `docs/milestones/milestone-11.md` for what this
-milestone covers. Milestone 10 (Low-Battery Cancellation) is covered by
-`docs/milestones/milestone-10.md` /
-`docs/design/milestone-10-low-battery-cancellation.md` (earlier
+This repository currently implements Milestone 15 (Unix Socket Transport)
+of `docs/roadmap.md`'s Phase 1 —
+Daemon Foundation + Single-Print IPC (milestones 0-9 keep their original
+scope; milestones 10+ follow the revised roadmap). Milestone 12 (Print
+Engine Extraction) moved the application-level print lifecycle behind
+`printerctl_print_engine_t`, reused unchanged by the CLI; Milestone 13
+added the independent control-context/worker-thread/two-pipe runtime
+foundation; Milestone 14 froze PLP/1; and Milestone 15 adds a local
+`AF_UNIX`/`SOCK_STREAM` transport for hardware-independent `PING`,
+`VERSION` and idle `STATUS`. It still does not integrate `print_engine`,
+serial, Marlin or print execution into the daemon, and changes nothing
+about the CLI's behavior described below. See
+`docs/milestones/milestone-15.md` /
+`docs/design/milestone-15-unix-socket-transport.md`,
+`docs/milestones/milestone-14.md` /
+`docs/design/protocol-v1.md`,
+`docs/milestones/milestone-13.md` /
+`docs/design/milestone-13-daemon-runtime.md` and
+`docs/milestones/milestone-12.md` /
+`docs/design/milestone-12-print-engine.md` for what each covers (earlier
 milestones have their own reports under `docs/milestones/`). Since
 Milestone 10 (2026-07-21), min end-stops were installed and enabled on
 all three axes, so `home` is now a real, unconfirmed command — see
@@ -76,7 +89,7 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. Eight
+Use `build-clang` instead of `build` if you configured with Clang. 15
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 logging integration and end-to-end commands against forked mock
 printers), `printerctl_config_tests` (configuration module),
@@ -84,9 +97,20 @@ printers), `printerctl_config_tests` (configuration module),
 (Marlin response parser), `printerctl_serial_tests` (serial transport
 over pseudo-terminals), `printerctl_printer_tests` (printer session
 against scripted mock printers), `printerctl_record_tests` (session
-records and the active-print marker) and `printerctl_logging_tests`
-(logging module). See `docs/testing.md` for what each covers in detail,
-the patterns behind them and the hardware-validation record.
+records and the active-print marker), `printerctl_logging_tests`
+(logging module), `printerctl_core_tests` (the Milestone 12 print
+engine, without any CLI parsing or terminal output),
+`printerctl_daemon_ipc_tests` (Milestone 13 internal command/event
+framing and validation) and `printerctl_daemon_runtime_tests`
+(Milestone 13 daemon runtime lifecycle, IPC round-trips, fault
+injection and repeated start/stop cycles), `printerctl_plp1_frame_tests`,
+`printerctl_plp1_payload_tests` and `printerctl_plp1_parser_tests`
+(Milestone 14 PLP/1 wire contract), and
+`printerctl_daemon_socket_tests` (Milestone 15 Unix socket transport).
+Run the daemon runtime/socket tests under ThreadSanitizer when checking
+concurrency changes. See
+`docs/testing.md` for what each covers in detail, the patterns behind
+them and the hardware-validation record.
 
 ## Usage
 
