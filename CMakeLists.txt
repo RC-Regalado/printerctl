@@ -12,6 +12,9 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
+# Milestone 13: the first thread in the project (daemon runtime's worker).
+find_package(Threads REQUIRED)
+
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/printerctl/version.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/include/printerctl/version.h"
@@ -98,6 +101,82 @@ target_include_directories(printerctl_core
 
 target_link_libraries(printerctl_core
     PUBLIC printerctl_config printerctl_logging printerctl_printer printerctl_record
+)
+
+# Milestone 13: daemon runtime foundation. Independent of core/printer/
+# serial/marlin/gcode/config/logging by design (Agents.md SS10) -- it
+# integrates none of them yet.
+add_library(printerctl_daemon_ipc STATIC
+    src/daemon/ipc.c
+)
+
+target_include_directories(printerctl_daemon_ipc
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+add_library(printerctl_daemon_worker STATIC
+    src/daemon/worker.c
+)
+
+target_include_directories(printerctl_daemon_worker
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_daemon_worker PUBLIC printerctl_daemon_ipc)
+
+add_library(printerctl_daemon_runtime STATIC
+    src/daemon/runtime.c
+)
+
+target_include_directories(printerctl_daemon_runtime
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_daemon_runtime
+    PUBLIC printerctl_daemon_worker printerctl_daemon_ipc Threads::Threads
+)
+
+# Milestone 14: Printerctl Local Protocol v1 (PLP/1) codec. Independent
+# of every other printerctl_* library, config and logging included --
+# a pure buffer-in/buffer-out codec (Agents.md-style isolation, no
+# socket/pipe/print_engine knowledge).
+add_library(printerctl_protocol_plp1 STATIC
+    src/protocol/plp1.c
+)
+
+target_include_directories(printerctl_protocol_plp1
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+add_library(printerctl_protocol_plp1_parser STATIC
+    src/protocol/plp1_parser.c
+)
+
+target_include_directories(printerctl_protocol_plp1_parser
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_protocol_plp1_parser PUBLIC printerctl_protocol_plp1)
+
+# Milestone 15: local Unix socket transport. This is the first layer that
+# knows both daemon runtime snapshots and PLP/1 frames; lower layers stay
+# unaware of sockets, protocol dispatch and file descriptors.
+add_library(printerctl_daemon_socket STATIC
+    src/daemon/socket.c
+)
+
+target_include_directories(printerctl_daemon_socket
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_daemon_socket
+    PUBLIC printerctl_daemon_runtime printerctl_protocol_plp1_parser Threads::Threads
 )
 
 add_library(printerctl_cli STATIC

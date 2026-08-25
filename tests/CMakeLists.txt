@@ -69,3 +69,51 @@ add_executable(printerctl_logging_tests
 target_link_libraries(printerctl_logging_tests PRIVATE printerctl_logging)
 
 add_test(NAME printerctl_logging_tests COMMAND printerctl_logging_tests)
+
+add_executable(printerctl_daemon_ipc_tests
+    test_daemon_ipc.c
+)
+
+target_link_libraries(printerctl_daemon_ipc_tests PRIVATE printerctl_daemon_ipc)
+
+add_test(NAME printerctl_daemon_ipc_tests COMMAND printerctl_daemon_ipc_tests)
+
+add_executable(printerctl_daemon_runtime_tests
+    test_daemon_runtime.c
+)
+
+target_link_libraries(printerctl_daemon_runtime_tests PRIVATE printerctl_daemon_runtime)
+
+add_test(NAME printerctl_daemon_runtime_tests COMMAND printerctl_daemon_runtime_tests)
+
+add_executable(printerctl_plp1_frame_tests
+    test_plp1_frame.c
+)
+
+target_link_libraries(printerctl_plp1_frame_tests PRIVATE printerctl_protocol_plp1)
+
+add_test(NAME printerctl_plp1_frame_tests COMMAND printerctl_plp1_frame_tests)
+
+add_executable(printerctl_plp1_payload_tests
+    test_plp1_payloads.c
+)
+
+target_link_libraries(printerctl_plp1_payload_tests PRIVATE printerctl_protocol_plp1)
+
+add_test(NAME printerctl_plp1_payload_tests COMMAND printerctl_plp1_payload_tests)
+
+add_executable(printerctl_plp1_parser_tests
+    test_plp1_parser.c
+)
+
+target_link_libraries(printerctl_plp1_parser_tests PRIVATE printerctl_protocol_plp1_parser)
+
+add_test(NAME printerctl_plp1_parser_tests COMMAND printerctl_plp1_parser_tests)
+
+add_executable(printerctl_daemon_socket_tests
+    test_daemon_socket.c
+)
+
+target_link_libraries(printerctl_daemon_socket_tests PRIVATE printerctl_daemon_socket)
+
+add_test(NAME printerctl_daemon_socket_tests COMMAND printerctl_daemon_socket_tests)
