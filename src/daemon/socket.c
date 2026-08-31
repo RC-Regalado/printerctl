@@ -6,6 +6,7 @@
 #include "printerctl/protocol/plp1_parser.h"
 
 #include <errno.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -200,7 +201,7 @@ static printerctl_daemon_socket_status_t write_full(
 {
     size_t written = 0;
     while (written < length) {
-        ssize_t n = write(fd, buffer + written, length - written);
+        ssize_t n = send(fd, buffer + written, length - written, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -275,7 +276,8 @@ static printerctl_daemon_socket_status_t handle_frame(
         size_t payload_length = 0;
         printerctl_plp1_version_response_t value;
         value.protocol_version = PRINTERCTL_PLP1_VERSION_1;
-        value.capability_bitmap = PRINTERCTL_PLP1_CAP_PRINTER_STATUS;
+        value.capability_bitmap =
+            PRINTERCTL_PLP1_CAP_PRINTER_STATUS | PRINTERCTL_PLP1_CAP_PRINT_CONTROL;
 
         printerctl_plp1_error_t plp_error;
         if (printerctl_plp1_encode_version_response(&value, payload, sizeof(payload),
@@ -300,6 +302,13 @@ static printerctl_daemon_socket_status_t handle_frame(
                                        out_error);
         }
 
+        printerctl_daemon_error_t runtime_error;
+        if (printerctl_daemon_runtime_drain_events(server->runtime, &runtime_error) !=
+            PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                       out_error);
+        }
+
         printerctl_daemon_snapshot_t snapshot;
         printerctl_daemon_runtime_snapshot(server->runtime, &snapshot);
 
@@ -312,6 +321,31 @@ static printerctl_daemon_socket_status_t handle_frame(
         if (requested_fields & PRINTERCTL_PLP1_STATUS_FIELD_WORKER_STATE) {
             value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_WORKER_STATE;
             value.worker_state = map_worker_state(snapshot.worker_state);
+        }
+        if (requested_fields & PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE) {
+            value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE;
+            value.execution_state = snapshot.execution_state;
+        }
+        if (requested_fields & PRINTERCTL_PLP1_STATUS_FIELD_PROGRESS) {
+            value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_PROGRESS;
+            value.progress = snapshot.progress_percent;
+        }
+        if (requested_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_SENT) {
+            value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_SENT;
+            value.commands_sent = snapshot.commands_sent;
+        }
+        if (requested_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED) {
+            value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED;
+            value.commands_acknowledged = snapshot.commands_acknowledged;
+        }
+        if (requested_fields & PRINTERCTL_PLP1_STATUS_FIELD_SOURCE_POSITION) {
+            value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_SOURCE_POSITION;
+            value.source_position = snapshot.source_position;
+        }
+        if ((requested_fields & PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON) &&
+            snapshot.failure_reason != 0) {
+            value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON;
+            value.failure_reason = snapshot.failure_reason;
         }
 
         uint8_t payload[32];
@@ -328,11 +362,88 @@ static printerctl_daemon_socket_status_t handle_frame(
                           (uint16_t)payload_length, out_error);
     }
 
+    if (request->message_type == PRINTERCTL_PLP1_MSG_PRINT_START) {
+        printerctl_plp1_print_start_request_t start;
+        printerctl_plp1_error_t plp_error;
+        if (printerctl_plp1_decode_print_start_request(request->payload, request->payload_length,
+                                                       &start, &plp_error) != PRINTERCTL_PLP1_OK ||
+            start.source_path[0] == '\0') {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                                       out_error);
+        }
+
+        uint32_t token = 0;
+        printerctl_daemon_error_t runtime_error;
+        if (printerctl_daemon_runtime_send_print_start(server->runtime, start.source_path, &token,
+                                                       &runtime_error) != PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                       out_error);
+        }
+        printerctl_daemon_event_t event;
+        if (printerctl_daemon_runtime_wait_command(server->runtime, token, &event,
+                                                   &runtime_error) != PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                       out_error);
+        }
+        if (event.result != PRINTERCTL_DAEMON_RESULT_OK) {
+            uint16_t status = event.wire_status != 0 ? event.wire_status
+                                                     : PRINTERCTL_PLP1_INTERNAL_ERROR;
+            return send_error_response(client_fd, request, status, out_error);
+        }
+        return send_frame(client_fd, PRINTERCTL_PLP1_MSG_PRINT_START,
+                          PRINTERCTL_PLP1_FLAG_RESPONSE, request->request_id,
+                          PRINTERCTL_PLP1_SUCCESS, NULL, 0, out_error);
+    }
+
+    if (request->message_type == PRINTERCTL_PLP1_MSG_PRINT_PAUSE ||
+        request->message_type == PRINTERCTL_PLP1_MSG_PRINT_RESUME ||
+        request->message_type == PRINTERCTL_PLP1_MSG_PRINT_CANCEL) {
+        uint32_t token = 0;
+        printerctl_daemon_error_t runtime_error;
+        printerctl_daemon_status_t send_status;
+        if (request->message_type == PRINTERCTL_PLP1_MSG_PRINT_PAUSE) {
+            send_status =
+                printerctl_daemon_runtime_send_print_pause(server->runtime, &token, &runtime_error);
+        } else if (request->message_type == PRINTERCTL_PLP1_MSG_PRINT_RESUME) {
+            send_status = printerctl_daemon_runtime_send_print_resume(server->runtime, &token,
+                                                                      &runtime_error);
+        } else {
+            send_status = printerctl_daemon_runtime_send_print_cancel(server->runtime, &token,
+                                                                      &runtime_error);
+        }
+        if (send_status != PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_INTERNAL_ERROR,
+                                       out_error);
+        }
+
+        printerctl_daemon_event_t event;
+        if (printerctl_daemon_runtime_wait_command(server->runtime, token, &event,
+                                                   &runtime_error) != PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                       out_error);
+        }
+        if (event.result != PRINTERCTL_DAEMON_RESULT_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_NOT_PRINTING,
+                                       out_error);
+        }
+        return send_frame(client_fd, request->message_type, PRINTERCTL_PLP1_FLAG_RESPONSE,
+                          request->request_id, PRINTERCTL_PLP1_SUCCESS, NULL, 0, out_error);
+    }
+
     return send_error_response(client_fd, request, PRINTERCTL_PLP1_INVALID_STATE, out_error);
 }
 
 printerctl_daemon_socket_status_t printerctl_daemon_socket_serve_one(
     printerctl_daemon_socket_server_t *server,
+    printerctl_daemon_socket_error_t *out_error)
+{
+    return printerctl_daemon_socket_serve_one_interruptible(server, NULL, NULL, out_error);
+}
+
+printerctl_daemon_socket_status_t printerctl_daemon_socket_serve_one_interruptible(
+    printerctl_daemon_socket_server_t *server,
+    printerctl_daemon_socket_should_stop_fn should_stop,
+    void *context,
     printerctl_daemon_socket_error_t *out_error)
 {
     if (out_error == NULL) {
@@ -362,6 +473,29 @@ printerctl_daemon_socket_status_t printerctl_daemon_socket_serve_one(
     printerctl_plp1_parser_init(&parser, parser_buffer, sizeof(parser_buffer));
 
     for (;;) {
+        if (should_stop != NULL && should_stop(context)) {
+            close(client_fd);
+            return PRINTERCTL_DAEMON_SOCKET_OK;
+        }
+
+        struct pollfd pfd;
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int poll_rc = poll(&pfd, 1, 250);
+        if (poll_rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_IO, "poll(client): %s",
+                      strerror(errno));
+            close(client_fd);
+            return out_error->status;
+        }
+        if (poll_rc == 0) {
+            continue;
+        }
+
         uint8_t chunk[4096];
         ssize_t n = read(client_fd, chunk, sizeof(chunk));
         if (n == 0) {

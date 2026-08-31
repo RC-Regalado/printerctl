@@ -608,7 +608,7 @@ Never blindly unlink a socket path without determining whether a live instance o
 
 # M16 — Single-Print Daemon Integration
 
-**Status: APPROVED**
+**Status: DONE**
 
 ## Goal
 
@@ -750,7 +750,7 @@ Preserve all existing behavior:
 
 # M17 — Lifecycle, Fault & Legacy Compatibility Validation
 
-**Status: APPROVED**
+**Status: DONE**
 
 ## Goal
 
@@ -876,7 +876,8 @@ Equivalent PTY/mock-Marlin fault tests must cover the required failure paths bef
 
 # 6. Phase completion and next phases
 
-After M17 is accepted, Phase 1 is complete.
+After M17 is accepted, Phase 1 is complete. M17 is implemented as of
+2026-08-25; see [[milestone-17|docs/milestones/milestone-17.md]].
 
 The project then proceeds independently through:
 

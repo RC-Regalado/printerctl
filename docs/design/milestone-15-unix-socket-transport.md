@@ -44,6 +44,15 @@ Out of scope remains out of code: no `print_engine`, serial, Marlin,
 G-code execution, queue, persistence, event subscriptions, web API or CLI
 migration.
 
+The repository also builds `printerctld`, a minimal process wrapper
+around this transport:
+
+```text
+printerctld [--socket PATH] [--help] [--version]
+```
+
+The default socket path is `/tmp/printerctl.sock`.
+
 ## Runtime model
 
 `printerctl_daemon_socket_server_t` is owned by the control context and
@@ -59,6 +68,10 @@ clients are supported by repeated calls to
 `printerctl_daemon_socket_serve_one()`. Simultaneous clients are deferred
 until a milestone actually needs them; this avoids introducing a second
 concurrency model before print execution exists.
+
+`printerctld` waits for readable events on the listening socket with
+`poll()`, serves one client, then returns to the accept loop. `SIGINT` and
+`SIGTERM` request clean shutdown between client sessions.
 
 ## Socket path lifecycle
 

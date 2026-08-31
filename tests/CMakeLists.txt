@@ -117,3 +117,27 @@ add_executable(printerctl_daemon_socket_tests
 target_link_libraries(printerctl_daemon_socket_tests PRIVATE printerctl_daemon_socket)
 
 add_test(NAME printerctl_daemon_socket_tests COMMAND printerctl_daemon_socket_tests)
+
+add_executable(printerctld_tests
+    test_printerctld.c
+)
+
+target_compile_definitions(printerctld_tests
+    PRIVATE
+        TEST_PRINTERCTLD_PATH="$<TARGET_FILE:printerctld>"
+        TEST_PRINTERCTL_PATH="$<TARGET_FILE:printerctl>"
+)
+
+target_link_libraries(printerctld_tests PRIVATE printerctl_protocol_plp1)
+
+add_dependencies(printerctld_tests printerctld printerctl)
+
+add_test(NAME printerctld_tests COMMAND printerctld_tests)
+
+add_executable(printerctl_daemon_print_tests
+    test_daemon_print.c
+)
+
+target_link_libraries(printerctl_daemon_print_tests PRIVATE printerctl_daemon_runtime)
+
+add_test(NAME printerctl_daemon_print_tests COMMAND printerctl_daemon_print_tests)

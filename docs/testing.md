@@ -20,13 +20,13 @@ primary verification method.
 
 ## Test binaries
 
-Fifteen independent CMake/ctest targets, one per module plus integration
-integration suite:
+Seventeen independent CMake/ctest targets, one per module plus integration
+suites:
 
 | Binary | Covers |
 |---|---|
 | `printerctl_tests` | CLI grammar, configuration precedence, logging integration, and end-to-end command execution against forked mock printers (`tests/test_cli.c`) |
-| `printerctl_config_tests` | Configuration resolution: defaults, `--config` file, CLI overrides, precedence, validation |
+| `printerctl_config_tests` | Configuration resolution: defaults, `--config` file, CLI overrides, owner-aware views, precedence, validation |
 | `printerctl_gcode_tests` | G-code file reading: normalization, comment/blank-line stripping, progress, malformed/oversized lines, `G28` detection |
 | `printerctl_marlin_tests` | Marlin response classification and parsing: `ok`, `Error:`, `busy:`, `echo:`, `Resend:`, temperature/position/firmware-info reports |
 | `printerctl_serial_tests` | Serial transport over pseudo-terminals: open/configure/read/write, timeout, exclusive access (`TIOCEXCL`) |
@@ -40,6 +40,8 @@ integration suite:
 | `printerctl_plp1_payload_tests` | Milestone 14 payload codecs: VERSION, STATUS, PRINT_START and error payload validation |
 | `printerctl_plp1_parser_tests` | Milestone 14 incremental parser: fragmentation, coalescing, malformed frames and parser recovery boundaries |
 | `printerctl_daemon_socket_tests` | Milestone 15 Unix socket transport: real `AF_UNIX`, fragmented/coalesced requests, stale/live socket paths, sequential clients and malformed-client containment |
+| `printerctld_tests` | Milestone 15-18 daemon executable smoke/config test: fork `printerctld`, connect through PLP/1, validate `PING`, terminate with `SIGTERM`, load valid daemon config and reject invalid daemon config |
+| `printerctl_daemon_print_tests` | Milestone 16 daemon print integration: worker-owned print engine, pseudo-terminal Marlin, pause/resume/cancel and second-start rejection |
 
 Run all of them:
 
@@ -99,6 +101,17 @@ to run the same suite under Clang; both must be warning-free with
   socket paths under `/tmp`, real `AF_UNIX`/`SOCK_STREAM` clients, and
   pthread-backed `serve_one()` calls to verify stream behavior without
   serial hardware or print execution.
+- **Daemon process tests**: `printerctld_tests` forks the built
+  `printerctld` binary, waits for its Unix socket, performs real PLP/1
+  exchanges, validates idle shutdown, process-level `SIGTERM` and
+  `SIGPWR` during active PTY-backed prints, active-print marker PID
+  targeting, ACK-window cancellation for `SIGTERM`, `SIGPWR` and
+  `PRINT_CANCEL`, no post-commit host transmission, and both directions
+  of legacy CLI / daemon serial exclusivity.
+- **Daemon print integration**: M16 tests drive the daemon runtime
+  directly against a pseudo-terminal mock Marlin printer, proving
+  `PRINT_START`, pause/resume/cancel and active-print rejection without
+  real hardware.
 
 ## Hardware validation
 
@@ -138,7 +151,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-This should configure, build and pass all fifteen suites with no manual
+This should configure, build and pass all seventeen suites with no manual
 setup beyond a C17 compiler, CMake >= 3.16, and the standard POSIX
 tools the test suites use (`posix_openpt` and friends, already part of
 glibc on the project's Linux target).

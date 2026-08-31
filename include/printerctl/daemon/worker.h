@@ -2,16 +2,15 @@
 #define PRINTERCTL_DAEMON_WORKER_H
 
 #include "printerctl/daemon/ipc.h"
+#include "printerctl/config.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 
 /*
- * Milestone 13 print worker: the thread body that will eventually own
- * printerctl_print_engine_t (Milestone 16). M13 integrates nothing real
- * yet -- no engine, no printer, no serial -- it only proves the thread
- * can be created, reach READY, process NOP/SHUTDOWN over `cmd_pipe`,
- * and emit events over `event_pipe` deterministically.
+ * Print worker: M13 introduced the thread body and M16 made it the owner
+ * of printerctl_print_engine_t. The control context sends bounded commands
+ * over `cmd_pipe`; the worker reports state/progress over `event_pipe`.
  *
  * Worker lifecycle (Agents.md SS13):
  *
@@ -55,9 +54,14 @@ typedef bool (*printerctl_daemon_worker_init_fn)(
 typedef struct {
     int cmd_read_fd;
     int event_write_fd;
+    printerctl_config_t config;
     printerctl_daemon_worker_init_fn init_hook; /* NULL => trivial success */
     void *init_context;
 } printerctl_daemon_worker_args_t;
+
+void printerctl_daemon_worker_reset_signal_requests(void);
+void printerctl_daemon_worker_request_cancel_from_signal(void);
+void printerctl_daemon_worker_request_power_failure_from_signal(void);
 
 /*
  * pthread entry point (matches void *(*)(void *)): runs `init_hook` if
@@ -66,6 +70,11 @@ typedef struct {
  * `event_write_fd`:
  *
  *   NOP           -> COMMAND_COMPLETED(token)
+ *   PRINT_START   -> accept/reject one active print; accepted prints run
+ *                    through the existing print_engine
+ *   PRINT_PAUSE/
+ *   PRINT_RESUME/
+ *   PRINT_CANCEL  -> applied while a print is active, rejected otherwise
  *   SHUTDOWN      -> STOPPING(token), cleanup, STOPPED(token), return
  *   cmd_pipe EOF  -> STOPPING(0), STOPPED(0), return (orderly: the
  *                    control side went away without an explicit

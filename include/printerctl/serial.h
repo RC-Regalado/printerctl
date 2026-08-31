@@ -70,6 +70,8 @@ typedef struct {
     char message[PRINTERCTL_SERIAL_ERROR_MAX];
 } printerctl_serial_error_t;
 
+typedef void (*printerctl_serial_wait_hook_fn)(void *context);
+
 /*
  * Opens the terminal device at `path` and configures it for Marlin
  * communication: raw mode (no echo, no canonical input, no CR/LF
@@ -150,6 +152,20 @@ printerctl_serial_status_t printerctl_serial_read_line(
     printerctl_serial_port_t *port,
     char *buffer,
     size_t buffer_size,
+    printerctl_serial_error_t *out_error);
+
+/*
+ * Same contract as printerctl_serial_read_line(), but calls `on_wait`
+ * periodically while waiting for input. The hook must not read/write
+ * the serial descriptor; it exists for higher layers to poll independent
+ * cancellation state during a bounded ACK wait.
+ */
+printerctl_serial_status_t printerctl_serial_read_line_with_hook(
+    printerctl_serial_port_t *port,
+    char *buffer,
+    size_t buffer_size,
+    printerctl_serial_wait_hook_fn on_wait,
+    void *wait_context,
     printerctl_serial_error_t *out_error);
 
 /*

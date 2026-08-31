@@ -19,6 +19,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#define PRINTERCTL_SERIAL_WAIT_HOOK_POLL_MS 20
+
 static void set_error(printerctl_serial_error_t *out_error,
                        printerctl_serial_status_t status,
                        const char *format, ...)
@@ -94,7 +96,12 @@ static int remaining_ms(uint64_t deadline_ms)
  * hangup/error conditions reported by poll(), or ERR_IO if poll() itself
  * fails. EINTR restarts the wait with the remaining time.
  */
-static printerctl_serial_status_t wait_ready(int fd, short events, uint64_t deadline_ms)
+static printerctl_serial_status_t wait_ready_with_hook(
+    int fd,
+    short events,
+    uint64_t deadline_ms,
+    printerctl_serial_wait_hook_fn on_wait,
+    void *wait_context)
 {
     for (;;) {
         struct pollfd pfd = {.fd = fd, .events = events, .revents = 0};
@@ -102,6 +109,9 @@ static printerctl_serial_status_t wait_ready(int fd, short events, uint64_t dead
         int timeout = remaining_ms(deadline_ms);
         if (timeout == 0) {
             return PRINTERCTL_SERIAL_ERR_TIMEOUT;
+        }
+        if (on_wait != NULL && timeout > PRINTERCTL_SERIAL_WAIT_HOOK_POLL_MS) {
+            timeout = PRINTERCTL_SERIAL_WAIT_HOOK_POLL_MS;
         }
 
         int rc = poll(&pfd, 1, timeout);
@@ -112,6 +122,10 @@ static printerctl_serial_status_t wait_ready(int fd, short events, uint64_t dead
             return PRINTERCTL_SERIAL_ERR_IO;
         }
         if (rc == 0) {
+            if (on_wait != NULL) {
+                on_wait(wait_context);
+                continue;
+            }
             return PRINTERCTL_SERIAL_ERR_TIMEOUT;
         }
 
@@ -124,6 +138,11 @@ static printerctl_serial_status_t wait_ready(int fd, short events, uint64_t dead
             return PRINTERCTL_SERIAL_ERR_DISCONNECTED;
         }
     }
+}
+
+static printerctl_serial_status_t wait_ready(int fd, short events, uint64_t deadline_ms)
+{
+    return wait_ready_with_hook(fd, events, deadline_ms, NULL, NULL);
 }
 
 printerctl_serial_status_t printerctl_serial_open(
@@ -338,6 +357,18 @@ printerctl_serial_status_t printerctl_serial_read_line(
     size_t buffer_size,
     printerctl_serial_error_t *out_error)
 {
+    return printerctl_serial_read_line_with_hook(port, buffer, buffer_size, NULL, NULL,
+                                                out_error);
+}
+
+printerctl_serial_status_t printerctl_serial_read_line_with_hook(
+    printerctl_serial_port_t *port,
+    char *buffer,
+    size_t buffer_size,
+    printerctl_serial_wait_hook_fn on_wait,
+    void *wait_context,
+    printerctl_serial_error_t *out_error)
+{
     if (out_error == NULL) {
         return PRINTERCTL_SERIAL_ERR_INVALID_ARGUMENT;
     }
@@ -361,7 +392,8 @@ printerctl_serial_status_t printerctl_serial_read_line(
     size_t length = 0;
 
     for (;;) {
-        printerctl_serial_status_t ready = wait_ready(port->fd, POLLIN, deadline);
+        printerctl_serial_status_t ready =
+            wait_ready_with_hook(port->fd, POLLIN, deadline, on_wait, wait_context);
         if (ready == PRINTERCTL_SERIAL_ERR_TIMEOUT) {
             buffer[length] = '\0';
             set_error(out_error, ready,

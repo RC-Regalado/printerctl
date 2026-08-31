@@ -1,5 +1,6 @@
 #include "printerctl/core/print_engine.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -17,6 +18,73 @@ static void emit_simple(printerctl_print_engine_t *engine, printerctl_print_even
     memset(&event, 0, sizeof(event));
     event.type = type;
     emit(engine, &event);
+}
+
+static printerctl_print_control_t tx_gate_close_if_requested(printerctl_print_engine_t *engine)
+{
+    if (engine == NULL || !engine->tx_gate_ready) {
+        return PRINTERCTL_PRINT_CONTROL_CONTINUE;
+    }
+
+    pthread_mutex_lock(&engine->tx_gate);
+    if (engine->cancel_power_failure_requested) {
+        engine->tx_gate_closed = true;
+        engine->tx_gate_power_failure = true;
+    } else if (engine->cancel_requested && !engine->tx_gate_closed) {
+        engine->tx_gate_closed = true;
+        engine->tx_gate_power_failure = false;
+    }
+
+    printerctl_print_control_t control = PRINTERCTL_PRINT_CONTROL_CONTINUE;
+    if (engine->tx_gate_closed) {
+        control = engine->tx_gate_power_failure
+            ? PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE
+            : PRINTERCTL_PRINT_CONTROL_CANCEL;
+    }
+    pthread_mutex_unlock(&engine->tx_gate);
+    return control;
+}
+
+printerctl_print_control_t printerctl_print_engine_commit_cancellation(
+    printerctl_print_engine_t *engine)
+{
+    return tx_gate_close_if_requested(engine);
+}
+
+static printerctl_print_control_t tx_gate_begin(void *context)
+{
+    printerctl_print_engine_t *engine = context;
+    pthread_mutex_lock(&engine->tx_gate);
+    if (engine->cancel_power_failure_requested) {
+        engine->tx_gate_closed = true;
+        engine->tx_gate_power_failure = true;
+    } else if (engine->cancel_requested && !engine->tx_gate_closed) {
+        engine->tx_gate_closed = true;
+        engine->tx_gate_power_failure = false;
+    }
+    if (engine->tx_gate_closed) {
+        printerctl_print_control_t control = engine->tx_gate_power_failure
+            ? PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE
+            : PRINTERCTL_PRINT_CONTROL_CANCEL;
+        pthread_mutex_unlock(&engine->tx_gate);
+        return control;
+    }
+    return PRINTERCTL_PRINT_CONTROL_CONTINUE;
+}
+
+static void tx_gate_end(void *context)
+{
+    printerctl_print_engine_t *engine = context;
+    pthread_mutex_unlock(&engine->tx_gate);
+}
+
+static void on_ack_wait(void *context)
+{
+    printerctl_print_engine_t *engine = context;
+    if (engine->on_control_poll != NULL) {
+        engine->on_control_poll(engine, engine->control_poll_context);
+    }
+    (void)tx_gate_close_if_requested(engine);
 }
 
 /* Mirrors printer.h's printerctl_print_control_t vocabulary; used only to
@@ -67,9 +135,18 @@ printerctl_printer_status_t printerctl_print_engine_connect(
     engine->on_event = on_event;
     engine->event_context = event_context;
 
+    if (pthread_mutex_init(&engine->tx_gate, NULL) != 0) {
+        out_error->status = PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT;
+        snprintf(out_error->message, sizeof(out_error->message), "cannot initialize TX gate");
+        return out_error->status;
+    }
+    engine->tx_gate_ready = true;
+
     printerctl_printer_status_t status =
         printerctl_printer_connect(&engine->printer, config, logger_ready ? logger : NULL, out_error);
     if (status != PRINTERCTL_PRINTER_OK) {
+        pthread_mutex_destroy(&engine->tx_gate);
+        engine->tx_gate_ready = false;
         return status;
     }
 
@@ -120,7 +197,12 @@ static printerctl_print_control_t on_control(void *context)
 {
     printerctl_print_engine_t *engine = context;
 
-    if (engine->cancel_power_failure_requested) {
+    if (engine->on_control_poll != NULL) {
+        engine->on_control_poll(engine, engine->control_poll_context);
+    }
+
+    printerctl_print_control_t cancel_control = tx_gate_close_if_requested(engine);
+    if (cancel_control == PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE) {
         if (!engine->cancel_power_failure_notified) {
             engine->cancel_power_failure_notified = true;
             emit_simple(engine, PRINTERCTL_PRINT_EVENT_CANCELLING_POWER_FAILURE);
@@ -128,7 +210,7 @@ static printerctl_print_control_t on_control(void *context)
         return PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE;
     }
 
-    if (engine->cancel_requested) {
+    if (cancel_control == PRINTERCTL_PRINT_CONTROL_CANCEL) {
         return PRINTERCTL_PRINT_CONTROL_CANCEL;
     }
 
@@ -243,8 +325,9 @@ printerctl_printer_status_t printerctl_print_engine_run(
     started.path = path;
     emit(engine, &started);
 
-    printerctl_printer_status_t status = printerctl_printer_print_file(
-        &engine->printer, path, on_progress, engine, on_control, engine, out_summary, out_error);
+    printerctl_printer_status_t status = printerctl_printer_print_file_controlled(
+        &engine->printer, path, on_progress, engine, on_control, engine, tx_gate_begin,
+        tx_gate_end, on_ack_wait, engine, out_summary, out_error);
 
     printerctl_print_event_t terminal;
     memset(&terminal, 0, sizeof(terminal));
@@ -300,6 +383,18 @@ void printerctl_print_engine_request_cancel_power_failure(printerctl_print_engin
     engine->cancel_power_failure_requested = 1;
 }
 
+void printerctl_print_engine_set_control_poll(
+    printerctl_print_engine_t *engine,
+    printerctl_print_engine_control_poll_fn on_control_poll,
+    void *context)
+{
+    if (engine == NULL) {
+        return;
+    }
+    engine->on_control_poll = on_control_poll;
+    engine->control_poll_context = context;
+}
+
 printerctl_printer_status_t printerctl_print_engine_disconnect(
     printerctl_print_engine_t *engine,
     printerctl_printer_error_t *out_error)
@@ -320,5 +415,10 @@ printerctl_printer_status_t printerctl_print_engine_disconnect(
         engine->marker_active = false;
     }
 
-    return printerctl_printer_disconnect(&engine->printer, out_error);
+    printerctl_printer_status_t status = printerctl_printer_disconnect(&engine->printer, out_error);
+    if (engine->tx_gate_ready) {
+        pthread_mutex_destroy(&engine->tx_gate);
+        engine->tx_gate_ready = false;
+    }
+    return status;
 }

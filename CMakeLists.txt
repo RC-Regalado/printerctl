@@ -100,7 +100,7 @@ target_include_directories(printerctl_core
 )
 
 target_link_libraries(printerctl_core
-    PUBLIC printerctl_config printerctl_logging printerctl_printer printerctl_record
+    PUBLIC printerctl_config printerctl_logging printerctl_printer printerctl_record Threads::Threads
 )
 
 # Milestone 13: daemon runtime foundation. Independent of core/printer/
@@ -124,7 +124,7 @@ target_include_directories(printerctl_daemon_worker
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
-target_link_libraries(printerctl_daemon_worker PUBLIC printerctl_daemon_ipc)
+target_link_libraries(printerctl_daemon_worker PUBLIC printerctl_daemon_ipc printerctl_core)
 
 add_library(printerctl_daemon_runtime STATIC
     src/daemon/runtime.c
@@ -196,6 +196,17 @@ add_executable(printerctl
 )
 
 target_link_libraries(printerctl PRIVATE printerctl_cli)
+
+add_executable(printerctld
+    src/printerctld_main.c
+)
+
+target_include_directories(printerctld
+    PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/include"
+)
+
+target_link_libraries(printerctld PRIVATE printerctl_daemon_socket printerctl_config)
 
 enable_testing()
 add_subdirectory(tests)

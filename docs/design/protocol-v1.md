@@ -465,10 +465,9 @@ daemon-side equivalent; it exists only for a STATUS response describing
 a field with no known value. A future dispatcher (M15/M16) is
 responsible for mapping the daemon's own C enums onto these wire values.
 
-`execution_state`'s value set is explicitly **not** defined here —
-Milestone 16 owns the mapping from `print_engine`'s internal state to
-this field once the engine is actually integrated; M14 only reserves
-the wire slot (a small numeric enum) so the codec is stable in advance.
+`execution_state` was reserved by M14 and defined by M16:
+`1 IDLE, 2 RUNNING, 3 PAUSED, 4 CANCELLING, 5 COMPLETED, 6 CANCELLED,
+7 FAILED`.
 
 A requested-but-absent field is not an error — it simply does not
 appear in `present_fields`; `printerctl_plp1_decode_status_response()`
@@ -492,6 +491,22 @@ concern.
 
 Success response: no payload. Means only "request accepted", never
 "print finished" — the operational semantics belong to Milestone 16.
+
+Implemented daemon error mapping after Phase 1 remediation:
+
+| Condition | Status |
+|---|---|
+| A daemon-owned print is already active | `BUSY` |
+| Worker command channel/runtime unavailable | `WORKER_UNAVAILABLE` |
+| Source path does not exist | `FILE_NOT_FOUND` |
+| Source path exists but is not readable | `FILE_NOT_READABLE` |
+| Source path is not a regular G-code file or fails G-code validation | `INVALID_GCODE_SOURCE` |
+| Serial open/configuration/startup failure | `SERIAL_ERROR` |
+| Printer response error / unsupported resend / unexpected response | `PRINTER_ERROR` |
+| Printer response timeout | `PRINTER_TIMEOUT` |
+
+`BUSY` is reserved for the active-execution case only; clients must key
+on the numeric status, never diagnostic text.
 
 ### Golden vector (`source_path = "/tmp/a.gcode"`, `request_id = 42`)
 

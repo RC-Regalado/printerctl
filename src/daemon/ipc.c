@@ -60,7 +60,17 @@ static printerctl_daemon_ipc_status_t read_full(int fd, void *buffer, size_t siz
 
 static bool command_type_valid(printerctl_daemon_command_type_t type)
 {
-    return type == PRINTERCTL_DAEMON_CMD_NOP || type == PRINTERCTL_DAEMON_CMD_SHUTDOWN;
+    switch (type) {
+    case PRINTERCTL_DAEMON_CMD_NOP:
+    case PRINTERCTL_DAEMON_CMD_SHUTDOWN:
+    case PRINTERCTL_DAEMON_CMD_PRINT_START:
+    case PRINTERCTL_DAEMON_CMD_PRINT_PAUSE:
+    case PRINTERCTL_DAEMON_CMD_PRINT_RESUME:
+    case PRINTERCTL_DAEMON_CMD_PRINT_CANCEL:
+    case PRINTERCTL_DAEMON_CMD_PRINT_CANCEL_POWER_FAILURE:
+        return true;
+    }
+    return false;
 }
 
 static bool event_type_valid(printerctl_daemon_event_type_t type)
@@ -68,6 +78,7 @@ static bool event_type_valid(printerctl_daemon_event_type_t type)
     switch (type) {
     case PRINTERCTL_DAEMON_EVENT_READY:
     case PRINTERCTL_DAEMON_EVENT_COMMAND_COMPLETED:
+    case PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE:
     case PRINTERCTL_DAEMON_EVENT_STOPPING:
     case PRINTERCTL_DAEMON_EVENT_STOPPED:
     case PRINTERCTL_DAEMON_EVENT_FAULT:

@@ -44,9 +44,10 @@ procedure).
 
 ## How the script communicates with the process
 
-There is no daemon yet (Phase II, Milestones 12+), so `printerctl power
-low-battery` uses a small, deliberately temporary mechanism instead of a
-proper IPC channel:
+The legacy CLI path still supports `printerctl power low-battery` through
+the active-print marker. With the Phase 1 daemon path, `printerctld` also
+handles `SIGPWR` directly and forwards it to the worker as a power-failure
+cancellation. The legacy marker mechanism remains:
 
 1. While a print streams, the printerctl process publishes its own PID
    to a live marker file: `$XDG_STATE_HOME/printerctl/active-print.pid`

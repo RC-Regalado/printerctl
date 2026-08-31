@@ -78,6 +78,13 @@ typedef struct {
 } printerctl_config_overrides_t;
 
 typedef enum {
+    PRINTERCTL_CONFIG_VIEW_ALL = 0,
+    PRINTERCTL_CONFIG_VIEW_CLIENT,
+    PRINTERCTL_CONFIG_VIEW_DAEMON,
+    PRINTERCTL_CONFIG_VIEW_LEGACY_CLI
+} printerctl_config_view_t;
+
+typedef enum {
     PRINTERCTL_CONFIG_OK = 0,
     PRINTERCTL_CONFIG_ERR_FILE_NOT_FOUND,
     PRINTERCTL_CONFIG_ERR_LINE_TOO_LONG,
@@ -142,6 +149,20 @@ void printerctl_config_apply_overrides(
     const printerctl_config_overrides_t *overrides);
 
 /*
+ * Applies only the fields owned by `view`.
+ *
+ * CLIENT: dry_run, verbose.
+ * DAEMON: port, baud, timeout.
+ * LEGACY_CLI: transitional Phase 2 compatibility view for direct serial
+ * commands not yet migrated to PLP/daemon execution; removed in M25.
+ * ALL: historical unfiltered behavior.
+ */
+void printerctl_config_apply_overrides_for_view(
+    printerctl_config_t *config,
+    const printerctl_config_overrides_t *overrides,
+    printerctl_config_view_t view);
+
+/*
  * Resolves the final configuration in precedence order: built-in defaults,
  * then the file named by cli_overrides->config_path (only when
  * has_config_path is set), then cli_overrides itself. On failure, returns
@@ -150,6 +171,12 @@ void printerctl_config_apply_overrides(
  */
 printerctl_config_status_t printerctl_config_resolve(
     const printerctl_config_overrides_t *cli_overrides,
+    printerctl_config_t *out_config,
+    printerctl_config_error_t *out_error);
+
+printerctl_config_status_t printerctl_config_resolve_for_view(
+    const printerctl_config_overrides_t *cli_overrides,
+    printerctl_config_view_t view,
     printerctl_config_t *out_config,
     printerctl_config_error_t *out_error);
 

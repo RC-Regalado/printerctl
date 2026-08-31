@@ -318,6 +318,14 @@ printerctl_plp1_result_t printerctl_plp1_decode_status_request(
 #define PRINTERCTL_PLP1_WORKER_STATE_STOPPED 4u
 #define PRINTERCTL_PLP1_WORKER_STATE_FAULTED 5u
 
+#define PRINTERCTL_PLP1_EXECUTION_STATE_IDLE 1u
+#define PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING 2u
+#define PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED 3u
+#define PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLING 4u
+#define PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED 5u
+#define PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED 6u
+#define PRINTERCTL_PLP1_EXECUTION_STATE_FAILED 7u
+
 /*
  * Wire widths for each optional field (docs/design/protocol-v1.md
  * records the rationale): daemon_state/worker_state/execution_state/

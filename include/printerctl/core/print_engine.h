@@ -7,6 +7,7 @@
 #include "printerctl/printer.h"
 #include "printerctl/record.h"
 
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 
@@ -119,12 +120,19 @@ typedef struct {
 typedef void (*printerctl_print_engine_event_fn)(
     const printerctl_print_event_t *event, void *context);
 
-typedef struct {
+typedef struct printerctl_print_engine printerctl_print_engine_t;
+
+typedef void (*printerctl_print_engine_control_poll_fn)(
+    printerctl_print_engine_t *engine, void *context);
+
+struct printerctl_print_engine {
     printerctl_printer_session_t printer;
     printerctl_logger_t *logger;
     bool logger_ready;
     printerctl_print_engine_event_fn on_event;
     void *event_context;
+    printerctl_print_engine_control_poll_fn on_control_poll;
+    void *control_poll_context;
 
     char state_dir[PRINTERCTL_RECORD_DIR_MAX];
     bool state_dir_resolved;
@@ -133,11 +141,15 @@ typedef struct {
 
     bool paused;
     bool cancel_power_failure_notified;
+    pthread_mutex_t tx_gate;
+    bool tx_gate_ready;
+    bool tx_gate_closed;
+    bool tx_gate_power_failure;
     volatile sig_atomic_t pause_requested;
     volatile sig_atomic_t resume_requested;
     volatile sig_atomic_t cancel_requested;
     volatile sig_atomic_t cancel_power_failure_requested;
-} printerctl_print_engine_t;
+};
 
 /*
  * Opens the serial port (via printerctl_printer_connect(), so the same
@@ -200,6 +212,18 @@ void printerctl_print_engine_request_pause(printerctl_print_engine_t *engine);
 void printerctl_print_engine_request_resume(printerctl_print_engine_t *engine);
 void printerctl_print_engine_request_cancel(printerctl_print_engine_t *engine);
 void printerctl_print_engine_request_cancel_power_failure(printerctl_print_engine_t *engine);
+
+/*
+ * Commits any pending cancellation request into the TX gate. Not
+ * async-signal-safe; signal handlers must call only request_*().
+ */
+printerctl_print_control_t printerctl_print_engine_commit_cancellation(
+    printerctl_print_engine_t *engine);
+
+void printerctl_print_engine_set_control_poll(
+    printerctl_print_engine_t *engine,
+    printerctl_print_engine_control_poll_fn on_control_poll,
+    void *context);
 
 /*
  * Removes the active-print marker if it is still active (idempotent)

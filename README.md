@@ -9,8 +9,9 @@ power-failure references.
 
 ## Status
 
-This repository currently implements Milestone 15 (Unix Socket Transport)
-of `docs/roadmap.md`'s Phase 1 —
+This repository currently implements Milestone 17 (Lifecycle, Fault &
+Legacy Compatibility Validation), completing and re-auditing
+`docs/roadmap.md`'s Phase 1 —
 Daemon Foundation + Single-Print IPC (milestones 0-9 keep their original
 scope; milestones 10+ follow the revised roadmap). Milestone 12 (Print
 Engine Extraction) moved the application-level print lifecycle behind
@@ -18,9 +19,18 @@ Engine Extraction) moved the application-level print lifecycle behind
 added the independent control-context/worker-thread/two-pipe runtime
 foundation; Milestone 14 froze PLP/1; and Milestone 15 adds a local
 `AF_UNIX`/`SOCK_STREAM` transport for hardware-independent `PING`,
-`VERSION` and idle `STATUS`. It still does not integrate `print_engine`,
-serial, Marlin or print execution into the daemon, and changes nothing
-about the CLI's behavior described below. See
+`VERSION` and idle `STATUS`, exposed through the `printerctld`
+executable; Milestone 16 connects PLP/1 `PRINT_START`, `PRINT_PAUSE`,
+`PRINT_RESUME` and `PRINT_CANCEL` to one worker-owned print engine. It
+does not add queueing, history, event subscriptions, multi-printer
+support or CLI migration, and changes nothing about the CLI's behavior
+described below. The Phase 1 remediation audit is recorded in
+`docs/audit/phase-1.md`; Phase 2 is ready to start, but has not been
+started here. See
+`docs/milestones/milestone-17.md` /
+`docs/design/milestone-17-lifecycle-fault-compatibility.md`,
+`docs/milestones/milestone-16.md` /
+`docs/design/milestone-16-single-print-daemon-integration.md`,
 `docs/milestones/milestone-15.md` /
 `docs/design/milestone-15-unix-socket-transport.md`,
 `docs/milestones/milestone-14.md` /
@@ -89,7 +99,7 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. 15
+Use `build-clang` instead of `build` if you configured with Clang. 17
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 logging integration and end-to-end commands against forked mock
 printers), `printerctl_config_tests` (configuration module),
@@ -106,8 +116,11 @@ framing and validation) and `printerctl_daemon_runtime_tests`
 injection and repeated start/stop cycles), `printerctl_plp1_frame_tests`,
 `printerctl_plp1_payload_tests` and `printerctl_plp1_parser_tests`
 (Milestone 14 PLP/1 wire contract), and
-`printerctl_daemon_socket_tests` (Milestone 15 Unix socket transport).
-Run the daemon runtime/socket tests under ThreadSanitizer when checking
+`printerctl_daemon_socket_tests` (Milestone 15 Unix socket transport)
+and `printerctld_tests` (Milestone 15 process smoke test over PLP/1).
+`printerctl_daemon_print_tests` covers Milestone 16 daemon/worker print
+integration over pseudo-terminals. Run the daemon runtime/socket/process
+tests under ThreadSanitizer when checking
 concurrency changes. See
 `docs/testing.md` for what each covers in detail, the patterns behind
 them and the hardware-validation record.
@@ -119,6 +132,15 @@ printerctl [GLOBAL_OPTIONS] COMMAND [COMMAND_ARGS]
 printerctl --help
 printerctl --version
 ```
+
+The daemon executable exposes the M18 owner-aware hardware configuration
+surface and the M16 single-print protocol surface:
+
+```text
+printerctld [--socket PATH] [--port PATH] [--baud N] [--timeout MS] [--config PATH] [--help] [--version]
+```
+
+Default socket path: `/tmp/printerctl.sock`.
 
 Global options (must appear before `COMMAND`, `--option VALUE` form only,
 at most once each):

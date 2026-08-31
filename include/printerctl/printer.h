@@ -270,6 +270,9 @@ typedef enum {
 } printerctl_print_control_t;
 
 typedef printerctl_print_control_t (*printerctl_printer_control_fn)(void *context);
+typedef printerctl_print_control_t (*printerctl_printer_tx_begin_fn)(void *context);
+typedef void (*printerctl_printer_tx_end_fn)(void *context);
+typedef void (*printerctl_printer_ack_wait_fn)(void *context);
 
 /*
  * Streams the G-code file at `path`, one normalized command at a time,
@@ -307,6 +310,28 @@ printerctl_printer_status_t printerctl_printer_print_file(
     void *progress_context,
     printerctl_printer_control_fn on_control,
     void *control_context,
+    printerctl_print_summary_t *out_summary,
+    printerctl_printer_error_t *out_error);
+
+/*
+ * Variant used by print_engine to close the daemon cancellation/TX race:
+ * `on_tx_begin` authorizes exactly one command transmission and may keep
+ * a caller-owned gate locked until `on_tx_end`, which is called right
+ * after the serial write returns. `on_ack_wait` is polled while waiting
+ * for the command ACK, so cancellation can be committed before the ACK
+ * is released while preserving the one-command-in-flight rule.
+ */
+printerctl_printer_status_t printerctl_printer_print_file_controlled(
+    printerctl_printer_session_t *session,
+    const char *path,
+    printerctl_printer_progress_fn on_progress,
+    void *progress_context,
+    printerctl_printer_control_fn on_control,
+    void *control_context,
+    printerctl_printer_tx_begin_fn on_tx_begin,
+    printerctl_printer_tx_end_fn on_tx_end,
+    printerctl_printer_ack_wait_fn on_ack_wait,
+    void *tx_context,
     printerctl_print_summary_t *out_summary,
     printerctl_printer_error_t *out_error);
 

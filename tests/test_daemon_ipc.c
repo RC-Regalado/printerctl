@@ -54,6 +54,7 @@ static const char *event_type_name(printerctl_daemon_event_type_t type)
     switch (type) {
     case PRINTERCTL_DAEMON_EVENT_READY: return "READY";
     case PRINTERCTL_DAEMON_EVENT_COMMAND_COMPLETED: return "COMMAND_COMPLETED";
+    case PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE: return "PRINT_UPDATE";
     case PRINTERCTL_DAEMON_EVENT_STOPPING: return "STOPPING";
     case PRINTERCTL_DAEMON_EVENT_STOPPED: return "STOPPED";
     case PRINTERCTL_DAEMON_EVENT_FAULT: return "FAULT";
@@ -66,6 +67,7 @@ static void test_event_round_trip_all_types(void)
     static const printerctl_daemon_event_type_t types[] = {
         PRINTERCTL_DAEMON_EVENT_READY,
         PRINTERCTL_DAEMON_EVENT_COMMAND_COMPLETED,
+        PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE,
         PRINTERCTL_DAEMON_EVENT_STOPPING,
         PRINTERCTL_DAEMON_EVENT_STOPPED,
         PRINTERCTL_DAEMON_EVENT_FAULT,

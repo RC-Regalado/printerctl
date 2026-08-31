@@ -3,18 +3,17 @@
 
 #include "printerctl/daemon/ipc.h"
 #include "printerctl/daemon/worker.h"
+#include "printerctl/config.h"
 
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 /*
- * Milestone 13 control context: the future printerctld's daemon/runtime
- * lifecycle, its one print worker thread, the two internal pipes
- * connecting them, and the published runtime snapshot. This is the
- * hardware-independent foundation Milestone 16 will connect to the
- * existing print engine (include/printerctl/core/print_engine.h) --
- * M13 integrates none of that yet (Agents.md SS10, SS16).
+ * Control context for printerctld's runtime lifecycle, its one print worker
+ * thread, the two internal pipes connecting them, and the published runtime
+ * snapshot. M13 introduced the hardware-independent boundary; M16 connects
+ * worker-owned print_engine execution through that boundary.
  *
  * ## fd ownership (Agents.md SS19)
  *
@@ -93,6 +92,12 @@ typedef enum {
 typedef struct {
     printerctl_daemon_state_t daemon_state;
     printerctl_daemon_worker_state_t worker_state;
+    uint8_t execution_state;
+    uint8_t progress_percent;
+    uint32_t commands_sent;
+    uint32_t commands_acknowledged;
+    uint32_t source_position;
+    uint16_t failure_reason;
     char last_runtime_error[PRINTERCTL_DAEMON_ERROR_MAX]; /* empty when none recorded */
 } printerctl_daemon_snapshot_t;
 
@@ -167,6 +172,13 @@ printerctl_daemon_status_t printerctl_daemon_runtime_start(
     void *worker_init_context,
     printerctl_daemon_error_t *out_error);
 
+printerctl_daemon_status_t printerctl_daemon_runtime_start_with_config(
+    printerctl_daemon_runtime_t *runtime,
+    const printerctl_config_t *config,
+    printerctl_daemon_worker_init_fn worker_init_hook,
+    void *worker_init_context,
+    printerctl_daemon_error_t *out_error);
+
 /*
  * Sends a NOP command and returns immediately with the token assigned
  * to it via *out_token -- it does NOT wait for the matching
@@ -177,6 +189,42 @@ printerctl_daemon_status_t printerctl_daemon_runtime_start(
 printerctl_daemon_status_t printerctl_daemon_runtime_send_nop(
     printerctl_daemon_runtime_t *runtime,
     uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_print_start(
+    printerctl_daemon_runtime_t *runtime,
+    const char *path,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_print_pause(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_print_resume(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_print_cancel(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_print_cancel_power_failure(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_wait_command(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t token,
+    printerctl_daemon_event_t *out_event,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_drain_events(
+    printerctl_daemon_runtime_t *runtime,
     printerctl_daemon_error_t *out_error);
 
 /*

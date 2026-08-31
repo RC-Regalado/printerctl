@@ -261,25 +261,52 @@ void printerctl_config_apply_overrides(
     printerctl_config_t *config,
     const printerctl_config_overrides_t *overrides)
 {
-    if (overrides->has_port) {
+    printerctl_config_apply_overrides_for_view(config, overrides, PRINTERCTL_CONFIG_VIEW_ALL);
+}
+
+void printerctl_config_apply_overrides_for_view(
+    printerctl_config_t *config,
+    const printerctl_config_overrides_t *overrides,
+    printerctl_config_view_t view)
+{
+    bool apply_hardware =
+        view == PRINTERCTL_CONFIG_VIEW_ALL ||
+        view == PRINTERCTL_CONFIG_VIEW_DAEMON ||
+        view == PRINTERCTL_CONFIG_VIEW_LEGACY_CLI;
+    bool apply_client =
+        view == PRINTERCTL_CONFIG_VIEW_ALL ||
+        view == PRINTERCTL_CONFIG_VIEW_CLIENT ||
+        view == PRINTERCTL_CONFIG_VIEW_LEGACY_CLI;
+
+    if (apply_hardware && overrides->has_port) {
         snprintf(config->port, sizeof(config->port), "%s", overrides->port);
     }
-    if (overrides->has_baud) {
+    if (apply_hardware && overrides->has_baud) {
         config->baud = overrides->baud;
     }
-    if (overrides->has_timeout) {
+    if (apply_hardware && overrides->has_timeout) {
         config->timeout_ms = overrides->timeout_ms;
     }
-    if (overrides->has_dry_run) {
+    if (apply_client && overrides->has_dry_run) {
         config->dry_run = overrides->dry_run;
     }
-    if (overrides->has_verbose) {
+    if (apply_client && overrides->has_verbose) {
         config->verbose = overrides->verbose;
     }
 }
 
 printerctl_config_status_t printerctl_config_resolve(
     const printerctl_config_overrides_t *cli_overrides,
+    printerctl_config_t *out_config,
+    printerctl_config_error_t *out_error)
+{
+    return printerctl_config_resolve_for_view(
+        cli_overrides, PRINTERCTL_CONFIG_VIEW_ALL, out_config, out_error);
+}
+
+printerctl_config_status_t printerctl_config_resolve_for_view(
+    const printerctl_config_overrides_t *cli_overrides,
+    printerctl_config_view_t view,
     printerctl_config_t *out_config,
     printerctl_config_error_t *out_error)
 {
@@ -296,9 +323,9 @@ printerctl_config_status_t printerctl_config_resolve(
             return status;
         }
 
-        printerctl_config_apply_overrides(out_config, &file_overrides);
+        printerctl_config_apply_overrides_for_view(out_config, &file_overrides, view);
     }
 
-    printerctl_config_apply_overrides(out_config, cli_overrides);
+    printerctl_config_apply_overrides_for_view(out_config, cli_overrides, view);
     return PRINTERCTL_CONFIG_OK;
 }

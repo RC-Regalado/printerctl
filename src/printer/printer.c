@@ -38,6 +38,98 @@ static void log_detail(printerctl_logger_t *logger,
     }
 }
 
+static printerctl_printer_status_t map_serial_write_status(
+    printerctl_serial_status_t serial_status)
+{
+    switch (serial_status) {
+    case PRINTERCTL_SERIAL_ERR_INVALID_ARGUMENT:
+        return PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT;
+    case PRINTERCTL_SERIAL_ERR_TIMEOUT:
+        return PRINTERCTL_PRINTER_ERR_TIMEOUT;
+    default:
+        return PRINTERCTL_PRINTER_ERR_SERIAL;
+    }
+}
+
+static printerctl_printer_status_t write_command_line(
+    printerctl_printer_session_t *session,
+    const char *command,
+    printerctl_printer_error_t *out_error)
+{
+    printerctl_serial_error_t serial_error;
+    printerctl_serial_status_t serial_status =
+        printerctl_serial_write_line(&session->port, command, &serial_error);
+    if (serial_status != PRINTERCTL_SERIAL_OK) {
+        printerctl_printer_status_t status = map_serial_write_status(serial_status);
+        set_error(out_error, status, "%s", serial_error.message);
+        return out_error->status;
+    }
+
+    log_detail(session->logger, printerctl_log_serial_tx, command);
+    return PRINTERCTL_PRINTER_OK;
+}
+
+static printerctl_printer_status_t wait_for_terminal_response(
+    printerctl_printer_session_t *session,
+    printerctl_printer_line_fn on_line,
+    void *context,
+    printerctl_serial_wait_hook_fn on_wait,
+    void *wait_context,
+    printerctl_printer_error_t *out_error)
+{
+    for (;;) {
+        char line[PRINTERCTL_PRINTER_LINE_MAX];
+        printerctl_serial_error_t serial_error;
+        printerctl_serial_status_t serial_status = printerctl_serial_read_line_with_hook(
+            &session->port, line, sizeof(line), on_wait, wait_context, &serial_error);
+        if (serial_status != PRINTERCTL_SERIAL_OK) {
+            printerctl_printer_status_t status =
+                serial_status == PRINTERCTL_SERIAL_ERR_TIMEOUT
+                    ? PRINTERCTL_PRINTER_ERR_TIMEOUT
+                    : PRINTERCTL_PRINTER_ERR_SERIAL;
+            set_error(out_error, status, "%s", serial_error.message);
+            log_detail(session->logger, printerctl_log_error,
+                       status == PRINTERCTL_PRINTER_ERR_TIMEOUT
+                           ? "response timeout"
+                           : "serial failure while waiting for a response");
+            return out_error->status;
+        }
+
+        log_detail(session->logger, printerctl_log_serial_rx, line);
+
+        if (on_line != NULL) {
+            on_line(line, context);
+        }
+
+        printerctl_marlin_response_t response;
+        if (printerctl_marlin_classify(line, &response) != PRINTERCTL_MARLIN_OK) {
+            set_error(out_error, PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE,
+                      "internal error classifying a response line");
+            return out_error->status;
+        }
+
+        if (!response.terminal) {
+            continue;
+        }
+
+        switch (response.type) {
+        case PRINTERCTL_MARLIN_RESPONSE_ACK:
+            return PRINTERCTL_PRINTER_OK;
+        case PRINTERCTL_MARLIN_RESPONSE_ERROR:
+            set_error(out_error, PRINTERCTL_PRINTER_ERR_PRINTER_ERROR,
+                      "printer reported an error: %s", response.payload);
+            log_detail(session->logger, printerctl_log_error, "printer reported an error");
+            return out_error->status;
+        case PRINTERCTL_MARLIN_RESPONSE_RESEND:
+        default:
+            set_error(out_error, PRINTERCTL_PRINTER_ERR_RESEND,
+                      "printer requested a resend, which is not supported");
+            log_detail(session->logger, printerctl_log_error, "printer requested a resend");
+            return out_error->status;
+        }
+    }
+}
+
 printerctl_printer_status_t printerctl_printer_connect(
     printerctl_printer_session_t *session,
     const printerctl_config_t *config,
@@ -122,78 +214,11 @@ printerctl_printer_status_t printerctl_printer_execute(
         return out_error->status;
     }
 
-    printerctl_serial_error_t serial_error;
-    printerctl_serial_status_t serial_status =
-        printerctl_serial_write_line(&session->port, command, &serial_error);
-    if (serial_status != PRINTERCTL_SERIAL_OK) {
-        printerctl_printer_status_t status;
-        switch (serial_status) {
-        case PRINTERCTL_SERIAL_ERR_INVALID_ARGUMENT:
-            status = PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT;
-            break;
-        case PRINTERCTL_SERIAL_ERR_TIMEOUT:
-            status = PRINTERCTL_PRINTER_ERR_TIMEOUT;
-            break;
-        default:
-            status = PRINTERCTL_PRINTER_ERR_SERIAL;
-            break;
-        }
-        set_error(out_error, status, "%s", serial_error.message);
-        return out_error->status;
+    printerctl_printer_status_t status = write_command_line(session, command, out_error);
+    if (status != PRINTERCTL_PRINTER_OK) {
+        return status;
     }
-
-    log_detail(session->logger, printerctl_log_serial_tx, command);
-
-    for (;;) {
-        char line[PRINTERCTL_PRINTER_LINE_MAX];
-        serial_status = printerctl_serial_read_line(&session->port, line, sizeof(line),
-                                                     &serial_error);
-        if (serial_status != PRINTERCTL_SERIAL_OK) {
-            printerctl_printer_status_t status =
-                serial_status == PRINTERCTL_SERIAL_ERR_TIMEOUT
-                    ? PRINTERCTL_PRINTER_ERR_TIMEOUT
-                    : PRINTERCTL_PRINTER_ERR_SERIAL;
-            set_error(out_error, status, "%s", serial_error.message);
-            log_detail(session->logger, printerctl_log_error,
-                        status == PRINTERCTL_PRINTER_ERR_TIMEOUT
-                            ? "response timeout"
-                            : "serial failure while waiting for a response");
-            return out_error->status;
-        }
-
-        log_detail(session->logger, printerctl_log_serial_rx, line);
-
-        if (on_line != NULL) {
-            on_line(line, context);
-        }
-
-        printerctl_marlin_response_t response;
-        if (printerctl_marlin_classify(line, &response) != PRINTERCTL_MARLIN_OK) {
-            set_error(out_error, PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE,
-                       "internal error classifying a response line");
-            return out_error->status;
-        }
-
-        if (!response.terminal) {
-            continue;
-        }
-
-        switch (response.type) {
-        case PRINTERCTL_MARLIN_RESPONSE_ACK:
-            return PRINTERCTL_PRINTER_OK;
-        case PRINTERCTL_MARLIN_RESPONSE_ERROR:
-            set_error(out_error, PRINTERCTL_PRINTER_ERR_PRINTER_ERROR,
-                       "printer reported an error: %s", response.payload);
-            log_detail(session->logger, printerctl_log_error, "printer reported an error");
-            return out_error->status;
-        case PRINTERCTL_MARLIN_RESPONSE_RESEND:
-        default:
-            set_error(out_error, PRINTERCTL_PRINTER_ERR_RESEND,
-                       "printer requested a resend, which is not supported");
-            log_detail(session->logger, printerctl_log_error, "printer requested a resend");
-            return out_error->status;
-        }
-    }
+    return wait_for_terminal_response(session, on_line, context, NULL, NULL, out_error);
 }
 
 /* Shared shape of the three typed queries: probe every response line with a marlin parser. */
@@ -475,13 +500,17 @@ static void log_print_end(printerctl_logger_t *logger,
     log_detail(logger, printerctl_log_state_transition, detail);
 }
 
-printerctl_printer_status_t printerctl_printer_print_file(
+printerctl_printer_status_t printerctl_printer_print_file_controlled(
     printerctl_printer_session_t *session,
     const char *path,
     printerctl_printer_progress_fn on_progress,
     void *progress_context,
     printerctl_printer_control_fn on_control,
     void *control_context,
+    printerctl_printer_tx_begin_fn on_tx_begin,
+    printerctl_printer_tx_end_fn on_tx_end,
+    printerctl_printer_ack_wait_fn on_ack_wait,
+    void *tx_context,
     printerctl_print_summary_t *out_summary,
     printerctl_printer_error_t *out_error)
 {
@@ -591,9 +620,38 @@ printerctl_printer_status_t printerctl_printer_print_file(
             break;
         }
 
+        bool tx_authorized = false;
+        if (on_tx_begin != NULL) {
+            printerctl_print_control_t control = on_tx_begin(tx_context);
+            if (control == PRINTERCTL_PRINT_CONTROL_CANCEL) {
+                set_error(out_error, PRINTERCTL_PRINTER_CANCELLED,
+                          "print cancelled by the operator");
+                status = PRINTERCTL_PRINTER_CANCELLED;
+                break;
+            }
+            if (control == PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE) {
+                set_error(out_error, PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE,
+                          "print cancelled: external power-failure/low-battery signal");
+                status = PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE;
+                break;
+            }
+            tx_authorized = true;
+        }
+
         printerctl_printer_status_t exchange_status =
-            printerctl_printer_execute(session, result.command, NULL, NULL, out_error);
+            write_command_line(session, result.command, out_error);
+        if (tx_authorized && on_tx_end != NULL) {
+            on_tx_end(tx_context);
+        }
         out_summary->commands_sent++;
+        if (exchange_status != PRINTERCTL_PRINTER_OK) {
+            status = exchange_status;
+            break;
+        }
+
+        exchange_status = wait_for_terminal_response(
+            session, NULL, NULL, (printerctl_serial_wait_hook_fn)on_ack_wait, tx_context,
+            out_error);
         if (exchange_status != PRINTERCTL_PRINTER_OK) {
             status = exchange_status;
             break;
@@ -649,6 +707,21 @@ printerctl_printer_status_t printerctl_printer_print_file(
 
     log_print_end(session->logger, out_summary, "print_completed");
     return PRINTERCTL_PRINTER_OK;
+}
+
+printerctl_printer_status_t printerctl_printer_print_file(
+    printerctl_printer_session_t *session,
+    const char *path,
+    printerctl_printer_progress_fn on_progress,
+    void *progress_context,
+    printerctl_printer_control_fn on_control,
+    void *control_context,
+    printerctl_print_summary_t *out_summary,
+    printerctl_printer_error_t *out_error)
+{
+    return printerctl_printer_print_file_controlled(session, path, on_progress, progress_context,
+                                                    on_control, control_context, NULL, NULL,
+                                                    NULL, NULL, out_summary, out_error);
 }
 
 printerctl_printer_status_t printerctl_printer_disconnect(

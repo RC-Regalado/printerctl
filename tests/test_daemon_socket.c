@@ -6,7 +6,9 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +31,11 @@ typedef struct {
     printerctl_daemon_socket_status_t status;
     printerctl_daemon_socket_error_t error;
 } serve_thread_t;
+
+typedef struct {
+    int master;
+    printerctl_config_t config;
+} mock_printer_t;
 
 static void *serve_one_thread(void *arg)
 {
@@ -142,15 +149,169 @@ static void start_runtime_and_socket(printerctl_daemon_runtime_t *runtime,
                                      printerctl_daemon_socket_server_t *server,
                                      const char *path)
 {
+    printerctl_config_t config;
+    printerctl_config_set_defaults(&config);
     printerctl_daemon_error_t runtime_error;
-    check(printerctl_daemon_runtime_start(runtime, NULL, NULL, &runtime_error) ==
-              PRINTERCTL_DAEMON_OK,
+    check(printerctl_daemon_runtime_start_with_config(runtime, &config, NULL, NULL,
+                                                      &runtime_error) == PRINTERCTL_DAEMON_OK,
           "runtime starts");
 
     printerctl_daemon_socket_error_t socket_error;
     check(printerctl_daemon_socket_listen(server, path, runtime, &socket_error) ==
               PRINTERCTL_DAEMON_SOCKET_OK,
           "socket listens");
+}
+
+static void start_runtime_and_socket_with_config(printerctl_daemon_runtime_t *runtime,
+                                                 printerctl_daemon_socket_server_t *server,
+                                                 const char *path,
+                                                 const printerctl_config_t *config)
+{
+    printerctl_daemon_error_t runtime_error;
+    check(printerctl_daemon_runtime_start_with_config(runtime, config, NULL, NULL,
+                                                      &runtime_error) == PRINTERCTL_DAEMON_OK,
+          "runtime starts");
+
+    printerctl_daemon_socket_error_t socket_error;
+    check(printerctl_daemon_socket_listen(server, path, runtime, &socket_error) ==
+              PRINTERCTL_DAEMON_SOCKET_OK,
+          "socket listens");
+}
+
+static void mock_open(mock_printer_t *mock)
+{
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    check(master >= 0 && grantpt(master) == 0 && unlockpt(master) == 0, "create pty");
+    const char *name = ptsname(master);
+    check(name != NULL, "ptsname");
+    mock->master = master;
+    printerctl_config_set_defaults(&mock->config);
+    snprintf(mock->config.port, sizeof(mock->config.port), "%s", name);
+    mock->config.timeout_ms = 1000;
+}
+
+static void mock_close(mock_printer_t *mock)
+{
+    close(mock->master);
+}
+
+static void mock_reply_ok(mock_printer_t *mock)
+{
+    check(write(mock->master, "ok\n", 3) == 3, "mock writes ok");
+}
+
+static void mock_expect_command(mock_printer_t *mock, const char *expected)
+{
+    char buffer[128];
+    size_t received = 0;
+    while (received < sizeof(buffer) - 1) {
+        struct pollfd pfd;
+        pfd.fd = mock->master;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        check(poll(&pfd, 1, 1000) > 0, "printer received command");
+        ssize_t n = read(mock->master, buffer + received, sizeof(buffer) - 1 - received);
+        check(n > 0, "read printer command");
+        received += (size_t)n;
+        buffer[received] = '\0';
+        if (strchr(buffer, '\n') != NULL) {
+            break;
+        }
+    }
+    check(strcmp(buffer, expected) == 0, "printer command matches expected");
+}
+
+static void write_gcode_file(char *path, size_t path_size, const char *contents)
+{
+    snprintf(path, path_size, "/tmp/printerctl-socket-print-XXXXXX");
+    int fd = mkstemp(path);
+    check(fd >= 0, "mkstemp");
+    size_t length = strlen(contents);
+    check(write(fd, contents, length) == (ssize_t)length, "write gcode");
+    close(fd);
+}
+
+static void send_print_start(int client, uint32_t request_id, const char *gcode_path)
+{
+    uint8_t payload[PRINTERCTL_PLP1_PRINT_START_PATH_MAX + 2];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    check(printerctl_plp1_encode_print_start_request(gcode_path, payload, sizeof(payload),
+                                                     &payload_length, &plp_error) ==
+              PRINTERCTL_PLP1_OK,
+          "encode PRINT_START payload");
+
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_PRINT_START, request_id, payload,
+                                           (uint16_t)payload_length, request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+static printerctl_plp1_frame_t read_response_frame(int client, uint8_t expected_type,
+                                                   uint32_t expected_request_id)
+{
+    uint8_t response[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t response_length = read_frame(client, response, sizeof(response));
+    printerctl_plp1_frame_t decoded;
+    decode_response(response, response_length, &decoded);
+    check(decoded.message_type == expected_type, "response type matches request");
+    check(decoded.request_id == expected_request_id, "response id matches request");
+    return decoded;
+}
+
+static void send_status_request(int client, uint32_t request_id, uint32_t fields)
+{
+    uint8_t payload[8];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    check(printerctl_plp1_encode_status_request(fields, payload, sizeof(payload),
+                                                &payload_length, &plp_error) ==
+              PRINTERCTL_PLP1_OK,
+          "encode STATUS payload");
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_STATUS, request_id, payload,
+                                           (uint16_t)payload_length, request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+static void send_empty_request(int client, uint8_t type, uint32_t request_id)
+{
+    uint8_t request[PRINTERCTL_PLP1_HEADER_SIZE];
+    size_t request_length = encode_request(type, request_id, NULL, 0, request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+static printerctl_plp1_status_response_t read_status_response(int client, uint32_t request_id)
+{
+    uint8_t response[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t response_length = read_frame(client, response, sizeof(response));
+    printerctl_plp1_frame_t decoded;
+    decode_response(response, response_length, &decoded);
+    check(decoded.message_type == PRINTERCTL_PLP1_MSG_STATUS, "STATUS response type");
+    check(decoded.request_id == request_id, "STATUS response id");
+    check(decoded.status == PRINTERCTL_PLP1_SUCCESS, "STATUS succeeds");
+
+    printerctl_plp1_status_response_t status;
+    printerctl_plp1_error_t plp_error;
+    check(printerctl_plp1_decode_status_response(decoded.payload, decoded.payload_length, &status,
+                                                 &plp_error) == PRINTERCTL_PLP1_OK,
+          "decode STATUS response");
+    return status;
+}
+
+static void wait_until_execution(printerctl_daemon_runtime_t *runtime, uint8_t state)
+{
+    printerctl_daemon_error_t error;
+    for (;;) {
+        printerctl_daemon_event_t event;
+        check(printerctl_daemon_runtime_wait_event(runtime, &event, &error) == PRINTERCTL_DAEMON_OK,
+              "wait print event");
+        printerctl_daemon_snapshot_t snapshot;
+        printerctl_daemon_runtime_snapshot(runtime, &snapshot);
+        if (snapshot.execution_state == state) {
+            return;
+        }
+    }
 }
 
 static void stop_runtime_and_socket(printerctl_daemon_runtime_t *runtime,
@@ -265,8 +426,9 @@ static void test_version_and_status_coalesced(void)
                                                   &plp_error) == PRINTERCTL_PLP1_OK,
           "decode VERSION payload");
     check(version.protocol_version == PRINTERCTL_PLP1_VERSION_1, "VERSION protocol");
-    check(version.capability_bitmap == PRINTERCTL_PLP1_CAP_PRINTER_STATUS,
-          "VERSION exposes only M15 status capability");
+    check(version.capability_bitmap ==
+              (PRINTERCTL_PLP1_CAP_PRINTER_STATUS | PRINTERCTL_PLP1_CAP_PRINT_CONTROL),
+          "VERSION exposes M16 status and print-control capabilities");
 
     response_length = read_frame(client, response, sizeof(response));
     decode_response(response, response_length, &decoded);
@@ -277,8 +439,9 @@ static void test_version_and_status_coalesced(void)
                                                  &plp_error) == PRINTERCTL_PLP1_OK,
           "decode STATUS payload");
     check(status.present_fields == (PRINTERCTL_PLP1_STATUS_FIELD_DAEMON_STATE |
-                                    PRINTERCTL_PLP1_STATUS_FIELD_WORKER_STATE),
-          "STATUS omits unsupported requested fields");
+                                    PRINTERCTL_PLP1_STATUS_FIELD_WORKER_STATE |
+                                    PRINTERCTL_PLP1_STATUS_FIELD_PROGRESS),
+          "STATUS reports M16 runtime and execution fields");
     check(status.daemon_state == PRINTERCTL_PLP1_DAEMON_STATE_RUNNING, "daemon state running");
     check(status.worker_state == PRINTERCTL_PLP1_WORKER_STATE_READY, "worker state ready");
 
@@ -421,6 +584,271 @@ static void test_malformed_client_does_not_kill_server(void)
     cleanup_temp_socket(path, dir);
 }
 
+static void test_print_start_over_socket_survives_client_disconnect(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nM114\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+
+    printerctl_daemon_runtime_t runtime;
+    printerctl_daemon_socket_server_t server;
+    start_runtime_and_socket_with_config(&runtime, &server, socket_path, &mock.config);
+
+    serve_thread_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.server = &server;
+    pthread_t thread;
+    check(pthread_create(&thread, NULL, serve_one_thread, &ctx) == 0, "serve thread starts");
+
+    int client = connect_client(socket_path);
+    send_print_start(client, 55, gcode_path);
+    printerctl_plp1_frame_t decoded =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_START, 55);
+    check(decoded.message_type == PRINTERCTL_PLP1_MSG_PRINT_START, "PRINT_START response type");
+    check(decoded.request_id == 55, "PRINT_START response id");
+    check(decoded.status == PRINTERCTL_PLP1_SUCCESS, "PRINT_START accepted");
+
+    shutdown(client, SHUT_WR);
+    check(pthread_join(thread, NULL) == 0, "serve thread joins");
+    check(ctx.status == PRINTERCTL_DAEMON_SOCKET_OK, "serve_one succeeds");
+    close(client);
+
+    mock_expect_command(&mock, "M105\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "M114\n");
+    mock_reply_ok(&mock);
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
+
+    stop_runtime_and_socket(&runtime, &server);
+    mock_close(&mock);
+    unlink(gcode_path);
+    cleanup_temp_socket(socket_path, dir);
+}
+
+static void test_second_client_observes_active_print_after_start_disconnect(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nM114\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+
+    printerctl_daemon_runtime_t runtime;
+    printerctl_daemon_socket_server_t server;
+    start_runtime_and_socket_with_config(&runtime, &server, socket_path, &mock.config);
+
+    serve_thread_t start_ctx;
+    memset(&start_ctx, 0, sizeof(start_ctx));
+    start_ctx.server = &server;
+    pthread_t start_thread;
+    check(pthread_create(&start_thread, NULL, serve_one_thread, &start_ctx) == 0,
+          "START serve thread starts");
+
+    int client_a = connect_client(socket_path);
+    send_print_start(client_a, 56, gcode_path);
+    printerctl_plp1_frame_t start_response =
+        read_response_frame(client_a, PRINTERCTL_PLP1_MSG_PRINT_START, 56);
+    check(start_response.status == PRINTERCTL_PLP1_SUCCESS, "client A START accepted");
+
+    shutdown(client_a, SHUT_WR);
+    check(pthread_join(start_thread, NULL) == 0, "START serve thread joins");
+    check(start_ctx.status == PRINTERCTL_DAEMON_SOCKET_OK, "START serve succeeds");
+    close(client_a);
+
+    mock_expect_command(&mock, "M105\n");
+
+    serve_thread_t status_ctx;
+    memset(&status_ctx, 0, sizeof(status_ctx));
+    status_ctx.server = &server;
+    pthread_t status_thread;
+    check(pthread_create(&status_thread, NULL, serve_one_thread, &status_ctx) == 0,
+          "STATUS serve thread starts");
+
+    int client_b = connect_client(socket_path);
+    send_status_request(client_b, 57, PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE);
+    printerctl_plp1_status_response_t status = read_status_response(client_b, 57);
+    check((status.present_fields & PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE) != 0,
+          "STATUS includes execution state");
+    check(status.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING,
+          "client B sees daemon-owned active execution");
+
+    shutdown(client_b, SHUT_WR);
+    check(pthread_join(status_thread, NULL) == 0, "STATUS serve thread joins");
+    check(status_ctx.status == PRINTERCTL_DAEMON_SOCKET_OK, "STATUS serve succeeds");
+    close(client_b);
+
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "M114\n");
+    mock_reply_ok(&mock);
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
+
+    stop_runtime_and_socket(&runtime, &server);
+    mock_close(&mock);
+    unlink(gcode_path);
+    cleanup_temp_socket(socket_path, dir);
+}
+
+static uint16_t run_print_start_status_case(const char *gcode_path,
+                                            const printerctl_config_t *config)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+
+    printerctl_daemon_runtime_t runtime;
+    printerctl_daemon_socket_server_t server;
+    start_runtime_and_socket_with_config(&runtime, &server, socket_path, config);
+
+    serve_thread_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.server = &server;
+    pthread_t thread;
+    check(pthread_create(&thread, NULL, serve_one_thread, &ctx) == 0, "serve thread starts");
+
+    int client = connect_client(socket_path);
+    send_print_start(client, 60, gcode_path);
+    printerctl_plp1_frame_t response =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_START, 60);
+    uint16_t status = response.status;
+
+    shutdown(client, SHUT_WR);
+    check(pthread_join(thread, NULL) == 0, "serve thread joins");
+    check(ctx.status == PRINTERCTL_DAEMON_SOCKET_OK, "serve_one succeeds");
+    close(client);
+
+    stop_runtime_and_socket(&runtime, &server);
+    cleanup_temp_socket(socket_path, dir);
+    return status;
+}
+
+static void test_print_start_error_mapping_over_socket(void)
+{
+    printerctl_config_t config;
+    printerctl_config_set_defaults(&config);
+
+    uint16_t missing = run_print_start_status_case("/tmp/printerctl-missing-source.gcode", &config);
+    check(missing == PRINTERCTL_PLP1_FILE_NOT_FOUND, "missing source maps to FILE_NOT_FOUND");
+
+    char unreadable_path[128];
+    write_gcode_file(unreadable_path, sizeof(unreadable_path), "M105\n");
+    check(chmod(unreadable_path, 0000) == 0, "make source unreadable");
+    uint16_t unreadable = run_print_start_status_case(unreadable_path, &config);
+    check(unreadable == PRINTERCTL_PLP1_FILE_NOT_READABLE,
+          "unreadable source maps to FILE_NOT_READABLE");
+    chmod(unreadable_path, 0600);
+    unlink(unreadable_path);
+
+    char serial_path[128];
+    write_gcode_file(serial_path, sizeof(serial_path), "M105\n");
+    snprintf(config.port, sizeof(config.port), "/tmp/printerctl-missing-serial");
+    uint16_t serial = run_print_start_status_case(serial_path, &config);
+    check(serial == PRINTERCTL_PLP1_SERIAL_ERROR, "serial startup failure maps to SERIAL_ERROR");
+    unlink(serial_path);
+}
+
+static void test_worker_unavailable_maps_to_plp_status(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\n");
+
+    printerctl_daemon_runtime_t runtime;
+    printerctl_daemon_socket_server_t server;
+    start_runtime_and_socket(&runtime, &server, socket_path);
+    close(runtime.cmd_pipe[1]);
+    runtime.cmd_pipe[1] = -1;
+
+    serve_thread_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.server = &server;
+    pthread_t thread;
+    check(pthread_create(&thread, NULL, serve_one_thread, &ctx) == 0, "serve thread starts");
+
+    int client = connect_client(socket_path);
+    send_print_start(client, 61, gcode_path);
+    printerctl_plp1_frame_t response =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_START, 61);
+    check(response.status == PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+          "worker command failure maps to WORKER_UNAVAILABLE");
+
+    shutdown(client, SHUT_WR);
+    check(pthread_join(thread, NULL) == 0, "serve thread joins");
+    close(client);
+
+    printerctl_daemon_socket_close(&server);
+    printerctl_daemon_error_t runtime_error;
+    (void)printerctl_daemon_runtime_shutdown(&runtime, &runtime_error);
+    unlink(gcode_path);
+    cleanup_temp_socket(socket_path, dir);
+}
+
+static void test_second_print_start_maps_to_busy_over_socket(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nM114\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+
+    printerctl_daemon_runtime_t runtime;
+    printerctl_daemon_socket_server_t server;
+    start_runtime_and_socket_with_config(&runtime, &server, socket_path, &mock.config);
+
+    serve_thread_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.server = &server;
+    pthread_t thread;
+    check(pthread_create(&thread, NULL, serve_one_thread, &ctx) == 0, "serve thread starts");
+
+    int client = connect_client(socket_path);
+    send_print_start(client, 62, gcode_path);
+    printerctl_plp1_frame_t first =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_START, 62);
+    check(first.status == PRINTERCTL_PLP1_SUCCESS, "first PRINT_START accepted");
+    mock_expect_command(&mock, "M105\n");
+
+    send_empty_request(client, PRINTERCTL_PLP1_MSG_PRINT_PAUSE, 63);
+    mock_reply_ok(&mock);
+    printerctl_plp1_frame_t pause =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_PAUSE, 63);
+    check(pause.status == PRINTERCTL_PLP1_SUCCESS, "PAUSE accepted before second START");
+
+    send_print_start(client, 64, gcode_path);
+    printerctl_plp1_frame_t second =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_START, 64);
+    check(second.status == PRINTERCTL_PLP1_BUSY, "active execution maps second START to BUSY");
+
+    send_empty_request(client, PRINTERCTL_PLP1_MSG_PRINT_RESUME, 65);
+    printerctl_plp1_frame_t resume =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_RESUME, 65);
+    check(resume.status == PRINTERCTL_PLP1_SUCCESS, "RESUME accepted after BUSY check");
+    mock_expect_command(&mock, "M114\n");
+    mock_reply_ok(&mock);
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
+
+    shutdown(client, SHUT_WR);
+    check(pthread_join(thread, NULL) == 0, "serve thread joins");
+    close(client);
+
+    stop_runtime_and_socket(&runtime, &server);
+    mock_close(&mock);
+    unlink(gcode_path);
+    cleanup_temp_socket(socket_path, dir);
+}
+
 int main(void)
 {
     test_ping_fragmented();
@@ -429,5 +857,10 @@ int main(void)
     test_stale_socket_replaced();
     test_live_socket_not_unlinked();
     test_malformed_client_does_not_kill_server();
+    test_print_start_over_socket_survives_client_disconnect();
+    test_second_client_observes_active_print_after_start_disconnect();
+    test_print_start_error_mapping_over_socket();
+    test_worker_unavailable_maps_to_plp_status();
+    test_second_print_start_maps_to_busy_over_socket();
     return 0;
 }

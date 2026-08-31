@@ -28,13 +28,12 @@
  * full-length read whose wire_size/type/result do not match what this
  * header defines is PRINTERCTL_DAEMON_IPC_ERR_MALFORMED.
  *
- * Neither envelope carries a payload yet: NOP/SHUTDOWN and the M13
- * worker events need none. A later milestone (M16, once PRINT_START
- * needs to carry a G-code path into the worker) can add a bounded
- * payload field to printerctl_daemon_command_t without redesigning this
- * envelope -- wire_size already exists precisely so a new field is a
- * detectable, versioned-in-place change rather than a silent ABI shift.
+ * M16 adds a bounded path payload for PRINT_START and print-visibility
+ * fields for PRINT_UPDATE events. This remains process-internal IPC,
+ * not the external PLP/1 wire contract.
  */
+
+#define PRINTERCTL_DAEMON_COMMAND_PATH_MAX 4096
 
 /* M13 defines only the two commands needed to validate the runtime:
  * NOP proves a correlated round-trip; SHUTDOWN drives the lifecycle.
@@ -42,7 +41,12 @@
  * but must not be implemented here (no premature behavior). */
 typedef enum {
     PRINTERCTL_DAEMON_CMD_NOP = 0,
-    PRINTERCTL_DAEMON_CMD_SHUTDOWN
+    PRINTERCTL_DAEMON_CMD_SHUTDOWN,
+    PRINTERCTL_DAEMON_CMD_PRINT_START,
+    PRINTERCTL_DAEMON_CMD_PRINT_PAUSE,
+    PRINTERCTL_DAEMON_CMD_PRINT_RESUME,
+    PRINTERCTL_DAEMON_CMD_PRINT_CANCEL,
+    PRINTERCTL_DAEMON_CMD_PRINT_CANCEL_POWER_FAILURE
 } printerctl_daemon_command_type_t;
 
 typedef struct {
@@ -50,11 +54,13 @@ typedef struct {
     printerctl_daemon_command_type_t type;
     uint32_t token;     /* internal correlation token; 0 is never assigned by the
                           * control context (see runtime.h) */
+    char path[PRINTERCTL_DAEMON_COMMAND_PATH_MAX]; /* PRINT_START only */
 } printerctl_daemon_command_t;
 
 typedef enum {
     PRINTERCTL_DAEMON_EVENT_READY = 0,
     PRINTERCTL_DAEMON_EVENT_COMMAND_COMPLETED,
+    PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE,
     PRINTERCTL_DAEMON_EVENT_STOPPING,
     PRINTERCTL_DAEMON_EVENT_STOPPED,
     PRINTERCTL_DAEMON_EVENT_FAULT
@@ -74,7 +80,14 @@ typedef struct {
                           * READY/STOPPING/STOPPED and for a FAULT not tied to
                           * one specific command */
     printerctl_daemon_result_t result;
-    char detail[PRINTERCTL_DAEMON_EVENT_DETAIL_MAX]; /* empty unless FAULT */
+    uint8_t execution_state;
+    uint8_t progress_percent;
+    uint32_t commands_sent;
+    uint32_t commands_acknowledged;
+    uint32_t source_position;
+    uint16_t failure_reason;
+    uint16_t wire_status; /* COMMAND_COMPLETED error status; 0 on success/unused */
+    char detail[PRINTERCTL_DAEMON_EVENT_DETAIL_MAX]; /* optional diagnostic text */
 } printerctl_daemon_event_t;
 
 typedef enum {

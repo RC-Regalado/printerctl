@@ -1232,8 +1232,11 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
 
     printerctl_config_t config;
     printerctl_config_error_t config_error;
-    printerctl_config_status_t status =
-        printerctl_config_resolve(&request.overrides, &config, &config_error);
+    /* M18: direct serial CLI commands are a transitional legacy path.
+     * Migrated PLP commands must switch to the client view and stop
+     * consuming port/baud/timeout; this compatibility view is removed in M25. */
+    printerctl_config_status_t status = printerctl_config_resolve_for_view(
+        &request.overrides, PRINTERCTL_CONFIG_VIEW_LEGACY_CLI, &config, &config_error);
     if (status != PRINTERCTL_CONFIG_OK) {
         fprintf(err, "printerctl: configuration error: %s\n", config_error.message);
         /* config_error.message may embed --config's path; the structured log

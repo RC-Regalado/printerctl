@@ -19,7 +19,8 @@ by the M13 control context. The implementation accepts local
 `AF_UNIX`/`SOCK_STREAM` clients, parses arbitrary byte streams with the
 incremental PLP/1 parser, and responds to the hardware-independent
 commands required for this milestone: `PING`, `VERSION` and idle
-`STATUS`.
+`STATUS`. The `printerctld` executable wraps that transport in a minimal
+process with `--socket`, `--help` and `--version`.
 
 The transport is deliberately sequential, not multi-client concurrent.
 That satisfies M15's required sequential-client behavior while avoiding a
@@ -30,9 +31,12 @@ second thread/dispatch model before M16 introduces real print ownership.
 - `include/printerctl/daemon/socket.h` — new public M15 transport API.
 - `src/daemon/socket.c` — socket lifecycle, stale/live path detection,
   PLP/1 dispatch, response writes, client lifecycle handling.
+- `src/printerctld_main.c` — minimal daemon process wrapper.
 - `tests/test_daemon_socket.c` — real `AF_UNIX` integration tests.
+- `tests/test_printerctld.c` — process smoke test for `printerctld`.
 - `CMakeLists.txt` — new `printerctl_daemon_socket` library.
-- `tests/CMakeLists.txt` — new `printerctl_daemon_socket_tests` target.
+- `tests/CMakeLists.txt` — new `printerctl_daemon_socket_tests` and
+  `printerctld_tests` targets.
 - `docs/design/milestone-15-unix-socket-transport.md` — design/as-built.
 - `docs/milestones/milestone-15.md` — this milestone report.
 - `docs/roadmap.md`, `docs/architecture.md`, `README.md` — status updates.
@@ -53,6 +57,8 @@ No lower layer was modified for M15: `core`, `printer`, `serial`,
 - live socket rejection without unlinking the active path;
 - malformed oversized stream containment followed by a successful next
   client.
+- `printerctld` process startup, PLP/1 `PING` over the configured socket,
+  and clean `SIGTERM` shutdown.
 
 ## Decisions taken
 
@@ -63,6 +69,7 @@ No lower layer was modified for M15: `core`, `printer`, `serial`,
 - Simultaneous clients are not supported in M15. Add concurrency only
   when a later milestone has a concrete owner/dispatch requirement.
 - STATUS does not fabricate progress, execution state or printer data.
+- Default `printerctld` socket path is `/tmp/printerctl.sock`.
 
 ## Risks found
 
@@ -83,9 +90,10 @@ No lower layer was modified for M15: `core`, `printer`, `serial`,
   `cmake -S . -B build-m15-tsan -DCMAKE_C_COMPILER=clang -DCMAKE_C_FLAGS='-fsanitize=thread -g'`
   + `printerctl_daemon_runtime_tests` and `printerctl_daemon_socket_tests`
 
-Result: 15/15 tests passed, including the new Unix socket integration
-suite. ASan/UBSan passed 15/15. TSan passed 2/2 on the runtime/socket
-targets, with no reported races.
+Result: 16/16 tests passed, including the Unix socket integration suite
+and the `printerctld` process smoke test. ASan/UBSan passed 16/16.
+TSan passed 3/3 on the runtime/socket/process targets, with no reported
+races.
 
 ## Next steps
 

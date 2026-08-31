@@ -784,7 +784,7 @@ leaves at the conceptual level, both explained in the design doc:
   design doc §2 for why the naive "each side closes what it doesn't
   use" pattern is unsafe here.
 
-M14-M17 remain exactly as described above: not implemented.
+M14-M17 implementation status is recorded below.
 
 ## 22. Milestone 14 implementation status
 
@@ -805,7 +805,7 @@ new CMake targets (`printerctl_protocol_plp1`,
 shows only standard C headers and the module's own headers — no socket,
 no `daemon/`, no `core/`.
 
-M16-M17 remain exactly as §§12-19 describe: not implemented.
+M17 implementation status is recorded in §25.
 
 ## 23. Milestone 15 implementation status
 
@@ -819,7 +819,8 @@ for the full as-built report.
 the control-context-owned `AF_UNIX`/`SOCK_STREAM` transport. The module
 depends on the M13 runtime snapshot and M14 PLP/1 parser/serializer, and
 does not depend on `core`, `printer`, `serial`, `marlin`, `gcode` or the
-CLI.
+CLI. `src/printerctld_main.c` adds the minimal process wrapper around
+that transport.
 
 Implemented protocol surface is intentionally limited to:
 
@@ -827,6 +828,35 @@ Implemented protocol surface is intentionally limited to:
 - `VERSION`;
 - idle `STATUS` for `daemon_state` and `worker_state`.
 
-`PRINT_START`, pause, resume, cancel, event subscriptions, queueing and
-daemon process lifecycle remain future milestones. The M15 server supports
-multiple sequential clients, not simultaneous clients.
+Event subscriptions, queueing and extended daemon lifecycle hardening
+remain future milestones. The M15/M16 server supports multiple sequential
+clients, not simultaneous clients.
+
+## 24. Milestone 16 implementation status
+
+§12 above describes single-print daemon integration as target
+architecture; M16 is now implemented and verified as of 2026-08-25. See
+[[milestone-16|docs/milestones/milestone-16.md]] and
+[[milestone-16-single-print-daemon-integration|docs/design/milestone-16-single-print-daemon-integration.md]]
+for the full as-built report.
+
+The worker owns the M12 `printerctl_print_engine_t`; the control context
+only sends bounded internal commands and applies worker `PRINT_UPDATE`
+events to its published snapshot. PLP/1 `PRINT_START`, `PRINT_PAUSE`,
+`PRINT_RESUME` and `PRINT_CANCEL` are dispatched through that boundary.
+
+No queue, persistent job model, history, event subscription, CLI
+migration, multi-printer support or automatic restart/resume was added.
+
+## 25. Milestone 17 implementation status
+
+M17 is implemented and verified as of 2026-08-25. See
+[[milestone-17|docs/milestones/milestone-17.md]] and
+[[milestone-17-lifecycle-fault-compatibility|docs/design/milestone-17-lifecycle-fault-compatibility.md]]
+for the full as-built report.
+
+Phase 1 daemon lifecycle, power-failure, serial-failure and compatibility
+scenarios are covered by regression tests. The daemon path preserves the
+existing safety model: no automatic homing, movement, heating, extrusion,
+emergency stop, resume, queueing, durable job persistence, auto-reconnect
+or automatic worker restart.

@@ -35,9 +35,10 @@ typedef struct {
 } printerctl_daemon_socket_server_t;
 
 /*
- * Milestone 15 local transport: AF_UNIX/SOCK_STREAM server owned by the
- * control context. It dispatches PLP/1 PING, VERSION and idle STATUS only.
- * It does not touch print_engine, serial, Marlin, G-code, queue or jobs.
+ * Local transport: AF_UNIX/SOCK_STREAM server owned by the control context.
+ * M15 introduced PING/VERSION/STATUS; M16 adds PRINT_* dispatch through the
+ * runtime boundary. This module still never owns print_engine, serial,
+ * Marlin, G-code, queue or jobs directly.
  */
 printerctl_daemon_socket_status_t printerctl_daemon_socket_listen(
     printerctl_daemon_socket_server_t *server,
@@ -52,6 +53,14 @@ printerctl_daemon_socket_status_t printerctl_daemon_socket_listen(
  */
 printerctl_daemon_socket_status_t printerctl_daemon_socket_serve_one(
     printerctl_daemon_socket_server_t *server,
+    printerctl_daemon_socket_error_t *out_error);
+
+typedef bool (*printerctl_daemon_socket_should_stop_fn)(void *context);
+
+printerctl_daemon_socket_status_t printerctl_daemon_socket_serve_one_interruptible(
+    printerctl_daemon_socket_server_t *server,
+    printerctl_daemon_socket_should_stop_fn should_stop,
+    void *context,
     printerctl_daemon_socket_error_t *out_error);
 
 void printerctl_daemon_socket_close(printerctl_daemon_socket_server_t *server);

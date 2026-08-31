@@ -92,6 +92,12 @@ movement — the goal is to stop cleanly, not to attempt a physically
 risky sequence while power may be compromised. See [[docs/apcupsd]] for
 the full mechanism.
 
+For streamed host prints, cancellation has three distinct moments:
+request, commit, and stopped. Bytes for a command whose serial write
+already began before commit may still be in flight and may still receive
+its ACK. After commit, the TX authorization gate forbids starting any
+new G-code command transmission.
+
 ## 7. No automatic resume, no automatic reconnect
 
 Nothing in printerctl ever reads an interrupted-session record back to

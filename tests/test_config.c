@@ -448,6 +448,82 @@ static void test_resolve_file_boolean_survives_without_cli_override(void)
     remove(path);
 }
 
+static void test_owner_views_apply_only_owned_fields(void)
+{
+    char path[64];
+    write_temp_config(
+        "port=/dev/from-file\n"
+        "baud=57600\n"
+        "timeout=9000\n"
+        "dry_run=true\n"
+        "verbose=true\n",
+        path, sizeof(path));
+
+    printerctl_config_overrides_t overrides;
+    printerctl_config_overrides_init(&overrides);
+    snprintf(overrides.config_path, sizeof(overrides.config_path), "%s", path);
+    overrides.has_config_path = true;
+    snprintf(overrides.port, sizeof(overrides.port), "%s", "/dev/from-cli");
+    overrides.has_port = true;
+    overrides.has_baud = true;
+    overrides.baud = 250000;
+    overrides.has_timeout = true;
+    overrides.timeout_ms = 12000;
+    overrides.has_dry_run = true;
+    overrides.dry_run = false;
+
+    printerctl_config_t config;
+    printerctl_config_error_t error;
+    printerctl_config_status_t status = printerctl_config_resolve_for_view(
+        &overrides, PRINTERCTL_CONFIG_VIEW_CLIENT, &config, &error);
+    check(status == PRINTERCTL_CONFIG_OK, "client view resolves");
+    check(config.port[0] == '\0', "client view ignores hardware port");
+    check(config.baud == PRINTERCTL_CONFIG_DEFAULT_BAUD, "client view ignores hardware baud");
+    check(config.timeout_ms == PRINTERCTL_CONFIG_DEFAULT_TIMEOUT_MS,
+          "client view ignores hardware timeout");
+    check(config.dry_run == false, "client CLI dry_run override still applies");
+    check(config.verbose == true, "client view applies verbose from file");
+
+    status = printerctl_config_resolve_for_view(
+        &overrides, PRINTERCTL_CONFIG_VIEW_DAEMON, &config, &error);
+    check(status == PRINTERCTL_CONFIG_OK, "daemon view resolves");
+    check(strcmp(config.port, "/dev/from-cli") == 0, "daemon view applies CLI port");
+    check(config.baud == 250000, "daemon view applies CLI baud");
+    check(config.timeout_ms == 12000, "daemon view applies CLI timeout");
+    check(config.dry_run == false, "daemon view ignores dry_run");
+    check(config.verbose == false, "daemon view ignores verbose");
+
+    status = printerctl_config_resolve_for_view(
+        &overrides, PRINTERCTL_CONFIG_VIEW_LEGACY_CLI, &config, &error);
+    check(status == PRINTERCTL_CONFIG_OK, "legacy CLI view resolves");
+    check(strcmp(config.port, "/dev/from-cli") == 0,
+          "legacy CLI view keeps transitional hardware config");
+    check(config.dry_run == false, "legacy CLI view keeps client dry_run");
+    check(config.verbose == true, "legacy CLI view keeps client verbose");
+
+    remove(path);
+}
+
+static void test_owner_views_still_validate_cross_owned_keys(void)
+{
+    char path[64];
+    write_temp_config("baud=not-a-number\n", path, sizeof(path));
+
+    printerctl_config_overrides_t overrides;
+    printerctl_config_overrides_init(&overrides);
+    snprintf(overrides.config_path, sizeof(overrides.config_path), "%s", path);
+    overrides.has_config_path = true;
+
+    printerctl_config_t config;
+    printerctl_config_error_t error;
+    printerctl_config_status_t status = printerctl_config_resolve_for_view(
+        &overrides, PRINTERCTL_CONFIG_VIEW_CLIENT, &config, &error);
+    check(status == PRINTERCTL_CONFIG_ERR_INVALID_VALUE,
+          "client view still rejects invalid cross-owned hardware values");
+
+    remove(path);
+}
+
 int main(void)
 {
     test_defaults();
@@ -470,6 +546,8 @@ int main(void)
     test_resolve_cli_value_equal_to_default();
     test_resolve_invalid_config_file();
     test_resolve_file_boolean_survives_without_cli_override();
+    test_owner_views_apply_only_owned_fields();
+    test_owner_views_still_validate_cross_owned_keys();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);
