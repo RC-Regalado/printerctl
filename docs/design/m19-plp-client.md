@@ -41,3 +41,22 @@ Do not duplicate framing logic.
 Prove using existing non-physical operations such as PING/VERSION/STATUS.
 
 No new hardware operation belongs here.
+
+## Implementation
+
+Implemented as `printerctl_client`, a reusable Unix-socket PLP/1 client
+layer.
+
+Responsibilities:
+
+- connect/close lifecycle;
+- monotonic non-zero request IDs;
+- PLP request serialization through the existing codec;
+- write-all over `send(..., MSG_NOSIGNAL)`;
+- bounded `poll()` wait;
+- incremental response parsing through the existing parser;
+- response type and request ID correlation;
+- remote status, malformed protocol, timeout and I/O error
+  classification.
+
+M19 does not migrate CLI commands and does not add PLP operations.

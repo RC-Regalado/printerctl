@@ -9,8 +9,8 @@ power-failure references.
 
 ## Status
 
-This repository currently implements Milestone 17 (Lifecycle, Fault &
-Legacy Compatibility Validation), completing and re-auditing
+This repository currently implements Milestone 19 (PLP Client Library),
+continuing Phase 2 CLI client migration after completing
 `docs/roadmap.md`'s Phase 1 —
 Daemon Foundation + Single-Print IPC (milestones 0-9 keep their original
 scope; milestones 10+ follow the revised roadmap). Milestone 12 (Print
@@ -22,11 +22,15 @@ foundation; Milestone 14 froze PLP/1; and Milestone 15 adds a local
 `VERSION` and idle `STATUS`, exposed through the `printerctld`
 executable; Milestone 16 connects PLP/1 `PRINT_START`, `PRINT_PAUSE`,
 `PRINT_RESUME` and `PRINT_CANCEL` to one worker-owned print engine. It
-does not add queueing, history, event subscriptions, multi-printer
-support or CLI migration, and changes nothing about the CLI's behavior
-described below. The Phase 1 remediation audit is recorded in
-`docs/audit/phase-1.md`; Phase 2 is ready to start, but has not been
-started here. See
+does not add queueing, history, event subscriptions or multi-printer
+support. Milestone 18 added owner-aware configuration views, and
+Milestone 19 adds a reusable PLP client library without migrating CLI
+commands yet. The Phase 1 remediation audit is recorded in
+`docs/audit/phase-1.md`. See
+`docs/milestones/milestone-19.md` /
+`docs/design/m19-plp-client.md`,
+`docs/milestones/milestone-18.md` /
+`docs/design/m18-configuration-boundary.md`,
 `docs/milestones/milestone-17.md` /
 `docs/design/milestone-17-lifecycle-fault-compatibility.md`,
 `docs/milestones/milestone-16.md` /
@@ -99,7 +103,7 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. 17
+Use `build-clang` instead of `build` if you configured with Clang. 18
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 logging integration and end-to-end commands against forked mock
 printers), `printerctl_config_tests` (configuration module),
@@ -119,7 +123,8 @@ injection and repeated start/stop cycles), `printerctl_plp1_frame_tests`,
 `printerctl_daemon_socket_tests` (Milestone 15 Unix socket transport)
 and `printerctld_tests` (Milestone 15 process smoke test over PLP/1).
 `printerctl_daemon_print_tests` covers Milestone 16 daemon/worker print
-integration over pseudo-terminals. Run the daemon runtime/socket/process
+integration over pseudo-terminals. `printerctl_client_tests` covers the
+Milestone 19 PLP client library. Run the daemon runtime/socket/process
 tests under ThreadSanitizer when checking
 concurrency changes. See
 `docs/testing.md` for what each covers in detail, the patterns behind

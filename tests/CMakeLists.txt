@@ -110,6 +110,14 @@ target_link_libraries(printerctl_plp1_parser_tests PRIVATE printerctl_protocol_p
 
 add_test(NAME printerctl_plp1_parser_tests COMMAND printerctl_plp1_parser_tests)
 
+add_executable(printerctl_client_tests
+    test_plp_client.c
+)
+
+target_link_libraries(printerctl_client_tests PRIVATE printerctl_client Threads::Threads)
+
+add_test(NAME printerctl_client_tests COMMAND printerctl_client_tests)
+
 add_executable(printerctl_daemon_socket_tests
     test_daemon_socket.c
 )

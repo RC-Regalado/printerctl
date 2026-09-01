@@ -43,7 +43,7 @@ This is a deliberate compatibility change and must be documented and tested.
 
 ## M18 — Configuration Boundary Preparation
 
-**Status:** PROPOSED
+**Status:** DONE
 
 ### Goal
 
@@ -74,7 +74,7 @@ existing unmigrated direct CLI commands working.
 
 ## M19 — PLP Client Library
 
-**Status:** PROPOSED
+**Status:** DONE
 
 ### Goal
 

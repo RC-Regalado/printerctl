@@ -163,6 +163,17 @@ target_include_directories(printerctl_protocol_plp1_parser
 
 target_link_libraries(printerctl_protocol_plp1_parser PUBLIC printerctl_protocol_plp1)
 
+add_library(printerctl_client STATIC
+    src/client/plp_client.c
+)
+
+target_include_directories(printerctl_client
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_client PUBLIC printerctl_protocol_plp1_parser)
+
 # Milestone 15: local Unix socket transport. This is the first layer that
 # knows both daemon runtime snapshots and PLP/1 frames; lower layers stay
 # unaware of sockets, protocol dispatch and file descriptors.
