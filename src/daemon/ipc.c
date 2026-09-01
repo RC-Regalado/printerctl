@@ -68,6 +68,9 @@ static bool command_type_valid(printerctl_daemon_command_type_t type)
     case PRINTERCTL_DAEMON_CMD_PRINT_RESUME:
     case PRINTERCTL_DAEMON_CMD_PRINT_CANCEL:
     case PRINTERCTL_DAEMON_CMD_PRINT_CANCEL_POWER_FAILURE:
+    case PRINTERCTL_DAEMON_CMD_QUERY_TEMP:
+    case PRINTERCTL_DAEMON_CMD_QUERY_POSITION:
+    case PRINTERCTL_DAEMON_CMD_QUERY_INFO:
         return true;
     }
     return false;

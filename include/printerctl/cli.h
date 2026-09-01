@@ -122,17 +122,18 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * file, oversized line, malformed line, I/O error, file changed while
  * being read) exits PRINTERCTL_EXIT_GCODE_ERROR.
  *
- * As of Milestone 6, `temp`, `position`, `info` and `send COMMAND`
- * execute a real single-command exchange via printerctl_printer (serial
- * + marlin + logging): PRINTERCTL_EXIT_OK with human-readable output on
- * success; PRINTERCTL_EXIT_CONFIG_ERROR when no port is configured;
+ * As of Milestone 20, `temp`, `position` and `info` query through
+ * printerctld over PLP/1 and no longer open serial from the CLI.
+ * `send COMMAND` remains a transitional direct serial exchange:
+ * PRINTERCTL_EXIT_OK with human-readable output on success;
+ * PRINTERCTL_EXIT_CONFIG_ERROR when no port is configured;
  * PRINTERCTL_EXIT_SAFETY_ERROR when `send` carries a G28;
  * PRINTERCTL_EXIT_COMM_ERROR when the port cannot be opened or the
  * exchange fails at the transport level (I/O, disconnect, timeout);
  * PRINTERCTL_EXIT_PRINTER_ERROR when the printer replies `Error:` or
- * `Resend:`, or acknowledges without the expected report. Under
- * --dry-run these four commands print the line they would transmit and
- * exit PRINTERCTL_EXIT_OK without touching any serial device.
+ * `Resend:`. Under --dry-run these commands print the line they would
+ * transmit and exit PRINTERCTL_EXIT_OK without touching any serial
+ * device.
  *
  * As of Milestone 7, `print FILE` without --dry-run streams the file
  * for real via printerctl_printer_print_file(): one normalized command
@@ -166,8 +167,8 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * once.
  *
  * Revised 2026-07-21: min end-stops are now enabled on all three axes,
- * so `home` executes for real like `temp`/`position`/`info` -- no
- * confirmation flag, only a configured `--port` -- sending `G28`.
+ * so `home` executes for real as a transitional direct serial command
+ * -- no confirmation flag, only a configured `--port` -- sending `G28`.
  * `home X`/`home Y`/`home Z` send `G28 X`/`G28 Y`/`G28 Z` to home a
  * single axis. `G28` remains refused everywhere else (`send`, and
  * inside a `print` G-code file) with PRINTERCTL_EXIT_SAFETY_ERROR, no

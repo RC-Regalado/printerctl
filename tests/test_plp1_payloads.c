@@ -1,7 +1,8 @@
 /*
- * Milestone 14 payload-codec tests for PLP/1: VERSION, STATUS,
- * PRINT_START and the generic error payload, exercised directly against
- * their own encode/decode functions (not through a full frame).
+ * PLP/1 payload-codec tests: VERSION, STATUS, PRINT_START, M20
+ * read-only query responses and the generic error payload, exercised
+ * directly against their own encode/decode functions (not through a
+ * full frame).
  */
 #include "printerctl/protocol/plp1.h"
 
@@ -483,6 +484,80 @@ static void test_error_payload_truncating_decode(void)
     check(tiny[sizeof(tiny) - 1] == '\0', "the truncated message is still NUL-terminated");
 }
 
+static void test_query_payloads(void)
+{
+    printerctl_plp1_error_t error;
+    uint8_t payload[640];
+    size_t length = 0;
+
+    printerctl_plp1_query_temp_response_t temp = {
+        PRINTERCTL_PLP1_QUERY_TEMP_FIELD_HOTEND | PRINTERCTL_PLP1_QUERY_TEMP_FIELD_BED,
+        210000,
+        215000,
+        60000,
+        0
+    };
+    check(printerctl_plp1_encode_query_temp_response(
+              &temp, payload, sizeof(payload), &length, &error) == PRINTERCTL_PLP1_OK,
+          "encoding TEMP query response succeeds");
+    check(length == 17, "TEMP query response is fixed 17 bytes");
+    check(payload[1] == 0x00 && payload[2] == 0x03 && payload[3] == 0x34 &&
+              payload[4] == 0x50,
+          "TEMP values are encoded big-endian");
+    printerctl_plp1_query_temp_response_t decoded_temp;
+    check(printerctl_plp1_decode_query_temp_response(
+              payload, length, &decoded_temp, &error) == PRINTERCTL_PLP1_OK,
+          "decoding TEMP query response succeeds");
+    check(decoded_temp.hotend_actual_milli_c == 210000 &&
+              decoded_temp.bed_target_milli_c == 0,
+          "TEMP fixed-point values round-trip");
+
+    printerctl_plp1_query_position_response_t pos = {
+        PRINTERCTL_PLP1_QUERY_POSITION_FIELD_E,
+        1000,
+        -2500,
+        3000,
+        4250
+    };
+    check(printerctl_plp1_encode_query_position_response(
+              &pos, payload, sizeof(payload), &length, &error) == PRINTERCTL_PLP1_OK,
+          "encoding POSITION query response succeeds");
+    check(length == 17, "POSITION query response is fixed 17 bytes");
+    printerctl_plp1_query_position_response_t decoded_pos;
+    check(printerctl_plp1_decode_query_position_response(
+              payload, length, &decoded_pos, &error) == PRINTERCTL_PLP1_OK,
+          "decoding POSITION query response succeeds");
+    check(decoded_pos.y_milli_mm == -2500 && decoded_pos.e_milli_mm == 4250,
+          "POSITION signed fixed-point values round-trip");
+
+    printerctl_plp1_query_info_response_t info;
+    memset(&info, 0, sizeof(info));
+    snprintf(info.firmware_name, sizeof(info.firmware_name), "%s", "Marlin 2.1.2");
+    snprintf(info.machine_type, sizeof(info.machine_type), "%s", "EasyThreed K9");
+    snprintf(info.protocol_version, sizeof(info.protocol_version), "%s", "1.0");
+    info.has_extruder_count = true;
+    info.extruder_count = 1;
+    check(printerctl_plp1_encode_query_info_response(
+              &info, payload, sizeof(payload), &length, &error) == PRINTERCTL_PLP1_OK,
+          "encoding INFO query response succeeds");
+    printerctl_plp1_query_info_response_t decoded_info;
+    check(printerctl_plp1_decode_query_info_response(
+              payload, length, &decoded_info, &error) == PRINTERCTL_PLP1_OK,
+          "decoding INFO query response succeeds");
+    check(strcmp(decoded_info.firmware_name, "Marlin 2.1.2") == 0 &&
+              decoded_info.has_extruder_count && decoded_info.extruder_count == 1,
+          "INFO query response fields round-trip");
+
+    check(printerctl_plp1_encode_query_temp_response(
+              &temp, payload, sizeof(payload), &length, &error) == PRINTERCTL_PLP1_OK,
+          "re-encoding TEMP query response succeeds");
+    payload[0] = 0x80;
+    check(printerctl_plp1_decode_query_temp_response(
+              payload, 17, &decoded_temp, &error) == PRINTERCTL_PLP1_ERR_MALFORMED &&
+              error.wire_status == PRINTERCTL_PLP1_INVALID_PAYLOAD,
+          "TEMP reserved field bits are rejected");
+}
+
 int main(void)
 {
     test_version_response();
@@ -502,6 +577,7 @@ int main(void)
     test_truncated_string();
     test_error_payload_round_trip();
     test_error_payload_truncating_decode();
+    test_query_payloads();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

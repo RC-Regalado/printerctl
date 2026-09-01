@@ -99,7 +99,7 @@ implemented in M14.
 0x80–0xFF reserved
 ```
 
-Implemented in Phase 1:
+Implemented through M20:
 
 | ID | Name |
 |---|---|
@@ -110,6 +110,9 @@ Implemented in Phase 1:
 | 0x21 | PRINT_PAUSE |
 | 0x22 | PRINT_RESUME |
 | 0x23 | PRINT_CANCEL |
+| 0x30 | QUERY_TEMP |
+| 0x31 | QUERY_POSITION |
+| 0x32 | QUERY_INFO |
 
 These IDs are part of the wire contract and must never be reused for an
 unrelated operation once published. A `message_type` outside this list
@@ -170,6 +173,7 @@ itself, before any payload-specific parsing is even attempted:
 | STATUS | **required** | **required** |
 | PRINT_START | **required** | forbidden |
 | PRINT_PAUSE / RESUME / CANCEL | forbidden | forbidden |
+| QUERY_TEMP / POSITION / INFO | forbidden | **required** |
 
 "Required" for `PRINT_START`'s request means a payload of at least 2
 bytes (the string's length prefix) must be present — even an *empty*
@@ -544,7 +548,49 @@ is idempotent success, resume-without-active-execution is
 for continuity but are **not implemented** by anything in M14 — no
 state machine exists yet to enforce them.
 
-## 19. Generic error payload
+## 19. Read-only queries (0x30/0x31/0x32)
+
+`QUERY_TEMP`, `QUERY_POSITION`, and `QUERY_INFO` are explicit active
+printer queries. They are not `STATUS`: the daemon worker performs the
+Marlin I/O and returns a structured response.
+
+Requests carry no payload.
+
+`QUERY_TEMP` success response:
+
+```text
+uint8  present_fields   bit 0 hotend, bit 1 bed
+int32  hotend_actual_milli_c
+int32  hotend_target_milli_c
+int32  bed_actual_milli_c
+int32  bed_target_milli_c
+```
+
+`QUERY_POSITION` success response:
+
+```text
+uint8  present_fields   bit 0 E present
+int32  x_milli_mm
+int32  y_milli_mm
+int32  z_milli_mm
+int32  e_milli_mm
+```
+
+`QUERY_INFO` success response:
+
+```text
+string firmware_name
+string machine_type
+string protocol_version
+string uuid
+uint8  has_extruder_count
+uint16 extruder_count
+```
+
+All integer fields are big-endian. String fields use the existing
+`uint16 length + bytes` string codec.
+
+## 20. Generic error payload
 
 An `ERROR`-flagged response may carry:
 
@@ -564,7 +610,7 @@ less, no fewer), rejected as `INVALID_PAYLOAD` otherwise. Truncation
 only ever happens against the caller's own buffer size, never against
 what the wire declared.
 
-## 20. Client disconnect contract
+## 21. Client disconnect contract
 
 Documented here, enforced later: once a future `PRINT_START` is
 accepted, the print's lifetime becomes independent of the initiating
@@ -573,7 +619,7 @@ client's connection lifetime. **Socket disconnect is not
 a forward-looking contract statement for M16/M17 to honor, not
 behavior implemented here.
 
-## 21. Parser requirements
+## 22. Parser requirements
 
 `printerctl_plp1_parser_t` (`plp1_parser.h`) turns an arbitrary byte
 stream into a sequence of complete frames without assuming any
@@ -604,7 +650,7 @@ next `feed()`/`take_frame()` call — the same "duration of the call"
 discipline every borrowed pointer in this codebase already uses (e.g.
 `printerctl_printer_line_fn` in `printer.h`).
 
-## 22. Memory and ownership
+## 23. Memory and ownership
 
 Every function in `plp1.h`/`plp1_parser.h` takes caller-provided
 buffers; nothing in `plp1.c`/`plp1_parser.c` calls `malloc`. No
@@ -614,7 +660,7 @@ parser's buffer is supplied by its caller (test files use a fixed
 `uint8_t buffer[PRINTERCTL_PLP1_MAX_FRAME_SIZE]` on the stack, matching
 this codebase's stack-value convention throughout).
 
-## 23. Versioning and compatibility
+## 24. Versioning and compatibility
 
 Only `version == 1` is accepted in M14; there is no negotiation. Status
 codes, message type IDs and flag bits are additive-only once published
@@ -622,7 +668,7 @@ codes, message type IDs and flag bits are additive-only once published
 is a wire contract commitment, not merely a style preference, since a
 client and `printerctld` may run different builds.
 
-## 24. Deferred
+## 25. Deferred
 
 - `AF_UNIX`/`SOCK_STREAM`, socket path/permissions, accept loop,
   fragmented-stream integration with a real transport — Milestone 15.

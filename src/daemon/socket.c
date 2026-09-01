@@ -256,6 +256,101 @@ static printerctl_daemon_socket_status_t send_error_response(
                       request->request_id, wire_status, NULL, 0, out_error);
 }
 
+static int32_t to_milli(double value)
+{
+    return (int32_t)(value >= 0.0 ? value * 1000.0 + 0.5 : value * 1000.0 - 0.5);
+}
+
+static printerctl_daemon_status_t send_query_command(
+    printerctl_daemon_socket_server_t *server, uint8_t message_type, uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    switch (message_type) {
+    case PRINTERCTL_PLP1_MSG_QUERY_TEMP:
+        return printerctl_daemon_runtime_send_query_temp(server->runtime, out_token, out_error);
+    case PRINTERCTL_PLP1_MSG_QUERY_POSITION:
+        return printerctl_daemon_runtime_send_query_position(server->runtime, out_token,
+                                                             out_error);
+    case PRINTERCTL_PLP1_MSG_QUERY_INFO:
+        return printerctl_daemon_runtime_send_query_info(server->runtime, out_token, out_error);
+    default:
+        return PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT;
+    }
+}
+
+static printerctl_daemon_socket_status_t send_query_success(
+    int client_fd, const printerctl_plp1_frame_t *request,
+    const printerctl_daemon_event_t *event, printerctl_daemon_socket_error_t *out_error)
+{
+    uint8_t payload[640];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+
+    if (request->message_type == PRINTERCTL_PLP1_MSG_QUERY_TEMP) {
+        printerctl_plp1_query_temp_response_t value;
+        memset(&value, 0, sizeof(value));
+        if (event->query_has_hotend) {
+            value.present_fields |= PRINTERCTL_PLP1_QUERY_TEMP_FIELD_HOTEND;
+        }
+        if (event->query_has_bed) {
+            value.present_fields |= PRINTERCTL_PLP1_QUERY_TEMP_FIELD_BED;
+        }
+        value.hotend_actual_milli_c = to_milli(event->query_hotend_actual);
+        value.hotend_target_milli_c = to_milli(event->query_hotend_target);
+        value.bed_actual_milli_c = to_milli(event->query_bed_actual);
+        value.bed_target_milli_c = to_milli(event->query_bed_target);
+        if (printerctl_plp1_encode_query_temp_response(
+                &value, payload, sizeof(payload), &payload_length, &plp_error) !=
+            PRINTERCTL_PLP1_OK) {
+            set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_PROTOCOL,
+                      "encode TEMP payload: %s", plp_error.message);
+            return out_error->status;
+        }
+    } else if (request->message_type == PRINTERCTL_PLP1_MSG_QUERY_POSITION) {
+        printerctl_plp1_query_position_response_t value;
+        memset(&value, 0, sizeof(value));
+        if (event->query_has_e) {
+            value.present_fields |= PRINTERCTL_PLP1_QUERY_POSITION_FIELD_E;
+        }
+        value.x_milli_mm = to_milli(event->query_x);
+        value.y_milli_mm = to_milli(event->query_y);
+        value.z_milli_mm = to_milli(event->query_z);
+        value.e_milli_mm = to_milli(event->query_e);
+        if (printerctl_plp1_encode_query_position_response(
+                &value, payload, sizeof(payload), &payload_length, &plp_error) !=
+            PRINTERCTL_PLP1_OK) {
+            set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_PROTOCOL,
+                      "encode POSITION payload: %s", plp_error.message);
+            return out_error->status;
+        }
+    } else {
+        printerctl_plp1_query_info_response_t value;
+        memset(&value, 0, sizeof(value));
+        snprintf(value.firmware_name, sizeof(value.firmware_name), "%s",
+                 event->query_firmware_name);
+        snprintf(value.machine_type, sizeof(value.machine_type), "%s",
+                 event->query_machine_type);
+        snprintf(value.protocol_version, sizeof(value.protocol_version), "%s",
+                 event->query_protocol_version);
+        snprintf(value.uuid, sizeof(value.uuid), "%s", event->query_uuid);
+        value.has_extruder_count = event->query_has_extruder_count;
+        if (event->query_extruder_count >= 0 && event->query_extruder_count <= 65535) {
+            value.extruder_count = (uint16_t)event->query_extruder_count;
+        }
+        if (printerctl_plp1_encode_query_info_response(
+                &value, payload, sizeof(payload), &payload_length, &plp_error) !=
+            PRINTERCTL_PLP1_OK) {
+            set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_PROTOCOL,
+                      "encode INFO payload: %s", plp_error.message);
+            return out_error->status;
+        }
+    }
+
+    return send_frame(client_fd, request->message_type, PRINTERCTL_PLP1_FLAG_RESPONSE,
+                      request->request_id, PRINTERCTL_PLP1_SUCCESS, payload,
+                      (uint16_t)payload_length, out_error);
+}
+
 static printerctl_daemon_socket_status_t handle_frame(
     printerctl_daemon_socket_server_t *server, int client_fd,
     const printerctl_plp1_frame_t *request, printerctl_daemon_socket_error_t *out_error)
@@ -428,6 +523,31 @@ static printerctl_daemon_socket_status_t handle_frame(
         }
         return send_frame(client_fd, request->message_type, PRINTERCTL_PLP1_FLAG_RESPONSE,
                           request->request_id, PRINTERCTL_PLP1_SUCCESS, NULL, 0, out_error);
+    }
+
+    if (request->message_type == PRINTERCTL_PLP1_MSG_QUERY_TEMP ||
+        request->message_type == PRINTERCTL_PLP1_MSG_QUERY_POSITION ||
+        request->message_type == PRINTERCTL_PLP1_MSG_QUERY_INFO) {
+        uint32_t token = 0;
+        printerctl_daemon_error_t runtime_error;
+        if (send_query_command(server, request->message_type, &token, &runtime_error) !=
+            PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                       out_error);
+        }
+
+        printerctl_daemon_event_t event;
+        if (printerctl_daemon_runtime_wait_command(server->runtime, token, &event,
+                                                   &runtime_error) != PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                       out_error);
+        }
+        if (event.result != PRINTERCTL_DAEMON_RESULT_OK) {
+            uint16_t status = event.wire_status != 0 ? event.wire_status
+                                                     : PRINTERCTL_PLP1_INTERNAL_ERROR;
+            return send_error_response(client_fd, request, status, out_error);
+        }
+        return send_query_success(client_fd, request, &event, out_error);
     }
 
     return send_error_response(client_fd, request, PRINTERCTL_PLP1_INVALID_STATE, out_error);

@@ -31,6 +31,11 @@ static void write_u32be(uint8_t *buffer, uint32_t value)
     buffer[3] = (uint8_t)(value & 0xFFu);
 }
 
+static void write_i32be(uint8_t *buffer, int32_t value)
+{
+    write_u32be(buffer, (uint32_t)value);
+}
+
 static uint16_t read_u16be(const uint8_t *buffer)
 {
     return (uint16_t)(((uint16_t)buffer[0] << 8) | (uint16_t)buffer[1]);
@@ -40,6 +45,11 @@ static uint32_t read_u32be(const uint8_t *buffer)
 {
     return ((uint32_t)buffer[0] << 24) | ((uint32_t)buffer[1] << 16) |
            ((uint32_t)buffer[2] << 8) | (uint32_t)buffer[3];
+}
+
+static int32_t read_i32be(const uint8_t *buffer)
+{
+    return (int32_t)read_u32be(buffer);
 }
 
 static bool message_type_known(uint8_t type)
@@ -52,6 +62,9 @@ static bool message_type_known(uint8_t type)
     case PRINTERCTL_PLP1_MSG_PRINT_PAUSE:
     case PRINTERCTL_PLP1_MSG_PRINT_RESUME:
     case PRINTERCTL_PLP1_MSG_PRINT_CANCEL:
+    case PRINTERCTL_PLP1_MSG_QUERY_TEMP:
+    case PRINTERCTL_PLP1_MSG_QUERY_POSITION:
+    case PRINTERCTL_PLP1_MSG_QUERY_INFO:
         return true;
     default:
         return false;
@@ -78,6 +91,9 @@ static uint16_t message_type_allowed_roles(uint8_t type)
     case PRINTERCTL_PLP1_MSG_PRINT_PAUSE:
     case PRINTERCTL_PLP1_MSG_PRINT_RESUME:
     case PRINTERCTL_PLP1_MSG_PRINT_CANCEL:
+    case PRINTERCTL_PLP1_MSG_QUERY_TEMP:
+    case PRINTERCTL_PLP1_MSG_QUERY_POSITION:
+    case PRINTERCTL_PLP1_MSG_QUERY_INFO:
         return PRINTERCTL_PLP1_FLAG_REQUEST | PRINTERCTL_PLP1_FLAG_RESPONSE;
     default:
         return 0;
@@ -128,6 +144,10 @@ static plp1_payload_requirement_t message_role_payload_requirement(uint8_t type,
          * and is therefore invalid, not merely "an empty string". The
          * success response has no payload. */
         return is_response ? PLP1_PAYLOAD_FORBIDDEN : PLP1_PAYLOAD_REQUIRED;
+    case PRINTERCTL_PLP1_MSG_QUERY_TEMP:
+    case PRINTERCTL_PLP1_MSG_QUERY_POSITION:
+    case PRINTERCTL_PLP1_MSG_QUERY_INFO:
+        return is_response ? PLP1_PAYLOAD_REQUIRED : PLP1_PAYLOAD_FORBIDDEN;
     default:
         return PLP1_PAYLOAD_OPTIONAL; /* unreachable: message_type_known()
             already rejected anything else before this is ever called;
@@ -894,6 +914,233 @@ printerctl_plp1_result_t printerctl_plp1_decode_print_start_request(
         return out_error->result;
     }
 
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_encode_query_temp_response(
+    const printerctl_plp1_query_temp_response_t *value,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if (value == NULL || out_payload == NULL || out_length == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "value, out_payload and out_length must not be NULL");
+        return out_error->result;
+    }
+    *out_length = 0;
+    if (value->present_fields & ~(uint8_t)(PRINTERCTL_PLP1_QUERY_TEMP_FIELD_HOTEND |
+                                           PRINTERCTL_PLP1_QUERY_TEMP_FIELD_BED)) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "TEMP response present_fields has reserved bits");
+        return out_error->result;
+    }
+    const size_t needed = 1 + 4 + 4 + 4 + 4;
+    if (out_payload_size < needed) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_BUFFER_TOO_SMALL, PRINTERCTL_PLP1_SUCCESS,
+                  "out_payload_size %zu is smaller than %zu", out_payload_size, needed);
+        return out_error->result;
+    }
+    out_payload[0] = value->present_fields;
+    write_i32be(out_payload + 1, value->hotend_actual_milli_c);
+    write_i32be(out_payload + 5, value->hotend_target_milli_c);
+    write_i32be(out_payload + 9, value->bed_actual_milli_c);
+    write_i32be(out_payload + 13, value->bed_target_milli_c);
+    *out_length = needed;
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_decode_query_temp_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_query_temp_response_t *out_value,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if ((payload == NULL && payload_length > 0) || out_value == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_value must not be NULL, and payload must not be NULL when present");
+        return out_error->result;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+    if (payload_length != 17) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "TEMP response payload of %zu byte(s), expected exactly 17", payload_length);
+        return out_error->result;
+    }
+    if (payload[0] & ~(uint8_t)(PRINTERCTL_PLP1_QUERY_TEMP_FIELD_HOTEND |
+                                PRINTERCTL_PLP1_QUERY_TEMP_FIELD_BED)) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "TEMP response present_fields has reserved bits");
+        return out_error->result;
+    }
+    out_value->present_fields = payload[0];
+    out_value->hotend_actual_milli_c = read_i32be(payload + 1);
+    out_value->hotend_target_milli_c = read_i32be(payload + 5);
+    out_value->bed_actual_milli_c = read_i32be(payload + 9);
+    out_value->bed_target_milli_c = read_i32be(payload + 13);
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_encode_query_position_response(
+    const printerctl_plp1_query_position_response_t *value,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if (value == NULL || out_payload == NULL || out_length == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "value, out_payload and out_length must not be NULL");
+        return out_error->result;
+    }
+    *out_length = 0;
+    if (value->present_fields & ~(uint8_t)PRINTERCTL_PLP1_QUERY_POSITION_FIELD_E) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "POSITION response present_fields has reserved bits");
+        return out_error->result;
+    }
+    const size_t needed = 1 + 4 + 4 + 4 + 4;
+    if (out_payload_size < needed) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_BUFFER_TOO_SMALL, PRINTERCTL_PLP1_SUCCESS,
+                  "out_payload_size %zu is smaller than %zu", out_payload_size, needed);
+        return out_error->result;
+    }
+    out_payload[0] = value->present_fields;
+    write_i32be(out_payload + 1, value->x_milli_mm);
+    write_i32be(out_payload + 5, value->y_milli_mm);
+    write_i32be(out_payload + 9, value->z_milli_mm);
+    write_i32be(out_payload + 13, value->e_milli_mm);
+    *out_length = needed;
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_decode_query_position_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_query_position_response_t *out_value,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if ((payload == NULL && payload_length > 0) || out_value == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_value must not be NULL, and payload must not be NULL when present");
+        return out_error->result;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+    if (payload_length != 17) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "POSITION response payload of %zu byte(s), expected exactly 17", payload_length);
+        return out_error->result;
+    }
+    if (payload[0] & ~(uint8_t)PRINTERCTL_PLP1_QUERY_POSITION_FIELD_E) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "POSITION response present_fields has reserved bits");
+        return out_error->result;
+    }
+    out_value->present_fields = payload[0];
+    out_value->x_milli_mm = read_i32be(payload + 1);
+    out_value->y_milli_mm = read_i32be(payload + 5);
+    out_value->z_milli_mm = read_i32be(payload + 9);
+    out_value->e_milli_mm = read_i32be(payload + 13);
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_encode_query_info_response(
+    const printerctl_plp1_query_info_response_t *value,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if (value == NULL || out_payload == NULL || out_length == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "value, out_payload and out_length must not be NULL");
+        return out_error->result;
+    }
+    *out_length = 0;
+
+    const char *fields[] = {value->firmware_name, value->machine_type,
+                            value->protocol_version, value->uuid};
+    size_t offset = 0;
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        size_t written = 0;
+        printerctl_plp1_result_t status = printerctl_plp1_encode_string(
+            fields[i], out_payload + offset, out_payload_size - offset, &written, out_error);
+        if (status != PRINTERCTL_PLP1_OK) {
+            *out_length = 0;
+            return status;
+        }
+        offset += written;
+    }
+    if (out_payload_size < offset + 3) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_BUFFER_TOO_SMALL, PRINTERCTL_PLP1_SUCCESS,
+                  "out_payload_size %zu is too small for INFO tail", out_payload_size);
+        *out_length = 0;
+        return out_error->result;
+    }
+    out_payload[offset++] = value->has_extruder_count ? 1u : 0u;
+    write_u16be(out_payload + offset, value->extruder_count);
+    offset += 2;
+    *out_length = offset;
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_decode_query_info_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_query_info_response_t *out_value,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if ((payload == NULL && payload_length > 0) || out_value == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_value must not be NULL, and payload must not be NULL when present");
+        return out_error->result;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+
+    char *fields[] = {out_value->firmware_name, out_value->machine_type,
+                      out_value->protocol_version, out_value->uuid};
+    size_t offset = 0;
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        size_t consumed = 0;
+        printerctl_plp1_result_t status = printerctl_plp1_decode_string(
+            payload + offset, payload_length - offset, fields[i],
+            sizeof(out_value->firmware_name), &consumed, out_error);
+        if (status != PRINTERCTL_PLP1_OK) {
+            memset(out_value, 0, sizeof(*out_value));
+            return status;
+        }
+        offset += consumed;
+    }
+    if (payload_length != offset + 3) {
+        memset(out_value, 0, sizeof(*out_value));
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "INFO response payload has invalid length");
+        return out_error->result;
+    }
+    if (payload[offset] > 1u) {
+        memset(out_value, 0, sizeof(*out_value));
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "INFO response has invalid extruder_count presence flag");
+        return out_error->result;
+    }
+    out_value->has_extruder_count = payload[offset++] != 0;
+    out_value->extruder_count = read_u16be(payload + offset);
     return PRINTERCTL_PLP1_OK;
 }
 

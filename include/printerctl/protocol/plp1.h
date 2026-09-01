@@ -2,6 +2,7 @@
 #define PRINTERCTL_PROTOCOL_PLP1_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
@@ -58,6 +59,9 @@
 #define PRINTERCTL_PLP1_MSG_PRINT_PAUSE 0x21u
 #define PRINTERCTL_PLP1_MSG_PRINT_RESUME 0x22u
 #define PRINTERCTL_PLP1_MSG_PRINT_CANCEL 0x23u
+#define PRINTERCTL_PLP1_MSG_QUERY_TEMP 0x30u
+#define PRINTERCTL_PLP1_MSG_QUERY_POSITION 0x31u
+#define PRINTERCTL_PLP1_MSG_QUERY_INFO 0x32u
 
 /* Flags (uint16 bitmap). Exactly one of REQUEST/RESPONSE/EVENT must be
  * set on any valid frame; bits 6-15 are reserved and must be 0. */
@@ -393,6 +397,67 @@ printerctl_plp1_result_t printerctl_plp1_encode_print_start_request(
 printerctl_plp1_result_t printerctl_plp1_decode_print_start_request(
     const uint8_t *payload, size_t payload_length,
     printerctl_plp1_print_start_request_t *out_value,
+    printerctl_plp1_error_t *out_error);
+
+/* Read-only query responses (M20). Numeric values are signed fixed-point
+ * milli-units on the wire: Celsius for TEMP, millimetres for POSITION. */
+#define PRINTERCTL_PLP1_QUERY_TEMP_FIELD_HOTEND 0x01u
+#define PRINTERCTL_PLP1_QUERY_TEMP_FIELD_BED 0x02u
+#define PRINTERCTL_PLP1_QUERY_POSITION_FIELD_E 0x01u
+
+typedef struct {
+    uint8_t present_fields;
+    int32_t hotend_actual_milli_c;
+    int32_t hotend_target_milli_c;
+    int32_t bed_actual_milli_c;
+    int32_t bed_target_milli_c;
+} printerctl_plp1_query_temp_response_t;
+
+typedef struct {
+    uint8_t present_fields;
+    int32_t x_milli_mm;
+    int32_t y_milli_mm;
+    int32_t z_milli_mm;
+    int32_t e_milli_mm;
+} printerctl_plp1_query_position_response_t;
+
+typedef struct {
+    char firmware_name[128];
+    char machine_type[128];
+    char protocol_version[128];
+    char uuid[128];
+    bool has_extruder_count;
+    uint16_t extruder_count;
+} printerctl_plp1_query_info_response_t;
+
+printerctl_plp1_result_t printerctl_plp1_encode_query_temp_response(
+    const printerctl_plp1_query_temp_response_t *value,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_decode_query_temp_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_query_temp_response_t *out_value,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_encode_query_position_response(
+    const printerctl_plp1_query_position_response_t *value,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_decode_query_position_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_query_position_response_t *out_value,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_encode_query_info_response(
+    const printerctl_plp1_query_info_response_t *value,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_decode_query_info_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_query_info_response_t *out_value,
     printerctl_plp1_error_t *out_error);
 
 /*

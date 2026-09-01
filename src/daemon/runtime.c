@@ -277,6 +277,30 @@ printerctl_daemon_status_t printerctl_daemon_runtime_send_print_cancel_power_fai
                         out_error);
 }
 
+printerctl_daemon_status_t printerctl_daemon_runtime_send_query_temp(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    return send_command(runtime, PRINTERCTL_DAEMON_CMD_QUERY_TEMP, NULL, out_token, out_error);
+}
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_query_position(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    return send_command(runtime, PRINTERCTL_DAEMON_CMD_QUERY_POSITION, NULL, out_token, out_error);
+}
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_query_info(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    return send_command(runtime, PRINTERCTL_DAEMON_CMD_QUERY_INFO, NULL, out_token, out_error);
+}
+
 printerctl_daemon_status_t printerctl_daemon_runtime_wait_event(
     printerctl_daemon_runtime_t *runtime,
     printerctl_daemon_event_t *out_event,

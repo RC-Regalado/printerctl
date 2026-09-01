@@ -525,11 +525,9 @@ static void test_dry_run_home(void)
 
 static void test_printer_commands_need_port(void)
 {
-    /* Since Milestone 6 (queries/send), Milestone 8 (SD-print controls)
-     * and the end-stop hardware update (home) these commands execute
-     * for real; without a configured port they are a configuration
-     * error, not "unavailable". */
-    const char *commands[] = {"pause", "resume", "cancel", "temp", "position", "info", "home"};
+    /* M20 migrated temp/position/info to the daemon. The remaining
+     * direct serial commands still need a configured port. */
+    const char *commands[] = {"pause", "resume", "cancel", "home"};
 
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
         char *argv[] = {(char *)"printerctl", (char *)commands[i]};
@@ -1332,85 +1330,43 @@ static void cli_mock_stop(cli_mock_printer_t *mock)
 
 static void test_temp_end_to_end(void)
 {
-    cli_mock_printer_t mock;
-    if (!cli_mock_start(&mock, "ok T:210.00 /210.00 B:60.00 /60.00 @:127 B@:0\n")) {
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"--verbose", (char *)"temp"};
+    char *argv[] = {(char *)"printerctl", (char *)"temp"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(5, argv, &out, &err);
+    int status = run_cli(2, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_OK, "'temp' against the mock printer exits with success");
-    check(out != NULL && strstr(out, "hotend 210.00 C (target 210.00 C)") != NULL,
-          "'temp' renders the hotend temperatures");
-    check(out != NULL && strstr(out, "bed 60.00 C (target 60.00 C)") != NULL,
-          "'temp' renders the bed temperatures");
-    check(err != NULL && strstr(err, "\tDEBUG\tserial_tx\tM105") != NULL,
-          "the transmitted M105 line is logged as serial_tx");
-    check(err != NULL && strstr(err, "\tDEBUG\tserial_rx\tok T:210.00") != NULL,
-          "the received response line is logged as serial_rx");
-    check(err != NULL && strstr(err, "state=connected baud=115200") != NULL,
-          "the connect state transition is logged with baud and timeout");
-    check(err != NULL && strstr(err, "state=disconnected") != NULL,
-          "the disconnect state transition is logged");
-    check(err != NULL && strstr(err, mock.slave_path) == NULL,
-          "logs never contain the port path");
-
-    cli_mock_stop(&mock);
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "'temp' without daemon exits with communication error");
+    check(err != NULL && strstr(err, "connect(") != NULL, "'temp' reports daemon connection");
     free(out);
     free(err);
 }
 
 static void test_position_end_to_end(void)
 {
-    cli_mock_printer_t mock;
-    if (!cli_mock_start(&mock, "X:1.00 Y:2.00 Z:3.00 E:4.00 Count X:0 Y:0 Z:0\nok\n")) {
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path, (char *)"position"};
+    char *argv[] = {(char *)"printerctl", (char *)"position"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(4, argv, &out, &err);
+    int status = run_cli(2, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_OK, "'position' against the mock printer exits with success");
-    check(out != NULL && strstr(out, "position X=1.00 Y=2.00 Z=3.00 E=4.00") != NULL,
-          "'position' renders the coordinates");
-
-    cli_mock_stop(&mock);
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "'position' without daemon exits with communication error");
     free(out);
     free(err);
 }
 
 static void test_info_end_to_end(void)
 {
-    cli_mock_printer_t mock;
-    if (!cli_mock_start(&mock,
-                         "FIRMWARE_NAME:Marlin 2.1.2 MACHINE_TYPE:EasyThreed K9 "
-                         "EXTRUDER_COUNT:1\nok\n")) {
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path, (char *)"info"};
+    char *argv[] = {(char *)"printerctl", (char *)"info"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(4, argv, &out, &err);
+    int status = run_cli(2, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_OK, "'info' against the mock printer exits with success");
-    check(out != NULL && strstr(out, "firmware: Marlin 2.1.2") != NULL,
-          "'info' renders the firmware name");
-    check(out != NULL && strstr(out, "machine: EasyThreed K9") != NULL,
-          "'info' renders the machine type");
-    check(out != NULL && strstr(out, "extruders: 1") != NULL,
-          "'info' renders the extruder count");
-
-    cli_mock_stop(&mock);
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "'info' without daemon exits with communication error");
     free(out);
     free(err);
 }
@@ -1489,11 +1445,12 @@ static void test_printer_error_end_to_end(void)
         return;
     }
 
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path, (char *)"temp"};
+    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+                     (char *)"send", (char *)"M105"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(4, argv, &out, &err);
+    int status = run_cli(5, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_PRINTER_ERROR,
           "an Error: reply exits with the printer error code");
@@ -1513,11 +1470,11 @@ static void test_timeout_end_to_end(void)
     }
 
     char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"--timeout", (char *)"150", (char *)"temp"};
+                     (char *)"--timeout", (char *)"150", (char *)"send", (char *)"M105"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(6, argv, &out, &err);
+    int status = run_cli(7, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_COMM_ERROR,
           "a silent printer exits with the communication error code");

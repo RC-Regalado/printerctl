@@ -357,3 +357,70 @@ printerctl_client_status_t printerctl_client_status(
     }
     return PRINTERCTL_CLIENT_OK;
 }
+
+printerctl_client_status_t printerctl_client_query_temp(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_plp1_query_temp_response_t *out_temp,
+    printerctl_client_error_t *out_error)
+{
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, PRINTERCTL_PLP1_MSG_QUERY_TEMP, NULL, 0, timeout_ms, &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_decode_query_temp_response(
+            response.payload, response.payload_length, out_temp, &plp_error) != PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "TEMP response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}
+
+printerctl_client_status_t printerctl_client_query_position(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_plp1_query_position_response_t *out_position,
+    printerctl_client_error_t *out_error)
+{
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, PRINTERCTL_PLP1_MSG_QUERY_POSITION, NULL, 0, timeout_ms, &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_decode_query_position_response(
+            response.payload, response.payload_length, out_position, &plp_error) !=
+        PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "POSITION response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}
+
+printerctl_client_status_t printerctl_client_query_info(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_plp1_query_info_response_t *out_info,
+    printerctl_client_error_t *out_error)
+{
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, PRINTERCTL_PLP1_MSG_QUERY_INFO, NULL, 0, timeout_ms, &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_decode_query_info_response(
+            response.payload, response.payload_length, out_info, &plp_error) != PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "INFO response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}

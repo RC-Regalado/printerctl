@@ -104,6 +104,68 @@ static void emit_command_result(worker_context_t *ctx, uint32_t token,
              detail, 0, 0, 0, 0, 0, 0, wire_status);
 }
 
+static printerctl_daemon_event_t command_result_event(uint32_t token,
+                                                      printerctl_daemon_result_t result,
+                                                      uint16_t wire_status,
+                                                      const char *detail)
+{
+    printerctl_daemon_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.wire_size = sizeof(event);
+    event.type = PRINTERCTL_DAEMON_EVENT_COMMAND_COMPLETED;
+    event.token = token;
+    event.result = result;
+    event.wire_status = wire_status;
+    if (detail != NULL) {
+        snprintf(event.detail, sizeof(event.detail), "%s", detail);
+    }
+    return event;
+}
+
+static void emit_temp_result(worker_context_t *ctx, uint32_t token,
+                             const printerctl_marlin_temperature_report_t *report)
+{
+    printerctl_daemon_event_t event =
+        command_result_event(token, PRINTERCTL_DAEMON_RESULT_OK, PRINTERCTL_PLP1_SUCCESS, NULL);
+    event.query_has_hotend = report->has_hotend;
+    event.query_hotend_actual = report->hotend_actual;
+    event.query_hotend_target = report->hotend_target;
+    event.query_has_bed = report->has_bed;
+    event.query_bed_actual = report->bed_actual;
+    event.query_bed_target = report->bed_target;
+    (void)printerctl_daemon_ipc_write_event(ctx->event_write_fd, &event);
+}
+
+static void emit_position_result(worker_context_t *ctx, uint32_t token,
+                                 const printerctl_marlin_position_report_t *report)
+{
+    printerctl_daemon_event_t event =
+        command_result_event(token, PRINTERCTL_DAEMON_RESULT_OK, PRINTERCTL_PLP1_SUCCESS, NULL);
+    event.query_x = report->x;
+    event.query_y = report->y;
+    event.query_z = report->z;
+    event.query_has_e = report->has_e;
+    event.query_e = report->e;
+    (void)printerctl_daemon_ipc_write_event(ctx->event_write_fd, &event);
+}
+
+static void emit_info_result(worker_context_t *ctx, uint32_t token,
+                             const printerctl_marlin_firmware_info_t *info)
+{
+    printerctl_daemon_event_t event =
+        command_result_event(token, PRINTERCTL_DAEMON_RESULT_OK, PRINTERCTL_PLP1_SUCCESS, NULL);
+    snprintf(event.query_firmware_name, sizeof(event.query_firmware_name), "%s",
+             info->firmware_name);
+    snprintf(event.query_machine_type, sizeof(event.query_machine_type), "%s",
+             info->machine_type);
+    snprintf(event.query_protocol_version, sizeof(event.query_protocol_version), "%s",
+             info->protocol_version);
+    snprintf(event.query_uuid, sizeof(event.query_uuid), "%s", info->uuid);
+    event.query_has_extruder_count = info->has_extruder_count;
+    event.query_extruder_count = info->extruder_count;
+    (void)printerctl_daemon_ipc_write_event(ctx->event_write_fd, &event);
+}
+
 static void emit_print_update(worker_context_t *ctx, uint8_t execution_state,
                               const printerctl_print_summary_t *summary,
                               const char *detail, uint16_t failure_reason)
@@ -238,6 +300,12 @@ static void poll_control_commands(printerctl_print_engine_t *engine, void *conte
             emit_command_result(ctx, cmd.token, PRINTERCTL_DAEMON_RESULT_ERROR,
                                 PRINTERCTL_PLP1_BUSY, "print already active");
             break;
+        case PRINTERCTL_DAEMON_CMD_QUERY_TEMP:
+        case PRINTERCTL_DAEMON_CMD_QUERY_POSITION:
+        case PRINTERCTL_DAEMON_CMD_QUERY_INFO:
+            emit_command_result(ctx, cmd.token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                                PRINTERCTL_PLP1_BUSY, "print already active");
+            break;
         case PRINTERCTL_DAEMON_CMD_SHUTDOWN:
             atomic_store_explicit(&g_signal_cancel_requested, 0, memory_order_relaxed);
             ctx->shutdown_after_print = true;
@@ -304,6 +372,45 @@ static void run_print(worker_context_t *ctx, const printerctl_daemon_command_t *
     }
 }
 
+static void run_query(worker_context_t *ctx, const printerctl_daemon_command_t *cmd)
+{
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_status_t status =
+        printerctl_printer_connect(&session, &ctx->config, NULL, &error);
+    if (status != PRINTERCTL_PRINTER_OK) {
+        emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                            map_printer_status(status), error.message);
+        return;
+    }
+
+    if (cmd->type == PRINTERCTL_DAEMON_CMD_QUERY_TEMP) {
+        printerctl_marlin_temperature_report_t report;
+        status = printerctl_printer_query_temperature(&session, &report, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            emit_temp_result(ctx, cmd->token, &report);
+        }
+    } else if (cmd->type == PRINTERCTL_DAEMON_CMD_QUERY_POSITION) {
+        printerctl_marlin_position_report_t report;
+        status = printerctl_printer_query_position(&session, &report, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            emit_position_result(ctx, cmd->token, &report);
+        }
+    } else {
+        printerctl_marlin_firmware_info_t info;
+        status = printerctl_printer_query_info(&session, &info, &error);
+        if (status == PRINTERCTL_PRINTER_OK) {
+            emit_info_result(ctx, cmd->token, &info);
+        }
+    }
+
+    printerctl_printer_disconnect(&session, &error);
+    if (status != PRINTERCTL_PRINTER_OK) {
+        emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                            map_printer_status(status), error.message);
+    }
+}
+
 void *printerctl_daemon_worker_main(void *arg)
 {
     printerctl_daemon_worker_args_t *args = arg;
@@ -360,6 +467,11 @@ void *printerctl_daemon_worker_main(void *arg)
             if (ctx.shutdown_after_print) {
                 return NULL;
             }
+            break;
+        case PRINTERCTL_DAEMON_CMD_QUERY_TEMP:
+        case PRINTERCTL_DAEMON_CMD_QUERY_POSITION:
+        case PRINTERCTL_DAEMON_CMD_QUERY_INFO:
+            run_query(&ctx, &cmd);
             break;
         case PRINTERCTL_DAEMON_CMD_PRINT_PAUSE:
         case PRINTERCTL_DAEMON_CMD_PRINT_RESUME:

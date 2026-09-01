@@ -1,6 +1,7 @@
 /* POSIX.1-2008 for sigaction(), used by the Milestone 8 print session controls. */
 #define _POSIX_C_SOURCE 200809L
 
+#include "printerctl/client/plp_client.h"
 #include "printerctl/cli.h"
 #include "printerctl/core/print_engine.h"
 #include "printerctl/gcode.h"
@@ -14,6 +15,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <unistd.h>
+
+#define PRINTERCTL_CLI_PLP_TIMEOUT_MS 5000
 
 static void set_error(printerctl_cli_error_t *out_error, const char *format, ...)
 {
@@ -68,6 +71,13 @@ static const char *command_name(printerctl_command_t command)
     case PRINTERCTL_COMMAND_POWER_LOW_BATTERY: return "power";
     }
     return "unknown";
+}
+
+static bool is_migrated_query_command(printerctl_command_t command)
+{
+    return command == PRINTERCTL_COMMAND_TEMP ||
+           command == PRINTERCTL_COMMAND_POSITION ||
+           command == PRINTERCTL_COMMAND_INFO;
 }
 
 bool printerctl_cli_parse(int argc, char *const argv[],
@@ -345,8 +355,8 @@ static void print_help(FILE *out)
         "\n"
         "Command-line controller for Marlin-based 3D printers over USB serial.\n"
         "'print FILE' streams a G-code file one acknowledged command at a time\n"
-        "(Milestone 7); 'temp', 'position', 'info' and 'send' run one command\n"
-        "each (Milestone 6). 'pause', 'resume' and 'cancel' control a print\n"
+        "(Milestone 7); 'temp', 'position' and 'info' query through printerctld\n"
+        "(Milestone 20); 'send' runs one direct command. 'pause', 'resume' and 'cancel' control a print\n"
         "running from the printer's SD card (Milestone 8; see Print session\n"
         "control below for host streams). 'power low-battery' notifies a\n"
         "running print of an external low-battery condition (Milestone 10;\n"
@@ -411,8 +421,9 @@ static void print_help(FILE *out)
         "\n"
         "Safety:\n"
         "  Min end-stops are enabled on all three axes, so 'home' (and 'home\n"
-        "  X'/'home Y'/'home Z') needs no confirmation flag and runs like\n"
-        "  'temp'/'position'/'info': only a configured --port is required.\n"
+        "  X'/'home Y'/'home Z') needs no confirmation flag. It remains a\n"
+        "  direct serial command during Phase 2 migration, so a configured\n"
+        "  --port is required until that command is migrated.\n"
         "  G28 remains disabled everywhere else: a G-code file containing G28\n"
         "  always fails 'print' (exit code 4; 'print' has no confirmation\n"
         "  flag), and 'send' refuses G28 the same way, with no bypass --\n"
@@ -690,15 +701,13 @@ static void render_received_line(const char *line, void *context)
 }
 
 /*
- * Milestone 6 execution of temp/position/info/send: connect, run the
- * one exchange, render, disconnect. The session lives entirely inside
- * this call; the port is always closed before returning, on success and
- * on failure.
+ * Transitional direct serial single-command execution. M20 moved
+ * temp/position/info to printerctld; send/home/SD controls remain here
+ * until their Phase 2 migration milestones.
  */
 /*
  * Min end-stops are enabled on all three axes, so `home` maps to a
- * fixed, safe G28 variant exactly like temp/position/info map to their
- * fixed queries -- never operator-typed text, so it does not go through
+ * fixed, safe G28 variant -- never operator-typed text, so it does not go through
  * printerctl_printer_send()'s G28 refusal (which still applies to
  * `send` and to G-code files, the only remaining paths where an
  * unconfirmed G28 could be unexpected).
@@ -756,56 +765,6 @@ static int run_single_command(const printerctl_command_args_t *args,
     }
 
     switch (args->command) {
-    case PRINTERCTL_COMMAND_TEMP: {
-        printerctl_marlin_temperature_report_t report;
-        status = printerctl_printer_query_temperature(&session, &report, &error);
-        if (status == PRINTERCTL_PRINTER_OK) {
-            fprintf(out, "printerctl: hotend %.2f C (target %.2f C)",
-                    report.hotend_actual, report.hotend_target);
-            if (report.has_bed) {
-                fprintf(out, ", bed %.2f C (target %.2f C)",
-                        report.bed_actual, report.bed_target);
-            }
-            fprintf(out, "\n");
-        }
-        break;
-    }
-
-    case PRINTERCTL_COMMAND_POSITION: {
-        printerctl_marlin_position_report_t report;
-        status = printerctl_printer_query_position(&session, &report, &error);
-        if (status == PRINTERCTL_PRINTER_OK) {
-            fprintf(out, "printerctl: position X=%.2f Y=%.2f Z=%.2f",
-                    report.x, report.y, report.z);
-            if (report.has_e) {
-                fprintf(out, " E=%.2f", report.e);
-            }
-            fprintf(out, "\n");
-        }
-        break;
-    }
-
-    case PRINTERCTL_COMMAND_INFO: {
-        printerctl_marlin_firmware_info_t info;
-        status = printerctl_printer_query_info(&session, &info, &error);
-        if (status == PRINTERCTL_PRINTER_OK) {
-            fprintf(out, "printerctl: firmware: %s\n", info.firmware_name);
-            if (info.machine_type[0] != '\0') {
-                fprintf(out, "printerctl: machine: %s\n", info.machine_type);
-            }
-            if (info.protocol_version[0] != '\0') {
-                fprintf(out, "printerctl: protocol: %s\n", info.protocol_version);
-            }
-            if (info.has_extruder_count) {
-                fprintf(out, "printerctl: extruders: %d\n", info.extruder_count);
-            }
-            if (info.uuid[0] != '\0') {
-                fprintf(out, "printerctl: uuid: %s\n", info.uuid);
-            }
-        }
-        break;
-    }
-
     case PRINTERCTL_COMMAND_HOME: {
         const char *command = home_axis_command(args->home_axis);
         fprintf(out, "> %s\n", command);
@@ -863,6 +822,128 @@ static int run_single_command(const printerctl_command_args_t *args,
     }
 
     return printer_status_to_exit_code(status);
+}
+
+static int wire_status_to_exit_code(uint16_t wire_status)
+{
+    switch (wire_status) {
+    case PRINTERCTL_PLP1_SUCCESS:
+        return PRINTERCTL_EXIT_OK;
+    case PRINTERCTL_PLP1_INVALID_ARGUMENT:
+        return PRINTERCTL_EXIT_USAGE_ERROR;
+    case PRINTERCTL_PLP1_PRINTER_ERROR:
+        return PRINTERCTL_EXIT_PRINTER_ERROR;
+    case PRINTERCTL_PLP1_SERIAL_ERROR:
+    case PRINTERCTL_PLP1_PRINTER_TIMEOUT:
+    case PRINTERCTL_PLP1_WORKER_UNAVAILABLE:
+    case PRINTERCTL_PLP1_INTERNAL_ERROR:
+    case PRINTERCTL_PLP1_SHUTTING_DOWN:
+    case PRINTERCTL_PLP1_BUSY:
+    case PRINTERCTL_PLP1_INVALID_STATE:
+    default:
+        return PRINTERCTL_EXIT_COMM_ERROR;
+    }
+}
+
+static int client_status_to_exit_code(printerctl_client_status_t status, uint16_t wire_status)
+{
+    if (status == PRINTERCTL_CLIENT_ERR_REMOTE) {
+        return wire_status_to_exit_code(wire_status);
+    }
+    return status == PRINTERCTL_CLIENT_OK ? PRINTERCTL_EXIT_OK : PRINTERCTL_EXIT_COMM_ERROR;
+}
+
+static void report_client_failure(FILE *err, printerctl_logger_t *logger, bool logger_ready,
+                                  const char *command_name_text,
+                                  printerctl_client_status_t status,
+                                  const printerctl_client_error_t *error)
+{
+    fprintf(err, "printerctl: %s\n", error->message);
+    if (logger_ready) {
+        char detail[96];
+        snprintf(detail, sizeof(detail), "command=%s client_status=%d wire_status=0x%04X",
+                 command_name_text, (int)status, error->wire_status);
+        warn_on_log_failure(err, printerctl_log_error(logger, detail),
+            "failed to record error log");
+    }
+}
+
+static double milli_to_double(int32_t value)
+{
+    return (double)value / 1000.0;
+}
+
+static int run_query_command(const printerctl_command_args_t *args,
+                             printerctl_logger_t *logger, bool logger_ready,
+                             FILE *out, FILE *err)
+{
+    printerctl_client_t client;
+    printerctl_client_error_t error;
+    printerctl_client_status_t status =
+        printerctl_client_connect(&client, PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, &error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, command_name(args->command), status,
+                              &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    if (args->command == PRINTERCTL_COMMAND_TEMP) {
+        printerctl_plp1_query_temp_response_t temp;
+        status = printerctl_client_query_temp(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &temp,
+                                              &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: hotend %.2f C (target %.2f C)",
+                    milli_to_double(temp.hotend_actual_milli_c),
+                    milli_to_double(temp.hotend_target_milli_c));
+            if (temp.present_fields & PRINTERCTL_PLP1_QUERY_TEMP_FIELD_BED) {
+                fprintf(out, ", bed %.2f C (target %.2f C)",
+                        milli_to_double(temp.bed_actual_milli_c),
+                        milli_to_double(temp.bed_target_milli_c));
+            }
+            fprintf(out, "\n");
+        }
+    } else if (args->command == PRINTERCTL_COMMAND_POSITION) {
+        printerctl_plp1_query_position_response_t position;
+        status = printerctl_client_query_position(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS,
+                                                  &position, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: position X=%.2f Y=%.2f Z=%.2f",
+                    milli_to_double(position.x_milli_mm),
+                    milli_to_double(position.y_milli_mm),
+                    milli_to_double(position.z_milli_mm));
+            if (position.present_fields & PRINTERCTL_PLP1_QUERY_POSITION_FIELD_E) {
+                fprintf(out, " E=%.2f", milli_to_double(position.e_milli_mm));
+            }
+            fprintf(out, "\n");
+        }
+    } else {
+        printerctl_plp1_query_info_response_t info;
+        status = printerctl_client_query_info(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &info,
+                                              &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: firmware: %s\n", info.firmware_name);
+            if (info.machine_type[0] != '\0') {
+                fprintf(out, "printerctl: machine: %s\n", info.machine_type);
+            }
+            if (info.protocol_version[0] != '\0') {
+                fprintf(out, "printerctl: protocol: %s\n", info.protocol_version);
+            }
+            if (info.has_extruder_count) {
+                fprintf(out, "printerctl: extruders: %u\n", (unsigned)info.extruder_count);
+            }
+            if (info.uuid[0] != '\0') {
+                fprintf(out, "printerctl: uuid: %s\n", info.uuid);
+            }
+        }
+    }
+
+    printerctl_client_close(&client);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, command_name(args->command), status,
+                              &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+    return PRINTERCTL_EXIT_OK;
 }
 
 /*
@@ -1114,9 +1195,9 @@ static int run_print_command(const printerctl_command_args_t *args,
  *
  * No print running is not an error: this command must be safely
  * idempotent for a script that may run with no print active, or run
- * more than once (the roadmap requires exactly this for the later
- * Milestone 19 socket-backed version, and there is no reason for the
- * pre-daemon version to behave any differently). A stale marker whose
+ * more than once (the roadmap requires exactly this for the future
+ * daemon-backed version, and there is no reason for the pre-daemon
+ * version to behave any differently). A stale marker whose
  * process is gone (`kill(pid, 0)` fails) is cleaned up rather than
  * treated as a fatal error. A stale marker whose PID has since been
  * reused by some unrelated live process cannot be distinguished from a
@@ -1235,8 +1316,11 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
     /* M18: direct serial CLI commands are a transitional legacy path.
      * Migrated PLP commands must switch to the client view and stop
      * consuming port/baud/timeout; this compatibility view is removed in M25. */
+    printerctl_config_view_t config_view =
+        is_migrated_query_command(request.command_args.command) ? PRINTERCTL_CONFIG_VIEW_CLIENT
+                                                                : PRINTERCTL_CONFIG_VIEW_LEGACY_CLI;
     printerctl_config_status_t status = printerctl_config_resolve_for_view(
-        &request.overrides, PRINTERCTL_CONFIG_VIEW_LEGACY_CLI, &config, &config_error);
+        &request.overrides, config_view, &config, &config_error);
     if (status != PRINTERCTL_CONFIG_OK) {
         fprintf(err, "printerctl: configuration error: %s\n", config_error.message);
         /* config_error.message may embed --config's path; the structured log
@@ -1280,9 +1364,6 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
     }
 
     bool is_single_command =
-        request.command_args.command == PRINTERCTL_COMMAND_TEMP ||
-        request.command_args.command == PRINTERCTL_COMMAND_POSITION ||
-        request.command_args.command == PRINTERCTL_COMMAND_INFO ||
         request.command_args.command == PRINTERCTL_COMMAND_SEND ||
         request.command_args.command == PRINTERCTL_COMMAND_HOME ||
         request.command_args.command == PRINTERCTL_COMMAND_PAUSE ||
@@ -1321,6 +1402,14 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
         }
     } else if (is_single_command) {
         exit_code = run_single_command(&request.command_args, &config, &logger, logger_ready, out, err);
+    } else if (is_migrated_query_command(request.command_args.command) && config.dry_run) {
+        const char *tx_line = single_command_tx_line(&request.command_args);
+        fprintf(out,
+            "printerctl: dry run: would send '%s' through printerctld and wait for the response "
+            "(no serial device is opened by printerctl)\n", tx_line);
+        exit_code = PRINTERCTL_EXIT_OK;
+    } else if (is_migrated_query_command(request.command_args.command)) {
+        exit_code = run_query_command(&request.command_args, &logger, logger_ready, out, err);
     } else if (request.command_args.command == PRINTERCTL_COMMAND_POWER_LOW_BATTERY && config.dry_run) {
         /* No serial device is ever opened by this command in the first
          * place, but --dry-run still reports rather than acts, exactly

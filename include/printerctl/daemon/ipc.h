@@ -1,6 +1,7 @@
 #ifndef PRINTERCTL_DAEMON_IPC_H
 #define PRINTERCTL_DAEMON_IPC_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -46,7 +47,10 @@ typedef enum {
     PRINTERCTL_DAEMON_CMD_PRINT_PAUSE,
     PRINTERCTL_DAEMON_CMD_PRINT_RESUME,
     PRINTERCTL_DAEMON_CMD_PRINT_CANCEL,
-    PRINTERCTL_DAEMON_CMD_PRINT_CANCEL_POWER_FAILURE
+    PRINTERCTL_DAEMON_CMD_PRINT_CANCEL_POWER_FAILURE,
+    PRINTERCTL_DAEMON_CMD_QUERY_TEMP,
+    PRINTERCTL_DAEMON_CMD_QUERY_POSITION,
+    PRINTERCTL_DAEMON_CMD_QUERY_INFO
 } printerctl_daemon_command_type_t;
 
 typedef struct {
@@ -87,6 +91,23 @@ typedef struct {
     uint32_t source_position;
     uint16_t failure_reason;
     uint16_t wire_status; /* COMMAND_COMPLETED error status; 0 on success/unused */
+    bool query_has_hotend;
+    double query_hotend_actual;
+    double query_hotend_target;
+    bool query_has_bed;
+    double query_bed_actual;
+    double query_bed_target;
+    double query_x;
+    double query_y;
+    double query_z;
+    bool query_has_e;
+    double query_e;
+    char query_firmware_name[128];
+    char query_machine_type[128];
+    char query_protocol_version[128];
+    char query_uuid[128];
+    bool query_has_extruder_count;
+    int query_extruder_count;
     char detail[PRINTERCTL_DAEMON_EVENT_DETAIL_MAX]; /* optional diagnostic text */
 } printerctl_daemon_event_t;
 

@@ -113,6 +113,37 @@ static void test_golden_ping_response(void)
           "decoding the golden PING response recovers the exact field values");
 }
 
+static void test_golden_query_temp_request(void)
+{
+    static const uint8_t expected[] = {
+        0x00, 0x00, 0x00, 0x0C,
+        0x01,
+        0x30,
+        0x00, 0x01,
+        0x00, 0x00, 0x00, 0x2A,
+        0x00, 0x00,
+        0x00, 0x00,
+    };
+
+    printerctl_plp1_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.version = PRINTERCTL_PLP1_VERSION_1;
+    frame.message_type = PRINTERCTL_PLP1_MSG_QUERY_TEMP;
+    frame.flags = PRINTERCTL_PLP1_FLAG_REQUEST;
+    frame.request_id = 42;
+    frame.status = PRINTERCTL_PLP1_SUCCESS;
+
+    uint8_t buffer[64];
+    size_t length = 0;
+    printerctl_plp1_error_t error;
+    check(printerctl_plp1_encode_frame(&frame, buffer, sizeof(buffer), &length, &error) ==
+              PRINTERCTL_PLP1_OK,
+          "encoding a QUERY_TEMP request succeeds");
+    check(length == sizeof(expected), "the encoded QUERY_TEMP request has the expected length");
+    check_bytes(buffer, expected, sizeof(expected),
+                "the encoded QUERY_TEMP request matches the golden bytes exactly");
+}
+
 static void test_golden_print_start_request(void)
 {
     static const uint8_t expected[] = {
@@ -755,6 +786,21 @@ static void test_mandatory_payload_validation(void)
                                             &error) == PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT,
               "encode_frame() rejects a payload on a PRINT_START success response");
     }
+    {
+        static const uint8_t query_resp_no_payload[16] = {
+            0x00, 0x00, 0x00, 0x0C,
+            0x01,
+            PRINTERCTL_PLP1_MSG_QUERY_TEMP,
+            0x00, 0x02, /* RESPONSE */
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00,
+            0x00, 0x00,
+        };
+        check(printerctl_plp1_decode_frame(query_resp_no_payload, sizeof(query_resp_no_payload),
+                                            &decoded, &error) == PRINTERCTL_PLP1_ERR_MALFORMED &&
+                  error.wire_status == PRINTERCTL_PLP1_INVALID_PAYLOAD,
+              "decode_frame() rejects a payload-less QUERY_TEMP response");
+    }
 
     /* OPTIONAL override: an ERROR-flagged response of ANY message type
      * (including ones that otherwise forbid a payload, like PING) may
@@ -907,6 +953,7 @@ int main(void)
 {
     test_golden_ping_request();
     test_golden_ping_response();
+    test_golden_query_temp_request();
     test_golden_print_start_request();
     test_frame_length_bounds();
     test_version();

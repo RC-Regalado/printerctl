@@ -175,6 +175,39 @@ static void *server_thread(void *arg)
                   &status, payload, sizeof(payload), &payload_length, &error) ==
                   PRINTERCTL_PLP1_OK,
               "encode STATUS payload");
+    } else if (request.message_type == PRINTERCTL_PLP1_MSG_QUERY_TEMP) {
+        printerctl_plp1_query_temp_response_t temp = {
+            PRINTERCTL_PLP1_QUERY_TEMP_FIELD_HOTEND | PRINTERCTL_PLP1_QUERY_TEMP_FIELD_BED,
+            210000,
+            215000,
+            60000,
+            0
+        };
+        check(printerctl_plp1_encode_query_temp_response(
+                  &temp, payload, sizeof(payload), &payload_length, &error) == PRINTERCTL_PLP1_OK,
+              "encode TEMP payload");
+    } else if (request.message_type == PRINTERCTL_PLP1_MSG_QUERY_POSITION) {
+        printerctl_plp1_query_position_response_t position = {
+            PRINTERCTL_PLP1_QUERY_POSITION_FIELD_E,
+            1000,
+            2000,
+            3000,
+            4000
+        };
+        check(printerctl_plp1_encode_query_position_response(
+                  &position, payload, sizeof(payload), &payload_length, &error) ==
+                  PRINTERCTL_PLP1_OK,
+              "encode POSITION payload");
+    } else if (request.message_type == PRINTERCTL_PLP1_MSG_QUERY_INFO) {
+        printerctl_plp1_query_info_response_t info;
+        memset(&info, 0, sizeof(info));
+        snprintf(info.firmware_name, sizeof(info.firmware_name), "%s", "Marlin 2.1.2");
+        snprintf(info.machine_type, sizeof(info.machine_type), "%s", "EasyThreed K9");
+        info.has_extruder_count = true;
+        info.extruder_count = 1;
+        check(printerctl_plp1_encode_query_info_response(
+                  &info, payload, sizeof(payload), &payload_length, &error) == PRINTERCTL_PLP1_OK,
+              "encode INFO payload");
     }
 
     if (server->mode == SERVER_UNSUPPORTED_VERSION) {
@@ -340,10 +373,61 @@ static void test_invalid_status_request(void)
           "invalid STATUS requested_fields rejected before I/O");
 }
 
+static void test_query_wrappers(void)
+{
+    {
+        server_t server;
+        server_start(&server, SERVER_VALID, PRINTERCTL_PLP1_MSG_QUERY_TEMP);
+        printerctl_client_t client;
+        printerctl_client_error_t error;
+        printerctl_plp1_query_temp_response_t temp;
+        check(printerctl_client_connect(&client, server.path, &error) == PRINTERCTL_CLIENT_OK,
+              "connect TEMP");
+        check(printerctl_client_query_temp(&client, 1000, &temp, &error) == PRINTERCTL_CLIENT_OK,
+              "TEMP query succeeds");
+        check(temp.hotend_actual_milli_c == 210000 && temp.bed_actual_milli_c == 60000,
+              "TEMP payload decoded");
+        printerctl_client_close(&client);
+        server_stop(&server);
+    }
+    {
+        server_t server;
+        server_start(&server, SERVER_VALID, PRINTERCTL_PLP1_MSG_QUERY_POSITION);
+        printerctl_client_t client;
+        printerctl_client_error_t error;
+        printerctl_plp1_query_position_response_t position;
+        check(printerctl_client_connect(&client, server.path, &error) == PRINTERCTL_CLIENT_OK,
+              "connect POSITION");
+        check(printerctl_client_query_position(&client, 1000, &position, &error) ==
+                  PRINTERCTL_CLIENT_OK,
+              "POSITION query succeeds");
+        check(position.x_milli_mm == 1000 && position.e_milli_mm == 4000,
+              "POSITION payload decoded");
+        printerctl_client_close(&client);
+        server_stop(&server);
+    }
+    {
+        server_t server;
+        server_start(&server, SERVER_VALID, PRINTERCTL_PLP1_MSG_QUERY_INFO);
+        printerctl_client_t client;
+        printerctl_client_error_t error;
+        printerctl_plp1_query_info_response_t info;
+        check(printerctl_client_connect(&client, server.path, &error) == PRINTERCTL_CLIENT_OK,
+              "connect INFO");
+        check(printerctl_client_query_info(&client, 1000, &info, &error) == PRINTERCTL_CLIENT_OK,
+              "INFO query succeeds");
+        check(strcmp(info.firmware_name, "Marlin 2.1.2") == 0 && info.extruder_count == 1,
+              "INFO payload decoded");
+        printerctl_client_close(&client);
+        server_stop(&server);
+    }
+}
+
 int main(void)
 {
     test_absent_socket();
     test_ping_version_status();
+    test_query_wrappers();
     test_faults();
     test_invalid_status_request();
     printf("All PLP client checks passed\n");

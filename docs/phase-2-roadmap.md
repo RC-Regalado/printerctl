@@ -108,7 +108,7 @@ CLI command handlers must not manually construct PLP byte frames.
 
 ## M20 — Read-Only Printer Queries
 
-**Status:** PROPOSED
+**Status:** IMPLEMENTED
 
 Migrate:
 

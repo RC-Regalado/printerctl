@@ -2,6 +2,7 @@
 #define _DEFAULT_SOURCE
 
 #include "printerctl/cli.h"
+#include "printerctl/client/plp_client.h"
 #include "printerctl/protocol/plp1.h"
 
 #include <errno.h>
@@ -176,6 +177,18 @@ static pid_t start_printerctld_with_port(const char *socket_path, const char *po
     return child;
 }
 
+static pid_t start_printerctld_default_with_port(const char *port_path)
+{
+    pid_t child = fork();
+    check(child >= 0, "fork");
+    if (child == 0) {
+        execl(TEST_PRINTERCTLD_PATH, "printerctld", "--port", port_path, "--timeout", "1000",
+              (char *)NULL);
+        _exit(127);
+    }
+    return child;
+}
+
 static pid_t start_printerctld_with_config(const char *socket_path, const char *config_path,
                                            const char *state_home)
 {
@@ -244,16 +257,25 @@ static bool mock_read_command(mock_printer_t *mock, char *buffer, size_t buffer_
                               int timeout_ms)
 {
     size_t received = 0;
+    int remaining_ms = timeout_ms;
     while (received < buffer_size - 1) {
         struct pollfd pfd;
         pfd.fd = mock->master;
         pfd.events = POLLIN;
         pfd.revents = 0;
-        int rc = poll(&pfd, 1, timeout_ms);
+        int slice_ms = remaining_ms > 50 ? 50 : remaining_ms;
+        int rc = poll(&pfd, 1, slice_ms);
         if (rc < 0 && errno == EINTR) {
             continue;
         }
-        if (rc <= 0 || (pfd.revents & POLLIN) == 0) {
+        if (rc == 0 || (pfd.revents & POLLIN) == 0) {
+            if (rc > 0 && (pfd.revents & POLLIN) == 0) {
+                sleep_ms(slice_ms);
+            }
+            remaining_ms -= slice_ms;
+            if (remaining_ms > 0) {
+                continue;
+            }
             buffer[received] = '\0';
             return false;
         }
@@ -271,7 +293,7 @@ static bool mock_read_command(mock_printer_t *mock, char *buffer, size_t buffer_
 static void mock_expect_command(mock_printer_t *mock, const char *expected)
 {
     char buffer[128];
-    check(mock_read_command(mock, buffer, sizeof(buffer), 1000), "printer received command");
+    check(mock_read_command(mock, buffer, sizeof(buffer), 5000), "printer received command");
     check(strcmp(buffer, expected) == 0, "printer command matches expected");
 }
 
@@ -390,6 +412,42 @@ static void expect_child_exit(pid_t child, int expected_exit)
     int status = 0;
     check(waitpid(child, &status, 0) == child, "wait child");
     check(WIFEXITED(status) && WEXITSTATUS(status) == expected_exit, "child exit status matches");
+}
+
+static pid_t start_printerctl_query(const char *command, const char *config_home, int *out_read_fd)
+{
+    int stdout_pipe[2];
+    check(pipe(stdout_pipe) == 0, "stdout pipe");
+    pid_t child = fork();
+    check(child >= 0, "fork printerctl query");
+    if (child == 0) {
+        close(stdout_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        close(stdout_pipe[1]);
+        setenv("XDG_CONFIG_HOME", config_home, 1);
+        execl(TEST_PRINTERCTL_PATH, "printerctl", command, (char *)NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    *out_read_fd = stdout_pipe[0];
+    return child;
+}
+
+static void read_output(int fd, char *buffer, size_t buffer_size)
+{
+    size_t used = 0;
+    while (used + 1 < buffer_size) {
+        ssize_t n = read(fd, buffer + used, buffer_size - used - 1);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        used += (size_t)n;
+    }
+    buffer[used] = '\0';
+    close(fd);
 }
 
 static pid_t read_active_marker_pid(const char *state_home)
@@ -728,6 +786,59 @@ static void test_legacy_owned_serial_rejects_daemon_start(void)
     rmdir(dir);
 }
 
+static void test_cli_read_only_queries_use_daemon(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port(mock.slave_path);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_query("temp", config_home, &out_fd);
+    mock_expect_command(&mock, "M105\n");
+    const char *temp = "ok T:210.00 /210.00 B:60.00 /60.00 @:127 B@:0\n";
+    check(write(mock.master, temp, strlen(temp)) == (ssize_t)strlen(temp),
+          "mock writes M105 response");
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    char output[512];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "hotend 210.00 C (target 210.00 C)") != NULL,
+          "CLI temp renders daemon response");
+
+    cli = start_printerctl_query("position", config_home, &out_fd);
+    mock_expect_command(&mock, "M114\n");
+    const char *position = "X:1.00 Y:2.00 Z:3.00 E:4.00 Count X:0 Y:0 Z:0\nok\n";
+    check(write(mock.master, position, strlen(position)) == (ssize_t)strlen(position),
+          "mock writes M114 response");
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "position X=1.00 Y=2.00 Z=3.00 E=4.00") != NULL,
+          "CLI position renders daemon response");
+
+    cli = start_printerctl_query("info", config_home, &out_fd);
+    mock_expect_command(&mock, "M115\n");
+    const char *info = "FIRMWARE_NAME:Marlin 2.1.2 MACHINE_TYPE:EasyThreed K9 "
+                       "EXTRUDER_COUNT:1\nok\n";
+    check(write(mock.master, info, strlen(info)) == (ssize_t)strlen(info),
+          "mock writes M115 response");
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "firmware: Marlin 2.1.2") != NULL &&
+              strstr(output, "machine: EasyThreed K9") != NULL &&
+              strstr(output, "extruders: 1") != NULL,
+          "CLI info renders daemon response");
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
 int main(void)
 {
     test_ping_and_clean_shutdown();
@@ -740,5 +851,6 @@ int main(void)
     test_print_cancel_ack_window_blocks_next_command();
     test_daemon_owned_serial_rejects_legacy_cli();
     test_legacy_owned_serial_rejects_daemon_start();
+    test_cli_read_only_queries_use_daemon();
     return 0;
 }

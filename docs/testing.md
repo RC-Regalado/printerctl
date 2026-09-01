@@ -37,9 +37,9 @@ suites:
 | `printerctl_daemon_ipc_tests` | Milestone 13 internal command/event pipe framing, correlation token validation and malformed/truncated message handling |
 | `printerctl_daemon_runtime_tests` | Milestone 13 runtime lifecycle: worker startup/shutdown handshakes, NOP round-trip, fault injection and repeated start/stop |
 | `printerctl_plp1_frame_tests` | Milestone 14 PLP/1 frame codec: byte-exact golden vectors, flags, versioning, bounds and message registry |
-| `printerctl_plp1_payload_tests` | Milestone 14 payload codecs: VERSION, STATUS, PRINT_START and error payload validation |
+| `printerctl_plp1_payload_tests` | PLP/1 payload codecs: VERSION, STATUS, PRINT_START, M20 read-only query responses and error payload validation |
 | `printerctl_plp1_parser_tests` | Milestone 14 incremental parser: fragmentation, coalescing, malformed frames and parser recovery boundaries |
-| `printerctl_client_tests` | Milestone 19 PLP client library: Unix socket connect, request IDs, write-all, incremental response parsing, correlation, timeout, remote errors and PING/VERSION/STATUS wrappers |
+| `printerctl_client_tests` | PLP client library: Unix socket connect, request IDs, write-all, incremental response parsing, correlation, timeout, remote errors and PING/VERSION/STATUS/M20 query wrappers |
 | `printerctl_daemon_socket_tests` | Milestone 15 Unix socket transport: real `AF_UNIX`, fragmented/coalesced requests, stale/live socket paths, sequential clients and malformed-client containment |
 | `printerctld_tests` | Milestone 15-18 daemon executable smoke/config test: fork `printerctld`, connect through PLP/1, validate `PING`, terminate with `SIGTERM`, load valid daemon config and reject invalid daemon config |
 | `printerctl_daemon_print_tests` | Milestone 16 daemon print integration: worker-owned print engine, pseudo-terminal Marlin, pause/resume/cancel and second-start rejection |

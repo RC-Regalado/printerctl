@@ -68,4 +68,22 @@ printerctl_client_status_t printerctl_client_status(
     printerctl_plp1_status_response_t *out_status,
     printerctl_client_error_t *out_error);
 
+printerctl_client_status_t printerctl_client_query_temp(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_plp1_query_temp_response_t *out_temp,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_query_position(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_plp1_query_position_response_t *out_position,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_query_info(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_plp1_query_info_response_t *out_info,
+    printerctl_client_error_t *out_error);
+
 #endif
