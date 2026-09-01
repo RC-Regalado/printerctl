@@ -61,6 +61,15 @@ static printerctl_daemon_status_t send_command(
     uint32_t *out_token,
     printerctl_daemon_error_t *out_error);
 
+static printerctl_daemon_status_t send_command_payload(
+    printerctl_daemon_runtime_t *runtime,
+    printerctl_daemon_command_type_t type,
+    const char *path,
+    const char *text,
+    uint8_t axis,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
 printerctl_daemon_status_t printerctl_daemon_runtime_start(
     printerctl_daemon_runtime_t *runtime,
     printerctl_daemon_worker_init_fn worker_init_hook,
@@ -191,6 +200,18 @@ static printerctl_daemon_status_t send_command(
     uint32_t *out_token,
     printerctl_daemon_error_t *out_error)
 {
+    return send_command_payload(runtime, type, path, NULL, 0, out_token, out_error);
+}
+
+static printerctl_daemon_status_t send_command_payload(
+    printerctl_daemon_runtime_t *runtime,
+    printerctl_daemon_command_type_t type,
+    const char *path,
+    const char *text,
+    uint8_t axis,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
     if (out_error == NULL) {
         return PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT;
     }
@@ -216,6 +237,15 @@ static printerctl_daemon_status_t send_command(
         }
         snprintf(cmd.path, sizeof(cmd.path), "%s", path);
     }
+    if (text != NULL) {
+        if (strlen(text) >= sizeof(cmd.text)) {
+            set_error(out_error, PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT,
+                      "command text exceeds %zu bytes", sizeof(cmd.text) - 1u);
+            return out_error->status;
+        }
+        snprintf(cmd.text, sizeof(cmd.text), "%s", text);
+    }
+    cmd.axis = axis;
 
     if (printerctl_daemon_ipc_write_command(runtime->cmd_pipe[1], &cmd) !=
         PRINTERCTL_DAEMON_IPC_OK) {
@@ -299,6 +329,66 @@ printerctl_daemon_status_t printerctl_daemon_runtime_send_query_info(
     printerctl_daemon_error_t *out_error)
 {
     return send_command(runtime, PRINTERCTL_DAEMON_CMD_QUERY_INFO, NULL, out_token, out_error);
+}
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_raw_send(
+    printerctl_daemon_runtime_t *runtime,
+    const char *command,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    if (command == NULL || command[0] == '\0') {
+        if (out_error != NULL) {
+            memset(out_error, 0, sizeof(*out_error));
+            set_error(out_error, PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT,
+                      "raw command must not be empty");
+        }
+        return PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT;
+    }
+    return send_command_payload(runtime, PRINTERCTL_DAEMON_CMD_RAW_SEND, NULL, command, 0,
+                                out_token, out_error);
+}
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_home(
+    printerctl_daemon_runtime_t *runtime,
+    uint8_t axis,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    if (axis > PRINTERCTL_PLP1_HOME_Z) {
+        if (out_error != NULL) {
+            memset(out_error, 0, sizeof(*out_error));
+            set_error(out_error, PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT,
+                      "invalid HOME axis %u", axis);
+        }
+        return PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT;
+    }
+    return send_command_payload(runtime, PRINTERCTL_DAEMON_CMD_HOME, NULL, NULL, axis,
+                                out_token, out_error);
+}
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_pause(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    return send_command(runtime, PRINTERCTL_DAEMON_CMD_SD_PAUSE, NULL, out_token, out_error);
+}
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_resume(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    return send_command(runtime, PRINTERCTL_DAEMON_CMD_SD_RESUME, NULL, out_token, out_error);
+}
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_cancel(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    return send_command(runtime, PRINTERCTL_DAEMON_CMD_SD_CANCEL, NULL, out_token, out_error);
 }
 
 printerctl_daemon_status_t printerctl_daemon_runtime_wait_event(

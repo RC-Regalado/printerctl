@@ -90,16 +90,16 @@ implemented in M14.
 
 ```text
 0x00–0x0F protocol/runtime
-0x10–0x1F printer queries
+0x10–0x1F reserved
 0x20–0x2F print control
-0x30–0x3F jobs       reserved
+0x30–0x3F printer query/control
 0x40–0x4F events     reserved
 0x50–0x5F history    reserved
 0x60–0x7F future
 0x80–0xFF reserved
 ```
 
-Implemented through M20:
+Implemented through M21:
 
 | ID | Name |
 |---|---|
@@ -113,6 +113,11 @@ Implemented through M20:
 | 0x30 | QUERY_TEMP |
 | 0x31 | QUERY_POSITION |
 | 0x32 | QUERY_INFO |
+| 0x33 | RAW_SEND |
+| 0x34 | HOME |
+| 0x35 | SD_PAUSE |
+| 0x36 | SD_RESUME |
+| 0x37 | SD_CANCEL |
 
 These IDs are part of the wire contract and must never be reused for an
 unrelated operation once published. A `message_type` outside this list
@@ -174,6 +179,9 @@ itself, before any payload-specific parsing is even attempted:
 | PRINT_START | **required** | forbidden |
 | PRINT_PAUSE / RESUME / CANCEL | forbidden | forbidden |
 | QUERY_TEMP / POSITION / INFO | forbidden | **required** |
+| RAW_SEND | **required** | **required** |
+| HOME | **required** | forbidden |
+| SD_PAUSE / SD_RESUME / SD_CANCEL | forbidden | forbidden |
 
 "Required" for `PRINT_START`'s request means a payload of at least 2
 bytes (the string's length prefix) must be present — even an *empty*
@@ -183,7 +191,7 @@ all (not even the length prefix) is rejected here, before
 
 **`ERROR` overrides the table above.** Any `RESPONSE` with the `ERROR`
 flag set — regardless of `message_type` — may carry the generic error
-payload (§19) or may carry none; both are valid, for every message
+payload (§21) or may carry none; both are valid, for every message
 type including ones that otherwise forbid a payload (e.g. an
 `ERROR`-flagged `PING` response may legitimately carry an error
 message). This check is evaluated first, ahead of the per-message-type
@@ -251,6 +259,7 @@ inconsistency):
 | 0x0202 | INVALID_STATE |
 | 0x0203 | BUSY |
 | 0x0204 | NOT_PRINTING |
+| 0x0205 | SAFETY_REJECTED |
 | 0x0301 | WORKER_UNAVAILABLE |
 | 0x0302 | INTERNAL_ERROR |
 | 0x0303 | SHUTTING_DOWN |
@@ -506,6 +515,7 @@ Implemented daemon error mapping after Phase 1 remediation:
 | Source path exists but is not readable | `FILE_NOT_READABLE` |
 | Source path is not a regular G-code file or fails G-code validation | `INVALID_GCODE_SOURCE` |
 | Serial open/configuration/startup failure | `SERIAL_ERROR` |
+| Raw `G28` submitted through `RAW_SEND` | `SAFETY_REJECTED` |
 | Printer response error / unsupported resend / unexpected response | `PRINTER_ERROR` |
 | Printer response timeout | `PRINTER_TIMEOUT` |
 
@@ -590,7 +600,38 @@ uint16 extruder_count
 All integer fields are big-endian. String fields use the existing
 `uint16 length + bytes` string codec.
 
-## 20. Generic error payload
+## 20. Explicit physical commands (0x33-0x37)
+
+M21 adds explicit daemon-owned physical commands. These are operator
+requests; daemon startup, reconnect, recovery and print start still
+never generate motion or homing automatically.
+
+`RAW_SEND` request and success response both carry one string:
+
+```text
+request:  string command
+response: string transcript
+```
+
+The transcript is the bounded sequence of Marlin response lines observed
+for the one command, separated by `\n`. `RAW_SEND("G28")` is rejected by
+the daemon with `SAFETY_REJECTED`; homing remains available only through
+`HOME`.
+
+`HOME` request:
+
+```text
+uint8 axis   0 all, 1 X, 2 Y, 3 Z
+```
+
+`HOME` success response has no payload.
+
+`SD_PAUSE`, `SD_RESUME` and `SD_CANCEL` requests/responses have no
+payload. They map to `M25`, `M24` and `M524` respectively and are
+distinct from host-stream `PRINT_PAUSE`, `PRINT_RESUME` and
+`PRINT_CANCEL`.
+
+## 21. Generic error payload
 
 An `ERROR`-flagged response may carry:
 

@@ -208,6 +208,22 @@ static void *server_thread(void *arg)
         check(printerctl_plp1_encode_query_info_response(
                   &info, payload, sizeof(payload), &payload_length, &error) == PRINTERCTL_PLP1_OK,
               "encode INFO payload");
+    } else if (request.message_type == PRINTERCTL_PLP1_MSG_RAW_SEND) {
+        printerctl_plp1_raw_send_request_t raw;
+        check(printerctl_plp1_decode_raw_send_request(request.payload, request.payload_length,
+                                                      &raw, &error) == PRINTERCTL_PLP1_OK,
+              "decode RAW_SEND request");
+        check(strcmp(raw.command, "M115") == 0, "RAW_SEND command sent");
+        check(printerctl_plp1_encode_raw_send_response("echo:Marlin\nok\n", payload,
+                                                       sizeof(payload), &payload_length,
+                                                       &error) == PRINTERCTL_PLP1_OK,
+              "encode RAW_SEND response");
+    } else if (request.message_type == PRINTERCTL_PLP1_MSG_HOME) {
+        printerctl_plp1_home_request_t home;
+        check(printerctl_plp1_decode_home_request(request.payload, request.payload_length,
+                                                  &home, &error) == PRINTERCTL_PLP1_OK,
+              "decode HOME request");
+        check(home.axis == PRINTERCTL_PLP1_HOME_X, "HOME axis sent");
     }
 
     if (server->mode == SERVER_UNSUPPORTED_VERSION) {
@@ -423,11 +439,57 @@ static void test_query_wrappers(void)
     }
 }
 
+static void test_physical_wrappers(void)
+{
+    {
+        server_t server;
+        server_start(&server, SERVER_VALID, PRINTERCTL_PLP1_MSG_RAW_SEND);
+        printerctl_client_t client;
+        printerctl_client_error_t error;
+        printerctl_plp1_raw_send_response_t response;
+        check(printerctl_client_connect(&client, server.path, &error) == PRINTERCTL_CLIENT_OK,
+              "connect RAW_SEND");
+        check(printerctl_client_raw_send(&client, "M115", 1000, &response, &error) ==
+                  PRINTERCTL_CLIENT_OK,
+              "RAW_SEND succeeds");
+        check(strcmp(response.transcript, "echo:Marlin\nok\n") == 0,
+              "RAW_SEND transcript decoded");
+        printerctl_client_close(&client);
+        server_stop(&server);
+    }
+    {
+        server_t server;
+        server_start(&server, SERVER_VALID, PRINTERCTL_PLP1_MSG_HOME);
+        printerctl_client_t client;
+        printerctl_client_error_t error;
+        check(printerctl_client_connect(&client, server.path, &error) == PRINTERCTL_CLIENT_OK,
+              "connect HOME");
+        check(printerctl_client_home(&client, PRINTERCTL_PLP1_HOME_X, 1000, &error) ==
+                  PRINTERCTL_CLIENT_OK,
+              "HOME succeeds");
+        printerctl_client_close(&client);
+        server_stop(&server);
+    }
+    {
+        server_t server;
+        server_start(&server, SERVER_VALID, PRINTERCTL_PLP1_MSG_SD_PAUSE);
+        printerctl_client_t client;
+        printerctl_client_error_t error;
+        check(printerctl_client_connect(&client, server.path, &error) == PRINTERCTL_CLIENT_OK,
+              "connect SD_PAUSE");
+        check(printerctl_client_sd_pause(&client, 1000, &error) == PRINTERCTL_CLIENT_OK,
+              "SD_PAUSE succeeds");
+        printerctl_client_close(&client);
+        server_stop(&server);
+    }
+}
+
 int main(void)
 {
     test_absent_socket();
     test_ping_version_status();
     test_query_wrappers();
+    test_physical_wrappers();
     test_faults();
     test_invalid_status_request();
     printf("All PLP client checks passed\n");

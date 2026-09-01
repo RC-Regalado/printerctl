@@ -351,6 +351,66 @@ static printerctl_daemon_socket_status_t send_query_success(
                       (uint16_t)payload_length, out_error);
 }
 
+static printerctl_daemon_status_t send_physical_command(
+    printerctl_daemon_socket_server_t *server, const printerctl_plp1_frame_t *request,
+    uint32_t *out_token, printerctl_daemon_error_t *out_error)
+{
+    switch (request->message_type) {
+    case PRINTERCTL_PLP1_MSG_RAW_SEND: {
+        printerctl_plp1_raw_send_request_t value;
+        printerctl_plp1_error_t plp_error;
+        if (printerctl_plp1_decode_raw_send_request(request->payload, request->payload_length,
+                                                    &value, &plp_error) != PRINTERCTL_PLP1_OK) {
+            return PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT;
+        }
+        return printerctl_daemon_runtime_send_raw_send(server->runtime, value.command, out_token,
+                                                       out_error);
+    }
+    case PRINTERCTL_PLP1_MSG_HOME: {
+        printerctl_plp1_home_request_t value;
+        printerctl_plp1_error_t plp_error;
+        if (printerctl_plp1_decode_home_request(request->payload, request->payload_length,
+                                                &value, &plp_error) != PRINTERCTL_PLP1_OK) {
+            return PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT;
+        }
+        return printerctl_daemon_runtime_send_home(server->runtime, value.axis, out_token,
+                                                   out_error);
+    }
+    case PRINTERCTL_PLP1_MSG_SD_PAUSE:
+        return printerctl_daemon_runtime_send_sd_pause(server->runtime, out_token, out_error);
+    case PRINTERCTL_PLP1_MSG_SD_RESUME:
+        return printerctl_daemon_runtime_send_sd_resume(server->runtime, out_token, out_error);
+    case PRINTERCTL_PLP1_MSG_SD_CANCEL:
+        return printerctl_daemon_runtime_send_sd_cancel(server->runtime, out_token, out_error);
+    default:
+        return PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT;
+    }
+}
+
+static printerctl_daemon_socket_status_t send_physical_success(
+    int client_fd, const printerctl_plp1_frame_t *request,
+    const printerctl_daemon_event_t *event, printerctl_daemon_socket_error_t *out_error)
+{
+    if (request->message_type != PRINTERCTL_PLP1_MSG_RAW_SEND) {
+        return send_frame(client_fd, request->message_type, PRINTERCTL_PLP1_FLAG_RESPONSE,
+                          request->request_id, PRINTERCTL_PLP1_SUCCESS, NULL, 0, out_error);
+    }
+
+    uint8_t payload[PRINTERCTL_PLP1_RAW_RESPONSE_MAX + 2];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_encode_raw_send_response(event->response_text, payload, sizeof(payload),
+                                                 &payload_length, &plp_error) !=
+        PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_PROTOCOL,
+                  "encode RAW_SEND payload: %s", plp_error.message);
+        return out_error->status;
+    }
+    return send_frame(client_fd, request->message_type, PRINTERCTL_PLP1_FLAG_RESPONSE,
+                      request->request_id, PRINTERCTL_PLP1_SUCCESS, payload,
+                      (uint16_t)payload_length, out_error);
+}
+
 static printerctl_daemon_socket_status_t handle_frame(
     printerctl_daemon_socket_server_t *server, int client_fd,
     const printerctl_plp1_frame_t *request, printerctl_daemon_socket_error_t *out_error)
@@ -548,6 +608,33 @@ static printerctl_daemon_socket_status_t handle_frame(
             return send_error_response(client_fd, request, status, out_error);
         }
         return send_query_success(client_fd, request, &event, out_error);
+    }
+
+    if (request->message_type == PRINTERCTL_PLP1_MSG_RAW_SEND ||
+        request->message_type == PRINTERCTL_PLP1_MSG_HOME ||
+        request->message_type == PRINTERCTL_PLP1_MSG_SD_PAUSE ||
+        request->message_type == PRINTERCTL_PLP1_MSG_SD_RESUME ||
+        request->message_type == PRINTERCTL_PLP1_MSG_SD_CANCEL) {
+        uint32_t token = 0;
+        printerctl_daemon_error_t runtime_error;
+        if (send_physical_command(server, request, &token, &runtime_error) !=
+            PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                                       out_error);
+        }
+
+        printerctl_daemon_event_t event;
+        if (printerctl_daemon_runtime_wait_command(server->runtime, token, &event,
+                                                   &runtime_error) != PRINTERCTL_DAEMON_OK) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                       out_error);
+        }
+        if (event.result != PRINTERCTL_DAEMON_RESULT_OK) {
+            uint16_t status = event.wire_status != 0 ? event.wire_status
+                                                     : PRINTERCTL_PLP1_INTERNAL_ERROR;
+            return send_error_response(client_fd, request, status, out_error);
+        }
+        return send_physical_success(client_fd, request, &event, out_error);
     }
 
     return send_error_response(client_fd, request, PRINTERCTL_PLP1_INVALID_STATE, out_error);

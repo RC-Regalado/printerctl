@@ -144,6 +144,85 @@ static void test_golden_query_temp_request(void)
                 "the encoded QUERY_TEMP request matches the golden bytes exactly");
 }
 
+static void test_golden_raw_send_request(void)
+{
+    static const uint8_t expected[] = {
+        0x00, 0x00, 0x00, 0x12,
+        0x01,
+        0x33,
+        0x00, 0x09,
+        0x00, 0x00, 0x00, 0x2A,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x04,
+        'M', '1', '1', '5'
+    };
+
+    uint8_t payload[16];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t error;
+    check(printerctl_plp1_encode_raw_send_request("M115", payload, sizeof(payload),
+                                                  &payload_length, &error) == PRINTERCTL_PLP1_OK,
+          "encoding RAW_SEND payload succeeds");
+
+    printerctl_plp1_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.version = PRINTERCTL_PLP1_VERSION_1;
+    frame.message_type = PRINTERCTL_PLP1_MSG_RAW_SEND;
+    frame.flags = PRINTERCTL_PLP1_FLAG_REQUEST;
+    frame.request_id = 42;
+    frame.status = PRINTERCTL_PLP1_SUCCESS;
+    frame.payload = payload;
+    frame.payload_length = (uint16_t)payload_length;
+
+    uint8_t buffer[64];
+    size_t length = 0;
+    check(printerctl_plp1_encode_frame(&frame, buffer, sizeof(buffer), &length, &error) ==
+              PRINTERCTL_PLP1_OK,
+          "encoding RAW_SEND request succeeds");
+    check_bytes(buffer, expected, sizeof(expected),
+                "RAW_SEND request matches the golden bytes exactly");
+}
+
+static void test_golden_home_x_request(void)
+{
+    static const uint8_t expected[] = {
+        0x00, 0x00, 0x00, 0x0D,
+        0x01,
+        0x34,
+        0x00, 0x09,
+        0x00, 0x00, 0x00, 0x2A,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x01
+    };
+
+    uint8_t payload[1];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t error;
+    check(printerctl_plp1_encode_home_request(PRINTERCTL_PLP1_HOME_X, payload, sizeof(payload),
+                                              &payload_length, &error) == PRINTERCTL_PLP1_OK,
+          "encoding HOME payload succeeds");
+
+    printerctl_plp1_frame_t frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.version = PRINTERCTL_PLP1_VERSION_1;
+    frame.message_type = PRINTERCTL_PLP1_MSG_HOME;
+    frame.flags = PRINTERCTL_PLP1_FLAG_REQUEST;
+    frame.request_id = 42;
+    frame.status = PRINTERCTL_PLP1_SUCCESS;
+    frame.payload = payload;
+    frame.payload_length = (uint16_t)payload_length;
+
+    uint8_t buffer[64];
+    size_t length = 0;
+    check(printerctl_plp1_encode_frame(&frame, buffer, sizeof(buffer), &length, &error) ==
+              PRINTERCTL_PLP1_OK,
+          "encoding HOME request succeeds");
+    check_bytes(buffer, expected, sizeof(expected),
+                "HOME X request matches the golden bytes exactly");
+}
+
 static void test_golden_print_start_request(void)
 {
     static const uint8_t expected[] = {
@@ -954,6 +1033,8 @@ int main(void)
     test_golden_ping_request();
     test_golden_ping_response();
     test_golden_query_temp_request();
+    test_golden_raw_send_request();
+    test_golden_home_x_request();
     test_golden_print_start_request();
     test_frame_length_bounds();
     test_version();

@@ -424,3 +424,118 @@ printerctl_client_status_t printerctl_client_query_info(
     }
     return PRINTERCTL_CLIENT_OK;
 }
+
+printerctl_client_status_t printerctl_client_raw_send(
+    printerctl_client_t *client,
+    const char *command,
+    int timeout_ms,
+    printerctl_plp1_raw_send_response_t *out_response,
+    printerctl_client_error_t *out_error)
+{
+    uint8_t payload[PRINTERCTL_PLP1_RAW_COMMAND_MAX + 2];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_encode_raw_send_request(command, payload, sizeof(payload),
+                                                &payload_length, &plp_error) !=
+        PRINTERCTL_PLP1_OK) {
+        if (out_error != NULL) {
+            set_error(out_error, PRINTERCTL_CLIENT_ERR_INVALID_ARGUMENT, 0,
+                      "RAW_SEND request: %s", plp_error.message);
+        }
+        return PRINTERCTL_CLIENT_ERR_INVALID_ARGUMENT;
+    }
+
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, PRINTERCTL_PLP1_MSG_RAW_SEND, payload, (uint16_t)payload_length, timeout_ms,
+        &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    if (printerctl_plp1_decode_raw_send_response(
+            response.payload, response.payload_length, out_response, &plp_error) !=
+        PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "RAW_SEND response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}
+
+printerctl_client_status_t printerctl_client_home(
+    printerctl_client_t *client,
+    uint8_t axis,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    uint8_t payload[1];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_encode_home_request(axis, payload, sizeof(payload), &payload_length,
+                                            &plp_error) != PRINTERCTL_PLP1_OK) {
+        if (out_error != NULL) {
+            set_error(out_error, PRINTERCTL_CLIENT_ERR_INVALID_ARGUMENT, 0,
+                      "HOME request: %s", plp_error.message);
+        }
+        return PRINTERCTL_CLIENT_ERR_INVALID_ARGUMENT;
+    }
+
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, PRINTERCTL_PLP1_MSG_HOME, payload, (uint16_t)payload_length, timeout_ms,
+        &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    if (printerctl_plp1_expect_no_payload(&response, &plp_error) != PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "HOME response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}
+
+static printerctl_client_status_t sd_control(
+    printerctl_client_t *client,
+    uint8_t message_type,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, message_type, NULL, 0, timeout_ms, &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_expect_no_payload(&response, &plp_error) != PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "SD response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}
+
+printerctl_client_status_t printerctl_client_sd_pause(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    return sd_control(client, PRINTERCTL_PLP1_MSG_SD_PAUSE, timeout_ms, out_error);
+}
+
+printerctl_client_status_t printerctl_client_sd_resume(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    return sd_control(client, PRINTERCTL_PLP1_MSG_SD_RESUME, timeout_ms, out_error);
+}
+
+printerctl_client_status_t printerctl_client_sd_cancel(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    return sd_control(client, PRINTERCTL_PLP1_MSG_SD_CANCEL, timeout_ms, out_error);
+}

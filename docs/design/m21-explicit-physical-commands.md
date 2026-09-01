@@ -1,5 +1,7 @@
 # M21 Design — Explicit Physical Commands
 
+Status: IMPLEMENTED
+
 ## Objective
 
 Migrate explicit operator physical commands while preserving policy.
@@ -36,3 +38,12 @@ Do not route `sd pause` into host `PRINT_PAUSE`.
 ## Review requirement
 
 Dedicated safety review required before DONE.
+
+## As-built notes
+
+- PLP/1 adds `RAW_SEND`, `HOME`, `SD_PAUSE`, `SD_RESUME` and `SD_CANCEL`.
+- `RAW_SEND("G28")` maps to `SAFETY_REJECTED`.
+- CLI `pause`, `resume` and `cancel` are reserved for host-stream control
+  in M23; SD controls are only `sd pause`, `sd resume` and `sd cancel`.
+- `print FILE` remains the only legacy direct-serial CLI printer command
+  until M22.

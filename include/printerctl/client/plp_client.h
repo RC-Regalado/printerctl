@@ -86,4 +86,32 @@ printerctl_client_status_t printerctl_client_query_info(
     printerctl_plp1_query_info_response_t *out_info,
     printerctl_client_error_t *out_error);
 
+printerctl_client_status_t printerctl_client_raw_send(
+    printerctl_client_t *client,
+    const char *command,
+    int timeout_ms,
+    printerctl_plp1_raw_send_response_t *out_response,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_home(
+    printerctl_client_t *client,
+    uint8_t axis,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_sd_pause(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_sd_resume(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_sd_cancel(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
 #endif

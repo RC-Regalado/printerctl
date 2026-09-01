@@ -558,6 +558,55 @@ static void test_query_payloads(void)
           "TEMP reserved field bits are rejected");
 }
 
+static void test_physical_command_payloads(void)
+{
+    printerctl_plp1_error_t error;
+    uint8_t payload[PRINTERCTL_PLP1_RAW_RESPONSE_MAX + 2];
+    size_t length = 0;
+
+    check(printerctl_plp1_encode_raw_send_request("M115", payload, sizeof(payload),
+                                                  &length, &error) == PRINTERCTL_PLP1_OK,
+          "encoding RAW_SEND request succeeds");
+    printerctl_plp1_raw_send_request_t raw;
+    check(printerctl_plp1_decode_raw_send_request(payload, length, &raw, &error) ==
+              PRINTERCTL_PLP1_OK,
+          "decoding RAW_SEND request succeeds");
+    check(strcmp(raw.command, "M115") == 0, "RAW_SEND command round-trips");
+
+    check(printerctl_plp1_encode_raw_send_request("", payload, sizeof(payload), &length,
+                                                  &error) == PRINTERCTL_PLP1_OK,
+          "empty RAW_SEND request can be encoded structurally");
+    check(printerctl_plp1_decode_raw_send_request(payload, length, &raw, &error) ==
+              PRINTERCTL_PLP1_ERR_MALFORMED &&
+              error.wire_status == PRINTERCTL_PLP1_INVALID_PAYLOAD,
+          "empty RAW_SEND request is rejected by the payload decoder");
+
+    check(printerctl_plp1_encode_raw_send_response("echo:test\nok\n", payload, sizeof(payload),
+                                                   &length, &error) == PRINTERCTL_PLP1_OK,
+          "encoding RAW_SEND response succeeds");
+    printerctl_plp1_raw_send_response_t response;
+    check(printerctl_plp1_decode_raw_send_response(payload, length, &response, &error) ==
+              PRINTERCTL_PLP1_OK,
+          "decoding RAW_SEND response succeeds");
+    check(strcmp(response.transcript, "echo:test\nok\n") == 0,
+          "RAW_SEND transcript round-trips");
+
+    check(printerctl_plp1_encode_home_request(PRINTERCTL_PLP1_HOME_Z, payload, sizeof(payload),
+                                              &length, &error) == PRINTERCTL_PLP1_OK &&
+              length == 1 && payload[0] == PRINTERCTL_PLP1_HOME_Z,
+          "HOME axis payload encodes as one byte");
+    printerctl_plp1_home_request_t home;
+    check(printerctl_plp1_decode_home_request(payload, length, &home, &error) ==
+              PRINTERCTL_PLP1_OK &&
+              home.axis == PRINTERCTL_PLP1_HOME_Z,
+          "HOME axis payload decodes");
+    payload[0] = 9;
+    check(printerctl_plp1_decode_home_request(payload, 1, &home, &error) ==
+              PRINTERCTL_PLP1_ERR_MALFORMED &&
+              error.wire_status == PRINTERCTL_PLP1_INVALID_PAYLOAD,
+          "invalid HOME axis is rejected");
+}
+
 int main(void)
 {
     test_version_response();
@@ -578,6 +627,7 @@ int main(void)
     test_error_payload_round_trip();
     test_error_payload_truncating_decode();
     test_query_payloads();
+    test_physical_command_payloads();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

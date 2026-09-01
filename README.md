@@ -9,7 +9,7 @@ power-failure references.
 
 ## Status
 
-This repository currently implements Milestone 20 (Read-Only Printer Queries),
+This repository currently implements Milestone 21 (Explicit Physical Commands),
 continuing Phase 2 CLI client migration after completing
 `docs/roadmap.md`'s Phase 1 —
 Daemon Foundation + Single-Print IPC (milestones 0-9 keep their original
@@ -24,10 +24,13 @@ executable; Milestone 16 connects PLP/1 `PRINT_START`, `PRINT_PAUSE`,
 `PRINT_RESUME` and `PRINT_CANCEL` to one worker-owned print engine. It
 does not add queueing, history, event subscriptions or multi-printer
 support. Milestone 18 added owner-aware configuration views, and
-Milestone 19 adds a reusable PLP client library, and Milestone 20 migrates
-`temp`, `position` and `info` through `printerctld`. The Phase 1
+Milestone 19 adds a reusable PLP client library, Milestone 20 migrates
+`temp`, `position` and `info` through `printerctld`, and Milestone 21
+migrates `send`, `home` and `sd pause`/`sd resume`/`sd cancel`. The Phase 1
 remediation audit is recorded in
 `docs/audit/phase-1.md`. See
+`docs/milestones/milestone-21.md` /
+`docs/design/m21-explicit-physical-commands.md`,
 `docs/milestones/milestone-20.md` /
 `docs/design/m20-read-only-queries.md`,
 `docs/milestones/milestone-19.md` /
@@ -57,18 +60,18 @@ invocation produces structured, timestamped logs on `stderr` (see
 `docs/logging.md`). `temp`, `position` and `info` now call
 `printerctld` over PLP/1; the daemon owns serial access for those
 read-only queries and returns structured responses for CLI rendering.
-`send COMMAND` still talks to the printer over the configured `--port`:
-one command is transmitted, response lines are read until Marlin's
-terminal reply (waiting out `busy:`/`echo:` keepalives), and the result
-is rendered human-readably. `send` refuses G28 with no bypass; the operator's
-explicit `M112` passes through. `print FILE` streams the G-code file
+`send COMMAND`, `home [X|Y|Z]` and `sd pause`/`sd resume`/`sd cancel`
+also go through `printerctld`; the CLI has no direct serial fallback for
+them. `send` refuses G28 with no bypass; the operator's explicit `M112`
+passes through. `print FILE` still streams the G-code file
 one acknowledged command at a time — the next command is not sent (or
 even read from the file) until Marlin replies `ok` — reporting progress
 per whole-percent change and a session summary with the final state and
 last acknowledged line; while it streams, the operator controls the
 session with signals (SIGUSR1 pauses, SIGUSR2 resumes, SIGINT/SIGTERM
 cancels gracefully with exit code `9`). `pause`, `resume` and `cancel`
-send `M25`/`M24`/`M524` to a print running from the printer's SD card.
+are reserved for daemon-owned host-print control in M23; SD-card print
+control is explicit under `sd pause`, `sd resume` and `sd cancel`.
 `--dry-run print FILE` parses and normalizes the file without opening a
 serial device; `--dry-run` with a single command prints the line it
 would transmit and exits `0`. A print that started but did not complete
@@ -129,9 +132,10 @@ injection and repeated start/stop cycles), `printerctl_plp1_frame_tests`,
 and `printerctld_tests` (Milestone 15 process smoke test over PLP/1).
 `printerctl_daemon_print_tests` covers Milestone 16 daemon/worker print
 integration over pseudo-terminals. `printerctl_client_tests` covers the
-PLP client library, including M20 query wrappers. `printerctld_tests`
-also covers M20 CLI-to-daemon read-only queries over a pseudo-terminal
-mock. Run the daemon runtime/socket/process tests under ThreadSanitizer when checking
+PLP client library, including M20 query wrappers and M21 physical-command
+wrappers. `printerctld_tests` also covers M20 CLI-to-daemon read-only
+queries and M21 explicit physical commands over a pseudo-terminal mock.
+Run the daemon runtime/socket/process tests under ThreadSanitizer when checking
 concurrency changes. See
 `docs/testing.md` for what each covers in detail, the patterns behind
 them and the hardware-validation record.
@@ -176,6 +180,9 @@ printerctl home X
 printerctl pause
 printerctl resume
 printerctl cancel
+printerctl sd pause
+printerctl sd resume
+printerctl sd cancel
 printerctl temp
 printerctl position
 printerctl info
@@ -188,8 +195,8 @@ as a usage error (exit code `2`).
 ### Homing
 
 Min end-stops are enabled on all three axes (X, Y, Z), so `home` needs
-no confirmation flag: it requires a configured `--port` in the current
-transitional CLI path and sends `G28`. `home X`, `home Y` and
+no confirmation flag: it sends `G28` through the daemon-owned execution
+path. `home X`, `home Y` and
 `home Z` home a single axis, sending `G28 X`, `G28 Y` and `G28 Z`
 respectively. `G28` remains refused everywhere else — `send "G28"` and
 a `print` file containing `G28` both still fail with exit code `4`, no
@@ -229,21 +236,20 @@ serial port is held exclusively while a session runs; a concurrent
 printerctl invocation against the same port fails to open it (exit `7`)
 instead of corrupting the stream.
 
-`pause`, `resume` and `cancel` instead control a print running from the
-**printer's SD card**, as direct Marlin commands: `M25` (pause SD
-print), `M24` (resume SD print) and `M524` (abort SD print). They
-render the exchange like `send` and cannot reach a host stream. On
+`sd pause`, `sd resume` and `sd cancel` instead control a print running
+from the **printer's SD card**, as daemon-owned Marlin commands: `M25`
+(pause SD print), `M24` (resume SD print) and `M524` (abort SD print).
+They cannot reach a host stream. On
 firmware without SD support Marlin answers `echo:Unknown command`
 (rendered) and still acknowledges, so the command is a visible no-op.
 
-`temp`, `position` and `info` require `printerctld` and do not consume
-`--port`/`--baud`/`--timeout` in `printerctl`. `send COMMAND`, `home`,
-`pause`, `resume` and `cancel` remain transitional direct-serial CLI
-commands requiring a configured port; they transmit their Marlin command
-(`the raw text`, `G28`/`G28 X`/`G28 Y`/`G28 Z`, `M25`, `M24`, `M524`),
-wait for the terminal reply and render it. `send` refuses `G28` (exit
-code `4`, no bypass). Under `--dry-run` they print the line they would
-send and exit `0` without touching any device.
+`temp`, `position`, `info`, `send COMMAND`, `home` and
+`sd pause`/`sd resume`/`sd cancel` require `printerctld` and do not
+consume `--port`/`--baud`/`--timeout` in `printerctl`. `print FILE`
+remains the only legacy direct-serial printer command until M22. `send`
+refuses `G28` (exit code `4`, no bypass). Under `--dry-run`, migrated
+physical commands print the line they would send and exit `0` without
+touching daemon or serial.
 
 `power low-battery` never requires a port and never opens a serial
 device itself — see Power events below.
@@ -371,13 +377,13 @@ the `serial_tx`/`serial_rx` records under `--verbose`). See
 ./build/printerctl temp
 ./build/printerctl position
 ./build/printerctl info
-./build/printerctl --port /dev/ttyACM0 send "M115"
-./build/printerctl --port /dev/ttyACM0 pause
-./build/printerctl --port /dev/ttyACM0 resume
-./build/printerctl --port /dev/ttyACM0 cancel
+./build/printerctl send "M115"
+./build/printerctl sd pause
+./build/printerctl sd resume
+./build/printerctl sd cancel
 ./build/printerctl power low-battery
-./build/printerctl --port /dev/ttyACM0 home
-./build/printerctl --port /dev/ttyACM0 home X
+./build/printerctl home
+./build/printerctl home X
 ```
 
 ## Versioning

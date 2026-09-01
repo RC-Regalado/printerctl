@@ -65,6 +65,11 @@ static bool message_type_known(uint8_t type)
     case PRINTERCTL_PLP1_MSG_QUERY_TEMP:
     case PRINTERCTL_PLP1_MSG_QUERY_POSITION:
     case PRINTERCTL_PLP1_MSG_QUERY_INFO:
+    case PRINTERCTL_PLP1_MSG_RAW_SEND:
+    case PRINTERCTL_PLP1_MSG_HOME:
+    case PRINTERCTL_PLP1_MSG_SD_PAUSE:
+    case PRINTERCTL_PLP1_MSG_SD_RESUME:
+    case PRINTERCTL_PLP1_MSG_SD_CANCEL:
         return true;
     default:
         return false;
@@ -94,6 +99,11 @@ static uint16_t message_type_allowed_roles(uint8_t type)
     case PRINTERCTL_PLP1_MSG_QUERY_TEMP:
     case PRINTERCTL_PLP1_MSG_QUERY_POSITION:
     case PRINTERCTL_PLP1_MSG_QUERY_INFO:
+    case PRINTERCTL_PLP1_MSG_RAW_SEND:
+    case PRINTERCTL_PLP1_MSG_HOME:
+    case PRINTERCTL_PLP1_MSG_SD_PAUSE:
+    case PRINTERCTL_PLP1_MSG_SD_RESUME:
+    case PRINTERCTL_PLP1_MSG_SD_CANCEL:
         return PRINTERCTL_PLP1_FLAG_REQUEST | PRINTERCTL_PLP1_FLAG_RESPONSE;
     default:
         return 0;
@@ -113,8 +123,8 @@ typedef enum {
  * than left to whichever payload-specific decoder or
  * printerctl_plp1_expect_no_payload() call a caller happens to remember
  * to invoke afterward. An ERROR-flagged response of *any* message type
- * may optionally carry the generic error payload instead of its normal
- * success shape (§19), which takes priority over the per-message rule
+     * may optionally carry the generic error payload instead of its normal
+     * success shape (§21), which takes priority over the per-message rule
  * below. Only called for types message_type_known() already accepted.
  */
 static plp1_payload_requirement_t message_role_payload_requirement(uint8_t type, uint16_t flags)
@@ -148,6 +158,14 @@ static plp1_payload_requirement_t message_role_payload_requirement(uint8_t type,
     case PRINTERCTL_PLP1_MSG_QUERY_POSITION:
     case PRINTERCTL_PLP1_MSG_QUERY_INFO:
         return is_response ? PLP1_PAYLOAD_REQUIRED : PLP1_PAYLOAD_FORBIDDEN;
+    case PRINTERCTL_PLP1_MSG_RAW_SEND:
+        return PLP1_PAYLOAD_REQUIRED;
+    case PRINTERCTL_PLP1_MSG_HOME:
+        return is_response ? PLP1_PAYLOAD_FORBIDDEN : PLP1_PAYLOAD_REQUIRED;
+    case PRINTERCTL_PLP1_MSG_SD_PAUSE:
+    case PRINTERCTL_PLP1_MSG_SD_RESUME:
+    case PRINTERCTL_PLP1_MSG_SD_CANCEL:
+        return PLP1_PAYLOAD_FORBIDDEN;
     default:
         return PLP1_PAYLOAD_OPTIONAL; /* unreachable: message_type_known()
             already rejected anything else before this is ever called;
@@ -1141,6 +1159,146 @@ printerctl_plp1_result_t printerctl_plp1_decode_query_info_response(
     }
     out_value->has_extruder_count = payload[offset++] != 0;
     out_value->extruder_count = read_u16be(payload + offset);
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_encode_raw_send_request(
+    const char *command,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error)
+{
+    return printerctl_plp1_encode_string(command, out_payload, out_payload_size, out_length,
+                                         out_error);
+}
+
+printerctl_plp1_result_t printerctl_plp1_decode_raw_send_request(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_raw_send_request_t *out_value,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+
+    if (out_value == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_value must not be NULL");
+        return out_error->result;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+
+    size_t consumed = 0;
+    printerctl_plp1_result_t status = printerctl_plp1_decode_string(
+        payload, payload_length, out_value->command, sizeof(out_value->command), &consumed,
+        out_error);
+    if (status != PRINTERCTL_PLP1_OK) {
+        return status;
+    }
+    if (out_value->command[0] == '\0' || consumed != payload_length) {
+        memset(out_value, 0, sizeof(*out_value));
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "RAW_SEND payload must be one non-empty command string");
+        return out_error->result;
+    }
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_encode_raw_send_response(
+    const char *transcript,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error)
+{
+    return printerctl_plp1_encode_string(transcript, out_payload, out_payload_size, out_length,
+                                         out_error);
+}
+
+printerctl_plp1_result_t printerctl_plp1_decode_raw_send_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_raw_send_response_t *out_value,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+
+    if (out_value == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_value must not be NULL");
+        return out_error->result;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+
+    size_t consumed = 0;
+    printerctl_plp1_result_t status = printerctl_plp1_decode_string(
+        payload, payload_length, out_value->transcript, sizeof(out_value->transcript), &consumed,
+        out_error);
+    if (status != PRINTERCTL_PLP1_OK) {
+        return status;
+    }
+    if (consumed != payload_length) {
+        memset(out_value, 0, sizeof(*out_value));
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "RAW_SEND response payload has trailing bytes");
+        return out_error->result;
+    }
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_encode_home_request(
+    uint8_t axis,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+
+    if (out_payload == NULL || out_length == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_payload and out_length must not be NULL");
+        return out_error->result;
+    }
+    *out_length = 0;
+    if (axis > PRINTERCTL_PLP1_HOME_Z) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "invalid HOME axis %u", axis);
+        return out_error->result;
+    }
+    if (out_payload_size < 1) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_BUFFER_TOO_SMALL, PRINTERCTL_PLP1_SUCCESS,
+                  "out_payload_size %zu is smaller than 1", out_payload_size);
+        return out_error->result;
+    }
+    out_payload[0] = axis;
+    *out_length = 1;
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_decode_home_request(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_home_request_t *out_value,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+
+    if ((payload == NULL && payload_length > 0) || out_value == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_value must not be NULL, and payload must not be NULL when present");
+        return out_error->result;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+    if (payload_length != 1 || payload[0] > PRINTERCTL_PLP1_HOME_Z) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD,
+                  "HOME payload must be exactly one valid axis byte");
+        return out_error->result;
+    }
+    out_value->axis = payload[0];
     return PRINTERCTL_PLP1_OK;
 }
 

@@ -122,7 +122,7 @@ Prefer structured PLP responses based on existing Marlin/domain parsing.
 
 ## M21 — Explicit Physical Commands
 
-**Status:** PROPOSED
+**Status:** IMPLEMENTED
 
 Migrate:
 
@@ -140,6 +140,15 @@ HOME(X)         -> explicit homing intent
 ```
 
 Safety is authoritative in the daemon.
+
+Implementation notes:
+
+- `send COMMAND`, `home [X|Y|Z]` and `sd pause`/`sd resume`/`sd cancel`
+  use PLP/1 and no longer use the legacy CLI hardware-config view.
+- Bare `pause`, `resume` and `cancel` are reserved for host-stream
+  control in M23 and are not SD aliases.
+- `print FILE` remains the only legacy direct-serial printer command
+  until M22.
 
 ## M22 — Host Print CLI Migration
 

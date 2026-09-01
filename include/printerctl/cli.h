@@ -40,6 +40,9 @@ typedef enum {
     PRINTERCTL_COMMAND_TEMP,
     PRINTERCTL_COMMAND_POSITION,
     PRINTERCTL_COMMAND_INFO,
+    PRINTERCTL_COMMAND_SD_PAUSE,
+    PRINTERCTL_COMMAND_SD_RESUME,
+    PRINTERCTL_COMMAND_SD_CANCEL,
     PRINTERCTL_COMMAND_POWER_LOW_BATTERY /* `power low-battery` (Milestone 10) */
 } printerctl_command_t;
 
@@ -122,18 +125,13 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * file, oversized line, malformed line, I/O error, file changed while
  * being read) exits PRINTERCTL_EXIT_GCODE_ERROR.
  *
- * As of Milestone 20, `temp`, `position` and `info` query through
+ * As of Milestones 20-21, `temp`, `position`, `info`, `send COMMAND`,
+ * `home [X|Y|Z]` and `sd pause`/`sd resume`/`sd cancel` execute through
  * printerctld over PLP/1 and no longer open serial from the CLI.
- * `send COMMAND` remains a transitional direct serial exchange:
- * PRINTERCTL_EXIT_OK with human-readable output on success;
- * PRINTERCTL_EXIT_CONFIG_ERROR when no port is configured;
- * PRINTERCTL_EXIT_SAFETY_ERROR when `send` carries a G28;
- * PRINTERCTL_EXIT_COMM_ERROR when the port cannot be opened or the
- * exchange fails at the transport level (I/O, disconnect, timeout);
- * PRINTERCTL_EXIT_PRINTER_ERROR when the printer replies `Error:` or
- * `Resend:`. Under --dry-run these commands print the line they would
- * transmit and exit PRINTERCTL_EXIT_OK without touching any serial
- * device.
+ * `pause`, `resume` and `cancel` are reserved for host-print control in
+ * M23 and are not SD aliases anymore. Under --dry-run the migrated
+ * physical commands print the line they would transmit and exit
+ * PRINTERCTL_EXIT_OK without requiring daemon or serial access.
  *
  * As of Milestone 7, `print FILE` without --dry-run streams the file
  * for real via printerctl_printer_print_file(): one normalized command
@@ -148,11 +146,10 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * session: SIGUSR1 pauses after the current command's acknowledgement,
  * SIGUSR2 resumes from the next unsent command, and SIGINT/SIGTERM
  * cancels gracefully — the summary reports the cancelled state and the
- * process exits PRINTERCTL_EXIT_PRINT_CANCELLED. The `pause`, `resume`
- * and `cancel` commands execute for real as direct Marlin SD-print
- * controls (M25, M24, M524) with the same exit-code mapping as `send`;
- * they target a print running from the printer's SD card, never a host
- * stream (the serial port of an active stream is held exclusively).
+ * process exits PRINTERCTL_EXIT_PRINT_CANCELLED. The `sd pause`,
+ * `sd resume` and `sd cancel` commands execute for real as daemon-owned
+ * Marlin SD-print controls (M25, M24, M524); they target a print
+ * running from the printer's SD card, never a host stream.
  *
  * As of Milestone 10, a streaming `print` also reacts to SIGPWR as a
  * distinct, non-operator cancellation: the summary reports
@@ -167,8 +164,8 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * once.
  *
  * Revised 2026-07-21: min end-stops are now enabled on all three axes,
- * so `home` executes for real as a transitional direct serial command
- * -- no confirmation flag, only a configured `--port` -- sending `G28`.
+ * so `home` executes for real as an explicit daemon-owned command
+ * sending `G28`.
  * `home X`/`home Y`/`home Z` send `G28 X`/`G28 Y`/`G28 Z` to home a
  * single axis. `G28` remains refused everywhere else (`send`, and
  * inside a `print` G-code file) with PRINTERCTL_EXIT_SAFETY_ERROR, no

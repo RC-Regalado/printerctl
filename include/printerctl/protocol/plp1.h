@@ -62,6 +62,11 @@
 #define PRINTERCTL_PLP1_MSG_QUERY_TEMP 0x30u
 #define PRINTERCTL_PLP1_MSG_QUERY_POSITION 0x31u
 #define PRINTERCTL_PLP1_MSG_QUERY_INFO 0x32u
+#define PRINTERCTL_PLP1_MSG_RAW_SEND 0x33u
+#define PRINTERCTL_PLP1_MSG_HOME 0x34u
+#define PRINTERCTL_PLP1_MSG_SD_PAUSE 0x35u
+#define PRINTERCTL_PLP1_MSG_SD_RESUME 0x36u
+#define PRINTERCTL_PLP1_MSG_SD_CANCEL 0x37u
 
 /* Flags (uint16 bitmap). Exactly one of REQUEST/RESPONSE/EVENT must be
  * set on any valid frame; bits 6-15 are reserved and must be 0. */
@@ -92,6 +97,7 @@ typedef enum {
     PRINTERCTL_PLP1_INVALID_STATE = 0x0202,
     PRINTERCTL_PLP1_BUSY = 0x0203,
     PRINTERCTL_PLP1_NOT_PRINTING = 0x0204,
+    PRINTERCTL_PLP1_SAFETY_REJECTED = 0x0205,
 
     PRINTERCTL_PLP1_WORKER_UNAVAILABLE = 0x0301,
     PRINTERCTL_PLP1_INTERNAL_ERROR = 0x0302,
@@ -430,6 +436,26 @@ typedef struct {
     uint16_t extruder_count;
 } printerctl_plp1_query_info_response_t;
 
+#define PRINTERCTL_PLP1_RAW_COMMAND_MAX 1024u
+#define PRINTERCTL_PLP1_RAW_RESPONSE_MAX 4096u
+
+typedef struct {
+    char command[PRINTERCTL_PLP1_RAW_COMMAND_MAX];
+} printerctl_plp1_raw_send_request_t;
+
+typedef struct {
+    char transcript[PRINTERCTL_PLP1_RAW_RESPONSE_MAX];
+} printerctl_plp1_raw_send_response_t;
+
+#define PRINTERCTL_PLP1_HOME_ALL 0u
+#define PRINTERCTL_PLP1_HOME_X 1u
+#define PRINTERCTL_PLP1_HOME_Y 2u
+#define PRINTERCTL_PLP1_HOME_Z 3u
+
+typedef struct {
+    uint8_t axis;
+} printerctl_plp1_home_request_t;
+
 printerctl_plp1_result_t printerctl_plp1_encode_query_temp_response(
     const printerctl_plp1_query_temp_response_t *value,
     uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
@@ -458,6 +484,36 @@ printerctl_plp1_result_t printerctl_plp1_encode_query_info_response(
 printerctl_plp1_result_t printerctl_plp1_decode_query_info_response(
     const uint8_t *payload, size_t payload_length,
     printerctl_plp1_query_info_response_t *out_value,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_encode_raw_send_request(
+    const char *command,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_decode_raw_send_request(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_raw_send_request_t *out_value,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_encode_raw_send_response(
+    const char *transcript,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_decode_raw_send_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_raw_send_response_t *out_value,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_encode_home_request(
+    uint8_t axis,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_decode_home_request(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_home_request_t *out_value,
     printerctl_plp1_error_t *out_error);
 
 /*

@@ -232,6 +232,33 @@ printerctl_daemon_status_t printerctl_daemon_runtime_send_query_info(
     uint32_t *out_token,
     printerctl_daemon_error_t *out_error);
 
+printerctl_daemon_status_t printerctl_daemon_runtime_send_raw_send(
+    printerctl_daemon_runtime_t *runtime,
+    const char *command,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_home(
+    printerctl_daemon_runtime_t *runtime,
+    uint8_t axis,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_pause(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_resume(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_cancel(
+    printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
 printerctl_daemon_status_t printerctl_daemon_runtime_wait_command(
     printerctl_daemon_runtime_t *runtime,
     uint32_t token,

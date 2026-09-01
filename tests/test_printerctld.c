@@ -433,6 +433,34 @@ static pid_t start_printerctl_query(const char *command, const char *config_home
     return child;
 }
 
+static pid_t start_printerctl_args(const char *arg1, const char *arg2, const char *arg3,
+                                   const char *config_home, int *out_read_fd)
+{
+    int stdout_pipe[2];
+    check(pipe(stdout_pipe) == 0, "stdout pipe");
+    pid_t child = fork();
+    check(child >= 0, "fork printerctl command");
+    if (child == 0) {
+        close(stdout_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        close(stdout_pipe[1]);
+        if (config_home != NULL) {
+            setenv("XDG_CONFIG_HOME", config_home, 1);
+        }
+        if (arg3 != NULL) {
+            execl(TEST_PRINTERCTL_PATH, "printerctl", arg1, arg2, arg3, (char *)NULL);
+        } else if (arg2 != NULL) {
+            execl(TEST_PRINTERCTL_PATH, "printerctl", arg1, arg2, (char *)NULL);
+        } else {
+            execl(TEST_PRINTERCTL_PATH, "printerctl", arg1, (char *)NULL);
+        }
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    *out_read_fd = stdout_pipe[0];
+    return child;
+}
+
 static void read_output(int fd, char *buffer, size_t buffer_size)
 {
     size_t used = 0;
@@ -839,6 +867,71 @@ static void test_cli_read_only_queries_use_daemon(void)
     rmdir(config_home);
 }
 
+static void test_cli_explicit_physical_commands_use_daemon(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port(mock.slave_path);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_args("send", "M500", NULL, config_home, &out_fd);
+    mock_expect_command(&mock, "M500\n");
+    const char *send_reply = "echo:Settings Stored\nok\n";
+    check(write(mock.master, send_reply, strlen(send_reply)) == (ssize_t)strlen(send_reply),
+          "mock writes RAW_SEND response");
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    char output[512];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "> M500") != NULL && strstr(output, "< echo:Settings Stored") != NULL &&
+              strstr(output, "< ok") != NULL,
+          "CLI send renders daemon-owned exchange");
+
+    cli = start_printerctl_args("home", "X", NULL, config_home, &out_fd);
+    mock_expect_command(&mock, "G28 X\n");
+    mock_reply_ok(&mock);
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "home complete: X axis") != NULL,
+          "CLI home renders daemon acknowledgement");
+
+    cli = start_printerctl_args("sd", "pause", NULL, config_home, &out_fd);
+    mock_expect_command(&mock, "M25\n");
+    mock_reply_ok(&mock);
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "SD print pause requested") != NULL,
+          "CLI sd pause renders daemon acknowledgement");
+
+    uint8_t payload[32];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    check(printerctl_plp1_encode_raw_send_request("G28", payload, sizeof(payload),
+                                                  &payload_length, &plp_error) == PRINTERCTL_PLP1_OK,
+          "encode RAW_SEND G28 request");
+    int client = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_RAW_SEND, 901, payload,
+                                           (uint16_t)payload_length, request, sizeof(request));
+    write_full(client, request, request_length);
+    printerctl_plp1_frame_t response =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_RAW_SEND, 901);
+    check(response.status == PRINTERCTL_PLP1_SAFETY_REJECTED,
+          "daemon rejects RAW_SEND G28 with SAFETY_REJECTED");
+    close(client);
+    mock_expect_no_command(&mock);
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
 int main(void)
 {
     test_ping_and_clean_shutdown();
@@ -852,5 +945,6 @@ int main(void)
     test_daemon_owned_serial_rejects_legacy_cli();
     test_legacy_owned_serial_rejects_daemon_start();
     test_cli_read_only_queries_use_daemon();
+    test_cli_explicit_physical_commands_use_daemon();
     return 0;
 }

@@ -83,7 +83,7 @@ static uint16_t map_printer_status(printerctl_printer_status_t status)
     case PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT: return PRINTERCTL_PLP1_INVALID_ARGUMENT;
     case PRINTERCTL_PRINTER_ERR_NOT_CONNECTED:
     case PRINTERCTL_PRINTER_ERR_NO_PORT: return PRINTERCTL_PLP1_INVALID_STATE;
-    case PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND:
+    case PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND: return PRINTERCTL_PLP1_SAFETY_REJECTED;
     case PRINTERCTL_PRINTER_ERR_GCODE: return PRINTERCTL_PLP1_INVALID_GCODE_SOURCE;
     case PRINTERCTL_PRINTER_ERR_SERIAL: return PRINTERCTL_PLP1_SERIAL_ERROR;
     case PRINTERCTL_PRINTER_ERR_TIMEOUT: return PRINTERCTL_PLP1_PRINTER_TIMEOUT;
@@ -164,6 +164,94 @@ static void emit_info_result(worker_context_t *ctx, uint32_t token,
     event.query_has_extruder_count = info->has_extruder_count;
     event.query_extruder_count = info->extruder_count;
     (void)printerctl_daemon_ipc_write_event(ctx->event_write_fd, &event);
+}
+
+typedef struct {
+    char *buffer;
+    size_t size;
+    size_t used;
+} transcript_t;
+
+static void collect_line(const char *line, void *context)
+{
+    transcript_t *tx = context;
+    if (tx->used + 1 >= tx->size) {
+        return;
+    }
+    int written = snprintf(tx->buffer + tx->used, tx->size - tx->used, "%s\n", line);
+    if (written > 0) {
+        size_t n = (size_t)written;
+        tx->used += n < tx->size - tx->used ? n : tx->size - tx->used - 1u;
+    }
+}
+
+static const char *home_command(uint8_t axis)
+{
+    switch (axis) {
+    case PRINTERCTL_PLP1_HOME_X: return "G28 X";
+    case PRINTERCTL_PLP1_HOME_Y: return "G28 Y";
+    case PRINTERCTL_PLP1_HOME_Z: return "G28 Z";
+    case PRINTERCTL_PLP1_HOME_ALL:
+    default: return "G28";
+    }
+}
+
+static printerctl_printer_status_t run_physical_operation(
+    printerctl_printer_session_t *session,
+    const printerctl_daemon_command_t *cmd,
+    transcript_t *transcript,
+    printerctl_printer_error_t *error)
+{
+    switch (cmd->type) {
+    case PRINTERCTL_DAEMON_CMD_RAW_SEND:
+        return printerctl_printer_send(session, cmd->text, collect_line, transcript, error);
+    case PRINTERCTL_DAEMON_CMD_HOME:
+        return printerctl_printer_execute(session, home_command(cmd->axis), collect_line,
+                                          transcript, error);
+    case PRINTERCTL_DAEMON_CMD_SD_PAUSE:
+        return printerctl_printer_pause_sd_print(session, collect_line, transcript, error);
+    case PRINTERCTL_DAEMON_CMD_SD_RESUME:
+        return printerctl_printer_resume_sd_print(session, collect_line, transcript, error);
+    case PRINTERCTL_DAEMON_CMD_SD_CANCEL:
+        return printerctl_printer_cancel_sd_print(session, collect_line, transcript, error);
+    default:
+        memset(error, 0, sizeof(*error));
+        error->status = PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT;
+        snprintf(error->message, sizeof(error->message), "%s", "unsupported physical command");
+        return error->status;
+    }
+}
+
+static void run_physical(worker_context_t *ctx, const printerctl_daemon_command_t *cmd)
+{
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_status_t status =
+        printerctl_printer_connect(&session, &ctx->config, NULL, &error);
+    if (status != PRINTERCTL_PRINTER_OK) {
+        emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                            map_printer_status(status), error.message);
+        return;
+    }
+
+    printerctl_daemon_event_t event =
+        command_result_event(cmd->token, PRINTERCTL_DAEMON_RESULT_OK,
+                             PRINTERCTL_PLP1_SUCCESS, NULL);
+    transcript_t transcript = {
+        .buffer = event.response_text,
+        .size = sizeof(event.response_text),
+        .used = 0,
+    };
+
+    status = run_physical_operation(&session, cmd, &transcript, &error);
+    printerctl_printer_error_t disconnect_error;
+    printerctl_printer_disconnect(&session, &disconnect_error);
+    if (status == PRINTERCTL_PRINTER_OK) {
+        (void)printerctl_daemon_ipc_write_event(ctx->event_write_fd, &event);
+    } else {
+        emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                            map_printer_status(status), error.message);
+    }
 }
 
 static void emit_print_update(worker_context_t *ctx, uint8_t execution_state,
@@ -303,6 +391,11 @@ static void poll_control_commands(printerctl_print_engine_t *engine, void *conte
         case PRINTERCTL_DAEMON_CMD_QUERY_TEMP:
         case PRINTERCTL_DAEMON_CMD_QUERY_POSITION:
         case PRINTERCTL_DAEMON_CMD_QUERY_INFO:
+        case PRINTERCTL_DAEMON_CMD_RAW_SEND:
+        case PRINTERCTL_DAEMON_CMD_HOME:
+        case PRINTERCTL_DAEMON_CMD_SD_PAUSE:
+        case PRINTERCTL_DAEMON_CMD_SD_RESUME:
+        case PRINTERCTL_DAEMON_CMD_SD_CANCEL:
             emit_command_result(ctx, cmd.token, PRINTERCTL_DAEMON_RESULT_ERROR,
                                 PRINTERCTL_PLP1_BUSY, "print already active");
             break;
@@ -472,6 +565,13 @@ void *printerctl_daemon_worker_main(void *arg)
         case PRINTERCTL_DAEMON_CMD_QUERY_POSITION:
         case PRINTERCTL_DAEMON_CMD_QUERY_INFO:
             run_query(&ctx, &cmd);
+            break;
+        case PRINTERCTL_DAEMON_CMD_RAW_SEND:
+        case PRINTERCTL_DAEMON_CMD_HOME:
+        case PRINTERCTL_DAEMON_CMD_SD_PAUSE:
+        case PRINTERCTL_DAEMON_CMD_SD_RESUME:
+        case PRINTERCTL_DAEMON_CMD_SD_CANCEL:
+            run_physical(&ctx, &cmd);
             break;
         case PRINTERCTL_DAEMON_CMD_PRINT_PAUSE:
         case PRINTERCTL_DAEMON_CMD_PRINT_RESUME:

@@ -35,6 +35,8 @@
  */
 
 #define PRINTERCTL_DAEMON_COMMAND_PATH_MAX 4096
+#define PRINTERCTL_DAEMON_COMMAND_TEXT_MAX 1024
+#define PRINTERCTL_DAEMON_RESPONSE_TEXT_MAX 4096
 
 /* M13 defines only the two commands needed to validate the runtime:
  * NOP proves a correlated round-trip; SHUTDOWN drives the lifecycle.
@@ -50,7 +52,12 @@ typedef enum {
     PRINTERCTL_DAEMON_CMD_PRINT_CANCEL_POWER_FAILURE,
     PRINTERCTL_DAEMON_CMD_QUERY_TEMP,
     PRINTERCTL_DAEMON_CMD_QUERY_POSITION,
-    PRINTERCTL_DAEMON_CMD_QUERY_INFO
+    PRINTERCTL_DAEMON_CMD_QUERY_INFO,
+    PRINTERCTL_DAEMON_CMD_RAW_SEND,
+    PRINTERCTL_DAEMON_CMD_HOME,
+    PRINTERCTL_DAEMON_CMD_SD_PAUSE,
+    PRINTERCTL_DAEMON_CMD_SD_RESUME,
+    PRINTERCTL_DAEMON_CMD_SD_CANCEL
 } printerctl_daemon_command_type_t;
 
 typedef struct {
@@ -59,6 +66,8 @@ typedef struct {
     uint32_t token;     /* internal correlation token; 0 is never assigned by the
                           * control context (see runtime.h) */
     char path[PRINTERCTL_DAEMON_COMMAND_PATH_MAX]; /* PRINT_START only */
+    char text[PRINTERCTL_DAEMON_COMMAND_TEXT_MAX]; /* RAW_SEND only */
+    uint8_t axis; /* HOME only: PRINTERCTL_PLP1_HOME_* value without including protocol/ here */
 } printerctl_daemon_command_t;
 
 typedef enum {
@@ -108,6 +117,7 @@ typedef struct {
     char query_uuid[128];
     bool query_has_extruder_count;
     int query_extruder_count;
+    char response_text[PRINTERCTL_DAEMON_RESPONSE_TEXT_MAX];
     char detail[PRINTERCTL_DAEMON_EVENT_DETAIL_MAX]; /* optional diagnostic text */
 } printerctl_daemon_event_t;
 

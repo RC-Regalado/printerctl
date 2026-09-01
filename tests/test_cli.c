@@ -28,6 +28,8 @@ static int g_failures = 0;
  */
 static char g_default_state_home[64];
 
+static void write_temp_gcode(const char *content, char *path, size_t path_size);
+
 static void check(int condition, const char *description)
 {
     if (!condition) {
@@ -182,7 +184,7 @@ static void test_help_rejects_extra_arguments(void)
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(3, argv, &out, &err);
+    int status = run_cli(5, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'--help extra' exits with usage error");
     check(err != NULL && strstr(err, "too many arguments") != NULL, "'--help extra' error is explicit");
@@ -197,7 +199,7 @@ static void test_equals_form_rejected(void)
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(3, argv, &out, &err);
+    int status = run_cli(5, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'--option=VALUE' form exits with usage error");
     check(err != NULL && strstr(err, "--port") != NULL, "'--option=VALUE' error names the option");
@@ -274,7 +276,7 @@ static void test_print_empty_file(void)
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(3, argv, &out, &err);
+    int status = run_cli(5, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'print' with an empty FILE argument exits with usage error");
 
@@ -288,7 +290,7 @@ static void test_send_empty_command(void)
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(3, argv, &out, &err);
+    int status = run_cli(5, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_USAGE_ERROR, "'send' with an empty COMMAND argument exits with usage error");
 
@@ -402,16 +404,16 @@ static void test_print_extra_arguments(void)
 
 static void test_send_command(void)
 {
-    /* Since Milestone 6 'send' executes for real; without a configured
-     * port it is a configuration error, not "unavailable". */
+    /* M21 migrates 'send' to printerctld; without the daemon it fails
+     * as unavailable/communication, not as a missing serial port. */
     char *argv[] = {(char *)"printerctl", (char *)"send", (char *)"M115 extra words"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "valid 'send' without a port is a configuration error");
-    check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR, "valid 'send' without a daemon is a communication error");
+    check(err != NULL && strstr(err, "connect") != NULL, "the daemon connection error is reported");
 
     free(out);
     free(err);
@@ -434,8 +436,8 @@ static void test_send_missing_argument(void)
 /*
  * Min end-stops are now enabled on all three axes: 'home' needs no
  * confirmation flag and runs like temp/position/info, requiring only a
- * configured --port (see test_printer_commands_need_port for the
- * shared no-port-is-a-config-error assertion 'home' now joins).
+ * printerctld; without a daemon it is a communication error, not a
+ * safety rejection.
  */
 static void test_home_no_longer_mentions_retired_confirmation_flag(void)
 {
@@ -445,7 +447,7 @@ static void test_home_no_longer_mentions_retired_confirmation_flag(void)
 
     int status = run_cli(2, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "'home' without a port is a configuration error, not a safety rejection");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR, "'home' without a daemon is a communication error, not a safety rejection");
     check(err != NULL && strstr(err, "i-understand-no-endstops") == NULL,
           "the retired confirmation flag is never mentioned");
 
@@ -525,23 +527,22 @@ static void test_dry_run_home(void)
 
 static void test_printer_commands_need_port(void)
 {
-    /* M20 migrated temp/position/info to the daemon. The remaining
-     * direct serial commands still need a configured port. */
-    const char *commands[] = {"pause", "resume", "cancel", "home"};
+    /* M21 migrated explicit physical single commands to the daemon.
+     * Only legacy 'print FILE' keeps direct serial ownership. */
+    char path[64];
+    write_temp_gcode("M105\n", path, sizeof(path));
+    char *argv[] = {(char *)"printerctl", (char *)"print", path};
+    char *out = NULL;
+    char *err = NULL;
 
-    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
-        char *argv[] = {(char *)"printerctl", (char *)commands[i]};
-        char *out = NULL;
-        char *err = NULL;
+    int status = run_cli(3, argv, &out, &err);
 
-        int status = run_cli(2, argv, &out, &err);
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "legacy print without a port is still a configuration error");
+    check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
 
-        check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "a printer command without a port is a configuration error");
-        check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
-
-        free(out);
-        free(err);
-    }
+    remove(path);
+    free(out);
+    free(err);
 }
 
 static void test_global_option_after_command_rejected(void)
@@ -583,21 +584,20 @@ static void test_config_file_precedence(void)
     char path[64];
     write_temp_config("port=/dev/from-file\nbaud=57600\n", path, sizeof(path));
 
-    /* 'home' now genuinely attempts a connection, so the port it
-     * resolved to is observable in the connection-failure message
-     * (Milestone 2 privacy rules: the human-readable message may name
-     * the port; the structured log never does -- see
-     * test_config_summary_omits_raw_port_and_config_path). */
+    /* Use legacy print here because M21 migrated home to daemon/client
+     * config and it must not consume hardware config anymore. */
+    char gcode_path[64];
+    write_temp_gcode("M105\n", gcode_path, sizeof(gcode_path));
     char *argv[] = {(char *)"printerctl", (char *)"--config", path,
                      (char *)"--port", (char *)"/dev/from-cli",
-                     (char *)"home"};
+                     (char *)"print", gcode_path};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(6, argv, &out, &err);
+    int status = run_cli(7, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_COMM_ERROR,
-          "'home' with the resolved config attempts to open /dev/from-cli, which does not exist");
+          "'print' with the resolved config attempts to open /dev/from-cli, which does not exist");
     check(err != NULL && strstr(err, "/dev/from-cli") != NULL,
           "CLI port overrides the config file port (the connection failure names the CLI port)");
     check(err != NULL && strstr(err, "/dev/from-file") == NULL, "the config file's port never took effect");
@@ -605,6 +605,7 @@ static void test_config_file_precedence(void)
           "config file baud is applied when CLI does not override it");
 
     remove(path);
+    remove(gcode_path);
     free(out);
     free(err);
 }
@@ -779,22 +780,24 @@ static void test_config_summary_omits_raw_port_and_config_path(void)
     char path[64];
     write_temp_config("baud=57600\n", path, sizeof(path));
 
-    /* 'home' now genuinely attempts a connection and fails (the port
+    /* Legacy print still attempts a direct connection and fails (the port
      * does not exist), so the port legitimately appears in the
      * human-readable failure message elsewhere in `err` -- the
      * assertions below check the config_summary log line specifically,
      * not the whole buffer, matching the Milestone 2 privacy rules
      * (structured log never leaks it; human-readable output may). */
+    char gcode_path[64];
+    write_temp_gcode("M105\n", gcode_path, sizeof(gcode_path));
     char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"/dev/ttyACM0",
                      (char *)"--config", path,
-                     (char *)"home"};
+                     (char *)"print", gcode_path};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(6, argv, &out, &err);
+    int status = run_cli(7, argv, &out, &err);
 
     check(status == PRINTERCTL_EXIT_COMM_ERROR,
-          "port+config resolved 'home' attempts a real connection and fails to open the nonexistent port");
+          "port+config resolved 'print' attempts a real connection and fails to open the nonexistent port");
 
     const char *summary_line = err != NULL ? strstr(err, "\tINFO\tconfig_summary\t") : NULL;
     check(summary_line != NULL, "log includes a config_summary line");
@@ -822,6 +825,7 @@ static void test_config_summary_omits_raw_port_and_config_path(void)
           "the human-readable connection-failure message may still name the port");
 
     remove(path);
+    remove(gcode_path);
     free(out);
     free(err);
 }
@@ -1206,60 +1210,6 @@ typedef struct {
     char slave_path[64];
 } cli_mock_printer_t;
 
-static bool cli_mock_start(cli_mock_printer_t *mock, const char *scripted_reply)
-{
-    mock->master = posix_openpt(O_RDWR | O_NOCTTY);
-    if (mock->master < 0 || grantpt(mock->master) != 0 || unlockpt(mock->master) != 0) {
-        fprintf(stderr, "FAIL: cannot create pty for the mock printer\n");
-        g_failures++;
-        return false;
-    }
-
-    const char *name = ptsname(mock->master);
-    if (name == NULL || strlen(name) >= sizeof(mock->slave_path)) {
-        fprintf(stderr, "FAIL: ptsname for the mock printer\n");
-        g_failures++;
-        close(mock->master);
-        return false;
-    }
-    strcpy(mock->slave_path, name);
-
-    mock->child = fork();
-    if (mock->child < 0) {
-        fprintf(stderr, "FAIL: cannot fork the mock printer\n");
-        g_failures++;
-        close(mock->master);
-        return false;
-    }
-
-    if (mock->child == 0) {
-        char c;
-        for (;;) {
-            ssize_t n = read(mock->master, &c, 1);
-            if (n <= 0) {
-                _exit(1);
-            }
-            if (c == '\n') {
-                break;
-            }
-        }
-        if (scripted_reply != NULL) {
-            size_t length = strlen(scripted_reply);
-            if (write(mock->master, scripted_reply, length) != (ssize_t)length) {
-                _exit(1);
-            }
-        }
-        for (;;) {
-            ssize_t n = read(mock->master, &c, 1);
-            if (n <= 0) {
-                _exit(0);
-            }
-        }
-    }
-
-    return true;
-}
-
 /*
  * Streaming variant of the mock: one scripted reply per received
  * command line, in order, then silence (drain until killed). Used by
@@ -1373,29 +1323,17 @@ static void test_info_end_to_end(void)
 
 static void test_send_end_to_end_logs_full_exchange(void)
 {
-    cli_mock_printer_t mock;
-    if (!cli_mock_start(&mock, "echo:Settings Stored\nok\n")) {
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"--verbose", (char *)"send", (char *)"M500"};
+    char *argv[] = {(char *)"printerctl", (char *)"--verbose", (char *)"send", (char *)"M500"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(6, argv, &out, &err);
+    int status = run_cli(4, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_OK, "'send' against the mock printer exits with success");
-    check(out != NULL && strstr(out, "> M500") != NULL, "'send' echoes the transmitted command");
-    check(out != NULL && strstr(out, "< echo:Settings Stored") != NULL,
-          "'send' renders each received line");
-    check(out != NULL && strstr(out, "< ok") != NULL, "'send' renders the acknowledgement");
-    check(err != NULL && strstr(err, "\tDEBUG\tserial_tx\tM500") != NULL,
-          "'send' logs the transmitted line");
-    check(err != NULL && strstr(err, "\tDEBUG\tserial_rx\tok") != NULL,
-          "'send' logs the received lines");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR, "migrated 'send' fails cleanly when daemon is unavailable");
+    check(err != NULL && strstr(err, "\tDEBUG\tcommand_parsed\tcommand=send") != NULL,
+          "migrated 'send' still logs CLI parsing");
+    check(err != NULL && strstr(err, "connect") != NULL, "the daemon connection error is reported");
 
-    cli_mock_stop(&mock);
     free(out);
     free(err);
 }
@@ -1417,12 +1355,7 @@ static void test_send_g28_blocked_end_to_end(void)
         free(err);
     }
 
-    cli_mock_printer_t mock;
-    if (!cli_mock_start(&mock, NULL)) {
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
+    char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"/tmp/unused",
                      (char *)"send", (char *)"G28"};
     char *out = NULL;
     char *err = NULL;
@@ -1433,54 +1366,37 @@ static void test_send_g28_blocked_end_to_end(void)
     check(err != NULL && strstr(err, "G28") != NULL, "the rejection names G28");
     check(err != NULL && strstr(err, "'home' command") != NULL, "the rejection explains why");
 
-    cli_mock_stop(&mock);
     free(out);
     free(err);
 }
 
 static void test_printer_error_end_to_end(void)
 {
-    cli_mock_printer_t mock;
-    if (!cli_mock_start(&mock, "Error:Thermal Runaway\n")) {
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"send", (char *)"M105"};
+    char *argv[] = {(char *)"printerctl", (char *)"send", (char *)"M105"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(5, argv, &out, &err);
+    int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_PRINTER_ERROR,
-          "an Error: reply exits with the printer error code");
-    check(err != NULL && strstr(err, "Thermal Runaway") != NULL,
-          "the printer's error message reaches the operator");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "migrated 'send' reports daemon unavailable without falling back to serial");
 
-    cli_mock_stop(&mock);
     free(out);
     free(err);
 }
 
 static void test_timeout_end_to_end(void)
 {
-    cli_mock_printer_t mock;
-    if (!cli_mock_start(&mock, NULL)) { /* the mock never answers */
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"--timeout", (char *)"150", (char *)"send", (char *)"M105"};
+    char *argv[] = {(char *)"printerctl", (char *)"--timeout", (char *)"150",
+                     (char *)"send", (char *)"M105"};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(7, argv, &out, &err);
+    int status = run_cli(5, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_COMM_ERROR,
-          "a silent printer exits with the communication error code");
-    check(err != NULL && strstr(err, "timed out") != NULL, "the timeout message is explicit");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR, "migrated 'send' does not use CLI timeout as serial config");
+    check(err != NULL && strstr(err, "connect") != NULL, "the daemon connection error is reported");
 
-    cli_mock_stop(&mock);
     free(out);
     free(err);
 }
@@ -1631,61 +1547,20 @@ static void test_print_timeout_end_to_end(void)
 
 static void test_pause_resume_cancel_sd_end_to_end(void)
 {
-    const struct {
-        const char *command;
-        const char *tx_line;
-        const char *report;
-    } cases[] = {
-        {"pause", "> M25", "SD print pause requested (M25 acknowledged)"},
-        {"resume", "> M24", "SD print resume requested (M24 acknowledged)"},
-        {"cancel", "> M524", "SD print abort requested (M524 acknowledged)"},
-    };
+    const char *commands[] = {"pause", "resume", "cancel"};
 
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        cli_mock_printer_t mock;
-        if (!cli_mock_start(&mock, "ok\n")) {
-            return;
-        }
-
-        char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                         (char *)"--verbose", (char *)cases[i].command};
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        char *argv[] = {(char *)"printerctl", (char *)commands[i]};
         char *out = NULL;
         char *err = NULL;
 
-        int status = run_cli(5, argv, &out, &err);
+        int status = run_cli(2, argv, &out, &err);
 
-        check(status == PRINTERCTL_EXIT_OK, "an SD-print control against the mock printer exits with success");
-        check(out != NULL && strstr(out, cases[i].tx_line) != NULL,
-              "the SD-print control echoes the Marlin command it transmits");
-        check(out != NULL && strstr(out, "< ok") != NULL,
-              "the SD-print control renders the acknowledgement");
-        check(out != NULL && strstr(out, cases[i].report) != NULL,
-              "the SD-print control reports what was requested");
-        check(err != NULL && strstr(err, "state=sd_") != NULL,
-              "the requested SD control is logged as a state transition");
+        check(status == PRINTERCTL_EXIT_UNAVAILABLE,
+              "bare pause/resume/cancel are reserved for host control until M23");
+        check(err != NULL && strstr(err, "use 'sd") != NULL,
+              "the operator is pointed at the SD namespace");
 
-        cli_mock_stop(&mock);
-        free(out);
-        free(err);
-    }
-
-    {
-        /* An Error: reply fails the control with the printer error code. */
-        cli_mock_printer_t mock;
-        if (!cli_mock_start(&mock, "Error:Printer halted. kill() called!\n")) {
-            return;
-        }
-
-        char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path, (char *)"pause"};
-        char *out = NULL;
-        char *err = NULL;
-
-        int status = run_cli(4, argv, &out, &err);
-
-        check(status == PRINTERCTL_EXIT_PRINTER_ERROR,
-              "an Error: reply to an SD-print control exits with the printer error code");
-
-        cli_mock_stop(&mock);
         free(out);
         free(err);
     }
@@ -1703,11 +1578,12 @@ static void test_dry_run_sd_controls(void)
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)cases[i].command};
+        char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"sd",
+                         (char *)cases[i].command};
         char *out = NULL;
         char *err = NULL;
 
-        int status = run_cli(3, argv, &out, &err);
+        int status = run_cli(4, argv, &out, &err);
 
         check(status == PRINTERCTL_EXIT_OK, "a dry-run SD-print control exits with success without a port");
         check(out != NULL && strstr(out, cases[i].would_send) != NULL,

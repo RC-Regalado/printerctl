@@ -68,6 +68,9 @@ static const char *command_name(printerctl_command_t command)
     case PRINTERCTL_COMMAND_TEMP: return "temp";
     case PRINTERCTL_COMMAND_POSITION: return "position";
     case PRINTERCTL_COMMAND_INFO: return "info";
+    case PRINTERCTL_COMMAND_SD_PAUSE: return "sd pause";
+    case PRINTERCTL_COMMAND_SD_RESUME: return "sd resume";
+    case PRINTERCTL_COMMAND_SD_CANCEL: return "sd cancel";
     case PRINTERCTL_COMMAND_POWER_LOW_BATTERY: return "power";
     }
     return "unknown";
@@ -78,6 +81,27 @@ static bool is_migrated_query_command(printerctl_command_t command)
     return command == PRINTERCTL_COMMAND_TEMP ||
            command == PRINTERCTL_COMMAND_POSITION ||
            command == PRINTERCTL_COMMAND_INFO;
+}
+
+static bool is_migrated_physical_command(printerctl_command_t command)
+{
+    return command == PRINTERCTL_COMMAND_SEND ||
+           command == PRINTERCTL_COMMAND_HOME ||
+           command == PRINTERCTL_COMMAND_SD_PAUSE ||
+           command == PRINTERCTL_COMMAND_SD_RESUME ||
+           command == PRINTERCTL_COMMAND_SD_CANCEL;
+}
+
+static bool is_migrated_daemon_command(printerctl_command_t command)
+{
+    return is_migrated_query_command(command) || is_migrated_physical_command(command);
+}
+
+static bool is_reserved_host_control_command(printerctl_command_t command)
+{
+    return command == PRINTERCTL_COMMAND_PAUSE ||
+           command == PRINTERCTL_COMMAND_RESUME ||
+           command == PRINTERCTL_COMMAND_CANCEL;
 }
 
 bool printerctl_cli_parse(int argc, char *const argv[],
@@ -246,6 +270,23 @@ bool printerctl_cli_parse(int argc, char *const argv[],
         command = PRINTERCTL_COMMAND_POSITION;
     } else if (strcmp(requested_command, "info") == 0) {
         command = PRINTERCTL_COMMAND_INFO;
+    } else if (strcmp(requested_command, "sd") == 0) {
+        if (i >= argc) {
+            set_error(out_error, "command 'sd' requires a subcommand (expected 'pause', 'resume' or 'cancel')");
+            return false;
+        }
+        if (strcmp(argv[i], "pause") == 0) {
+            command = PRINTERCTL_COMMAND_SD_PAUSE;
+        } else if (strcmp(argv[i], "resume") == 0) {
+            command = PRINTERCTL_COMMAND_SD_RESUME;
+        } else if (strcmp(argv[i], "cancel") == 0) {
+            command = PRINTERCTL_COMMAND_SD_CANCEL;
+        } else {
+            set_error(out_error, "unrecognized subcommand '%s' for 'sd' (expected 'pause', 'resume' or 'cancel')",
+                       argv[i]);
+            return false;
+        }
+        i++;
     } else if (strcmp(requested_command, "power") == 0) {
         command = PRINTERCTL_COMMAND_POWER_LOW_BATTERY;
     } else {
@@ -318,6 +359,9 @@ bool printerctl_cli_parse(int argc, char *const argv[],
     case PRINTERCTL_COMMAND_TEMP:
     case PRINTERCTL_COMMAND_POSITION:
     case PRINTERCTL_COMMAND_INFO:
+    case PRINTERCTL_COMMAND_SD_PAUSE:
+    case PRINTERCTL_COMMAND_SD_RESUME:
+    case PRINTERCTL_COMMAND_SD_CANCEL:
         if (i < argc) {
             set_error(out_error, "too many arguments");
             return false;
@@ -356,8 +400,8 @@ static void print_help(FILE *out)
         "Command-line controller for Marlin-based 3D printers over USB serial.\n"
         "'print FILE' streams a G-code file one acknowledged command at a time\n"
         "(Milestone 7); 'temp', 'position' and 'info' query through printerctld\n"
-        "(Milestone 20); 'send' runs one direct command. 'pause', 'resume' and 'cancel' control a print\n"
-        "running from the printer's SD card (Milestone 8; see Print session\n"
+        "(Milestone 20); 'send', 'home' and 'sd pause/resume/cancel' run through printerctld (M21).\n"
+        "'pause', 'resume' and 'cancel' are reserved for host prints (M23; see Print session\n"
         "control below for host streams). 'power low-battery' notifies a\n"
         "running print of an external low-battery condition (Milestone 10;\n"
         "meant to be run by an APCUPSD script, see scripts/apcupsd/). 'home'\n"
@@ -380,9 +424,12 @@ static void print_help(FILE *out)
         "                                       and report only, no serial access)\n"
         "  send COMMAND                        Send one raw command\n"
         "  home [X|Y|Z]                        Home all axes, or a single one\n"
-        "  pause                                Pause the printer's SD print (M25)\n"
-        "  resume                               Resume the printer's SD print (M24)\n"
-        "  cancel                               Abort the printer's SD print (M524)\n"
+        "  pause                                Host print pause (reserved until M23)\n"
+        "  resume                               Host print resume (reserved until M23)\n"
+        "  cancel                               Host print cancel (reserved until M23)\n"
+        "  sd pause                             Pause the printer's SD print (M25)\n"
+        "  sd resume                            Resume the printer's SD print (M24)\n"
+        "  sd cancel                            Abort the printer's SD print (M524)\n"
         "  temp                                 Query temperatures\n"
         "  position                             Query current position\n"
         "  info                                 Query printer information\n"
@@ -398,9 +445,9 @@ static void print_help(FILE *out)
         "                     event, not an operator cancel (see 'power' below)\n"
         "  Nothing is sent to the printer on pause/resume/cancel/power-cancel of\n"
         "  a host stream: it never moves, heats or parks on its own. The\n"
-        "  'pause', 'resume' and 'cancel' commands instead talk to a print\n"
-        "  running from the printer's SD card; they cannot reach a host stream,\n"
-        "  whose serial port is held exclusively while it runs.\n"
+        "  The 'sd pause', 'sd resume' and 'sd cancel' commands instead talk\n"
+        "  to a print running from the printer's SD card; they cannot reach a\n"
+        "  host stream.\n"
         "\n",
         PRINTERCTL_CONFIG_MIN_BAUD, PRINTERCTL_CONFIG_MAX_BAUD, PRINTERCTL_CONFIG_DEFAULT_BAUD,
         PRINTERCTL_CONFIG_MIN_TIMEOUT_MS, PRINTERCTL_CONFIG_MAX_TIMEOUT_MS, PRINTERCTL_CONFIG_DEFAULT_TIMEOUT_MS);
@@ -422,8 +469,7 @@ static void print_help(FILE *out)
         "Safety:\n"
         "  Min end-stops are enabled on all three axes, so 'home' (and 'home\n"
         "  X'/'home Y'/'home Z') needs no confirmation flag. It remains a\n"
-        "  direct serial command during Phase 2 migration, so a configured\n"
-        "  --port is required until that command is migrated.\n"
+        "  daemon-owned command during Phase 2 migration.\n"
         "  G28 remains disabled everywhere else: a G-code file containing G28\n"
         "  always fails 'print' (exit code 4; 'print' has no confirmation\n"
         "  flag), and 'send' refuses G28 the same way, with no bypass --\n"
@@ -693,18 +739,6 @@ static void report_printer_failure(FILE *err, printerctl_logger_t *logger, bool 
     }
 }
 
-/* stdout renderer for `send`: every received line, prefixed to read as an exchange. */
-static void render_received_line(const char *line, void *context)
-{
-    FILE *out = context;
-    fprintf(out, "< %s\n", line);
-}
-
-/*
- * Transitional direct serial single-command execution. M20 moved
- * temp/position/info to printerctld; send/home/SD controls remain here
- * until their Phase 2 migration milestones.
- */
 /*
  * Min end-stops are enabled on all three axes, so `home` maps to a
  * fixed, safe G28 variant -- never operator-typed text, so it does not go through
@@ -734,94 +768,29 @@ static const char *home_axis_name(printerctl_home_axis_t axis)
     }
 }
 
-static int run_single_command(const printerctl_command_args_t *args,
-                               const printerctl_config_t *config,
-                               printerctl_logger_t *logger, bool logger_ready,
-                               FILE *out, FILE *err)
+static uint8_t plp_home_axis(printerctl_home_axis_t axis)
 {
-    const char *name = command_name(args->command);
+    switch (axis) {
+    case PRINTERCTL_HOME_X: return PRINTERCTL_PLP1_HOME_X;
+    case PRINTERCTL_HOME_Y: return PRINTERCTL_PLP1_HOME_Y;
+    case PRINTERCTL_HOME_Z: return PRINTERCTL_PLP1_HOME_Z;
+    case PRINTERCTL_HOME_ALL:
+    default: return PRINTERCTL_PLP1_HOME_ALL;
+    }
+}
 
-    if (args->command == PRINTERCTL_COMMAND_SEND &&
-        printerctl_gcode_command_is_unsafe_g28(args->send_command)) {
-        static const char *const safety_message =
-            "refusing to send G28: homing is only available through the "
-            "'home' command, not 'send' (see the safety policy in Agents.md)";
-        fprintf(err, "printerctl: %s\n", safety_message);
-        if (logger_ready) {
-            warn_on_log_failure(err, printerctl_log_error(logger, safety_message),
-                "failed to record error log");
+static void render_transcript(FILE *out, const char *transcript)
+{
+    const char *line = transcript;
+    while (line[0] != '\0') {
+        const char *end = strchr(line, '\n');
+        if (end == NULL) {
+            fprintf(out, "< %s\n", line);
+            return;
         }
-        return PRINTERCTL_EXIT_SAFETY_ERROR;
+        fprintf(out, "< %.*s\n", (int)(end - line), line);
+        line = end + 1;
     }
-
-    printerctl_printer_session_t session;
-    printerctl_printer_error_t error;
-
-    printerctl_printer_status_t status =
-        printerctl_printer_connect(&session, config, logger_ready ? logger : NULL, &error);
-    if (status != PRINTERCTL_PRINTER_OK) {
-        report_printer_failure(err, logger, logger_ready, name, status, &error);
-        return printer_status_to_exit_code(status);
-    }
-
-    switch (args->command) {
-    case PRINTERCTL_COMMAND_HOME: {
-        const char *command = home_axis_command(args->home_axis);
-        fprintf(out, "> %s\n", command);
-        status = printerctl_printer_execute(&session, command, render_received_line, out, &error);
-        if (status == PRINTERCTL_PRINTER_OK) {
-            fprintf(out, "printerctl: home complete: %s (%s acknowledged)\n",
-                    home_axis_name(args->home_axis), command);
-        }
-        break;
-    }
-
-    /* Milestone 8 SD-print controls: explicit operator commands sent to
-     * a print running from the printer's SD card. A host stream is
-     * controlled with signals inside its own process, never from here —
-     * its serial port is held exclusively while it runs. */
-    case PRINTERCTL_COMMAND_PAUSE:
-        fprintf(out, "> M25\n");
-        status = printerctl_printer_pause_sd_print(&session, render_received_line, out, &error);
-        if (status == PRINTERCTL_PRINTER_OK) {
-            fprintf(out, "printerctl: SD print pause requested (M25 acknowledged)\n");
-        }
-        break;
-
-    case PRINTERCTL_COMMAND_RESUME:
-        fprintf(out, "> M24\n");
-        status = printerctl_printer_resume_sd_print(&session, render_received_line, out, &error);
-        if (status == PRINTERCTL_PRINTER_OK) {
-            fprintf(out, "printerctl: SD print resume requested (M24 acknowledged)\n");
-        }
-        break;
-
-    case PRINTERCTL_COMMAND_CANCEL:
-        fprintf(out, "> M524\n");
-        status = printerctl_printer_cancel_sd_print(&session, render_received_line, out, &error);
-        if (status == PRINTERCTL_PRINTER_OK) {
-            fprintf(out, "printerctl: SD print abort requested (M524 acknowledged)\n");
-        }
-        break;
-
-    case PRINTERCTL_COMMAND_SEND:
-    default:
-        fprintf(out, "> %s\n", args->send_command);
-        status = printerctl_printer_send(&session, args->send_command,
-                                          render_received_line, out, &error);
-        break;
-    }
-
-    if (status != PRINTERCTL_PRINTER_OK) {
-        report_printer_failure(err, logger, logger_ready, name, status, &error);
-    }
-
-    printerctl_printer_error_t disconnect_error;
-    if (printerctl_printer_disconnect(&session, &disconnect_error) != PRINTERCTL_PRINTER_OK) {
-        fprintf(err, "printerctl: warning: failed to close the serial port cleanly\n");
-    }
-
-    return printer_status_to_exit_code(status);
 }
 
 static int wire_status_to_exit_code(uint16_t wire_status)
@@ -829,6 +798,9 @@ static int wire_status_to_exit_code(uint16_t wire_status)
     switch (wire_status) {
     case PRINTERCTL_PLP1_SUCCESS:
         return PRINTERCTL_EXIT_OK;
+    case PRINTERCTL_PLP1_SAFETY_REJECTED:
+    case PRINTERCTL_PLP1_INVALID_GCODE_SOURCE:
+        return PRINTERCTL_EXIT_SAFETY_ERROR;
     case PRINTERCTL_PLP1_INVALID_ARGUMENT:
         return PRINTERCTL_EXIT_USAGE_ERROR;
     case PRINTERCTL_PLP1_PRINTER_ERROR:
@@ -934,6 +906,79 @@ static int run_query_command(const printerctl_command_args_t *args,
             if (info.uuid[0] != '\0') {
                 fprintf(out, "printerctl: uuid: %s\n", info.uuid);
             }
+        }
+    }
+
+    printerctl_client_close(&client);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, command_name(args->command), status,
+                              &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+    return PRINTERCTL_EXIT_OK;
+}
+
+static int run_physical_command(const printerctl_command_args_t *args,
+                                printerctl_logger_t *logger, bool logger_ready,
+                                FILE *out, FILE *err)
+{
+    if (args->command == PRINTERCTL_COMMAND_SEND &&
+        printerctl_gcode_command_is_unsafe_g28(args->send_command)) {
+        static const char *const safety_message =
+            "refusing to send G28: homing is only available through the "
+            "'home' command, not 'send' (see the safety policy in Agents.md)";
+        fprintf(err, "printerctl: %s\n", safety_message);
+        if (logger_ready) {
+            warn_on_log_failure(err, printerctl_log_error(logger, safety_message),
+                "failed to record error log");
+        }
+        return PRINTERCTL_EXIT_SAFETY_ERROR;
+    }
+
+    printerctl_client_t client;
+    printerctl_client_error_t error;
+    printerctl_client_status_t status =
+        printerctl_client_connect(&client, PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, &error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, command_name(args->command), status,
+                              &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    if (args->command == PRINTERCTL_COMMAND_SEND) {
+        printerctl_plp1_raw_send_response_t response;
+        fprintf(out, "> %s\n", args->send_command);
+        status = printerctl_client_raw_send(&client, args->send_command,
+                                            PRINTERCTL_CLI_PLP_TIMEOUT_MS, &response, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            render_transcript(out, response.transcript);
+        }
+    } else if (args->command == PRINTERCTL_COMMAND_HOME) {
+        const char *command = home_axis_command(args->home_axis);
+        fprintf(out, "> %s\n", command);
+        status = printerctl_client_home(&client, plp_home_axis(args->home_axis),
+                                        PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: home complete: %s (%s acknowledged)\n",
+                    home_axis_name(args->home_axis), command);
+        }
+    } else if (args->command == PRINTERCTL_COMMAND_SD_PAUSE) {
+        fprintf(out, "> M25\n");
+        status = printerctl_client_sd_pause(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: SD print pause requested (M25 acknowledged)\n");
+        }
+    } else if (args->command == PRINTERCTL_COMMAND_SD_RESUME) {
+        fprintf(out, "> M24\n");
+        status = printerctl_client_sd_resume(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: SD print resume requested (M24 acknowledged)\n");
+        }
+    } else {
+        fprintf(out, "> M524\n");
+        status = printerctl_client_sd_cancel(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: SD print abort requested (M524 acknowledged)\n");
         }
     }
 
@@ -1281,9 +1326,9 @@ static const char *single_command_tx_line(const printerctl_command_args_t *args)
     case PRINTERCTL_COMMAND_POSITION: return "M114";
     case PRINTERCTL_COMMAND_INFO: return "M115";
     case PRINTERCTL_COMMAND_HOME: return home_axis_command(args->home_axis);
-    case PRINTERCTL_COMMAND_PAUSE: return "M25";
-    case PRINTERCTL_COMMAND_RESUME: return "M24";
-    case PRINTERCTL_COMMAND_CANCEL: return "M524";
+    case PRINTERCTL_COMMAND_SD_PAUSE: return "M25";
+    case PRINTERCTL_COMMAND_SD_RESUME: return "M24";
+    case PRINTERCTL_COMMAND_SD_CANCEL: return "M524";
     case PRINTERCTL_COMMAND_SEND: return args->send_command;
     default: return NULL;
     }
@@ -1317,8 +1362,10 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
      * Migrated PLP commands must switch to the client view and stop
      * consuming port/baud/timeout; this compatibility view is removed in M25. */
     printerctl_config_view_t config_view =
-        is_migrated_query_command(request.command_args.command) ? PRINTERCTL_CONFIG_VIEW_CLIENT
-                                                                : PRINTERCTL_CONFIG_VIEW_LEGACY_CLI;
+        (is_migrated_daemon_command(request.command_args.command) ||
+         is_reserved_host_control_command(request.command_args.command))
+            ? PRINTERCTL_CONFIG_VIEW_CLIENT
+            : PRINTERCTL_CONFIG_VIEW_LEGACY_CLI;
     printerctl_config_status_t status = printerctl_config_resolve_for_view(
         &request.overrides, config_view, &config, &config_error);
     if (status != PRINTERCTL_CONFIG_OK) {
@@ -1366,9 +1413,9 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
     bool is_single_command =
         request.command_args.command == PRINTERCTL_COMMAND_SEND ||
         request.command_args.command == PRINTERCTL_COMMAND_HOME ||
-        request.command_args.command == PRINTERCTL_COMMAND_PAUSE ||
-        request.command_args.command == PRINTERCTL_COMMAND_RESUME ||
-        request.command_args.command == PRINTERCTL_COMMAND_CANCEL;
+        request.command_args.command == PRINTERCTL_COMMAND_SD_PAUSE ||
+        request.command_args.command == PRINTERCTL_COMMAND_SD_RESUME ||
+        request.command_args.command == PRINTERCTL_COMMAND_SD_CANCEL;
 
     int exit_code;
 
@@ -1401,7 +1448,7 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
             exit_code = PRINTERCTL_EXIT_OK;
         }
     } else if (is_single_command) {
-        exit_code = run_single_command(&request.command_args, &config, &logger, logger_ready, out, err);
+        exit_code = run_physical_command(&request.command_args, &logger, logger_ready, out, err);
     } else if (is_migrated_query_command(request.command_args.command) && config.dry_run) {
         const char *tx_line = single_command_tx_line(&request.command_args);
         fprintf(out,
@@ -1410,6 +1457,13 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
         exit_code = PRINTERCTL_EXIT_OK;
     } else if (is_migrated_query_command(request.command_args.command)) {
         exit_code = run_query_command(&request.command_args, &logger, logger_ready, out, err);
+    } else if (is_reserved_host_control_command(request.command_args.command)) {
+        fprintf(err,
+                "printerctl: command '%s' is reserved for host print control and is not "
+                "available until M23; use 'sd %s' for SD-card prints\n",
+                command_name(request.command_args.command),
+                command_name(request.command_args.command));
+        exit_code = PRINTERCTL_EXIT_UNAVAILABLE;
     } else if (request.command_args.command == PRINTERCTL_COMMAND_POWER_LOW_BATTERY && config.dry_run) {
         /* No serial device is ever opened by this command in the first
          * place, but --dry-run still reports rather than acts, exactly
