@@ -1,12 +1,9 @@
-/* POSIX.1-2008 for sigaction(), used by the Milestone 8 print session controls. */
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 
 #include "printerctl/client/plp_client.h"
 #include "printerctl/cli.h"
-#include "printerctl/core/print_engine.h"
 #include "printerctl/gcode.h"
 #include "printerctl/logging.h"
-#include "printerctl/printer.h"
 #include "printerctl/record.h"
 #include "printerctl/version.h"
 
@@ -94,7 +91,9 @@ static bool is_migrated_physical_command(printerctl_command_t command)
 
 static bool is_migrated_daemon_command(printerctl_command_t command)
 {
-    return is_migrated_query_command(command) || is_migrated_physical_command(command);
+    return command == PRINTERCTL_COMMAND_PRINT ||
+           is_migrated_query_command(command) ||
+           is_migrated_physical_command(command);
 }
 
 static bool is_reserved_host_control_command(printerctl_command_t command)
@@ -397,9 +396,9 @@ static void print_help(FILE *out)
         "       printerctl --help\n"
         "       printerctl --version\n"
         "\n"
-        "Command-line controller for Marlin-based 3D printers over USB serial.\n"
-        "'print FILE' streams a G-code file one acknowledged command at a time\n"
-        "(Milestone 7); 'temp', 'position' and 'info' query through printerctld\n"
+        "Command-line controller for Marlin-based 3D printers through printerctld.\n"
+        "'print FILE' starts daemon-owned host streaming over printerctld\n"
+        "(Milestone 22); 'temp', 'position' and 'info' query through printerctld\n"
         "(Milestone 20); 'send', 'home' and 'sd pause/resume/cancel' run through printerctld (M21).\n"
         "'pause', 'resume' and 'cancel' are reserved for host prints (M23; see Print session\n"
         "control below for host streams). 'power low-battery' notifies a\n"
@@ -419,9 +418,9 @@ static void print_help(FILE *out)
         "  --config PATH     Load key=value configuration from PATH\n"
         "\n"
         "Commands:\n"
-        "  print FILE                          Stream a G-code file, waiting for each\n"
-        "                                       command's 'ok' (with --dry-run: parse\n"
-        "                                       and report only, no serial access)\n"
+        "  print FILE                          Ask printerctld to start a host print\n"
+        "                                       (with --dry-run: parse and report only,\n"
+        "                                       no daemon or serial access)\n"
         "  send COMMAND                        Send one raw command\n"
         "  home [X|Y|Z]                        Home all axes, or a single one\n"
         "  pause                                Host print pause (reserved until M23)\n"
@@ -436,15 +435,11 @@ static void print_help(FILE *out)
         "  power low-battery                    Notify a running print of a power event\n"
         "\n"
         "Print session control:\n"
-        "  While 'print FILE' streams, signal the printerctl process to control\n"
-        "  the session (e.g. 'kill -USR1 PID' from another terminal):\n"
-        "    SIGUSR1          pause after the current command is acknowledged\n"
-        "    SIGUSR2          resume from the next unsent command\n"
-        "    SIGINT/SIGTERM   cancel gracefully (Ctrl+C; summary still printed)\n"
-        "    SIGPWR           cancel gracefully as a power-failure/low-battery\n"
-        "                     event, not an operator cancel (see 'power' below)\n"
+        "  'print FILE' starts daemon-owned host streaming and returns after\n"
+        "  printerctld accepts the request; the stream continues if the client\n"
+        "  disconnects. Host pause/resume/cancel are added in M23.\n"
         "  Nothing is sent to the printer on pause/resume/cancel/power-cancel of\n"
-        "  a host stream: it never moves, heats or parks on its own. The\n"
+        "  a host stream: it never moves, heats or parks on its own.\n"
         "  The 'sd pause', 'sd resume' and 'sd cancel' commands instead talk\n"
         "  to a print running from the printer's SD card; they cannot reach a\n"
         "  host stream.\n"
@@ -470,10 +465,10 @@ static void print_help(FILE *out)
         "  Min end-stops are enabled on all three axes, so 'home' (and 'home\n"
         "  X'/'home Y'/'home Z') needs no confirmation flag. It remains a\n"
         "  daemon-owned command during Phase 2 migration.\n"
-        "  G28 remains disabled everywhere else: a G-code file containing G28\n"
-        "  always fails 'print' (exit code 4; 'print' has no confirmation\n"
-        "  flag), and 'send' refuses G28 the same way, with no bypass --\n"
-        "  homing is only ever available through the dedicated 'home' command,\n"
+        "  G28 remains disabled everywhere else: daemon-owned print execution\n"
+        "  rejects G28 from sliced files with no confirmation flag, and\n"
+        "  'send' refuses G28 the same way, with no bypass -- homing is\n"
+        "  only ever available through the dedicated 'home' command,\n"
         "  never an unexpected side effect of a raw command or a sliced file.\n"
         "  Every other command passes through 'send', including the\n"
         "  operator's explicit emergency stop (M112).\n"
@@ -481,7 +476,7 @@ static void print_help(FILE *out)
         "Exit codes:\n"
         "  0  success (including --help/--version and a clean dry run)\n"
         "  2  usage error\n"
-        "  3  configuration error (including no --port for a printer command)\n"
+        "  3  configuration error\n"
         "  4  safety policy rejection (G28 in a G-code file or via send)\n"
         "  5  parsed successfully but not yet available in this build\n"
         "  6  G-code file error (unreadable, malformed, oversized line, ...)\n"
@@ -668,83 +663,11 @@ static int run_dry_run_print(const char *path, printerctl_logger_t *logger,
         : PRINTERCTL_EXIT_GCODE_ERROR;
 }
 
-static const char *printer_status_name(printerctl_printer_status_t status)
-{
-    switch (status) {
-    case PRINTERCTL_PRINTER_OK: return "ok";
-    case PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT: return "invalid_argument";
-    case PRINTERCTL_PRINTER_ERR_NOT_CONNECTED: return "not_connected";
-    case PRINTERCTL_PRINTER_ERR_NO_PORT: return "no_port";
-    case PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND: return "unsafe_command";
-    case PRINTERCTL_PRINTER_ERR_SERIAL: return "serial";
-    case PRINTERCTL_PRINTER_ERR_TIMEOUT: return "timeout";
-    case PRINTERCTL_PRINTER_ERR_PRINTER_ERROR: return "printer_error";
-    case PRINTERCTL_PRINTER_ERR_RESEND: return "resend";
-    case PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE: return "unexpected_response";
-    case PRINTERCTL_PRINTER_ERR_GCODE: return "gcode";
-    case PRINTERCTL_PRINTER_CANCELLED: return "cancelled";
-    case PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE: return "cancelled_power_failure";
-    }
-    return "unknown";
-}
-
-static int printer_status_to_exit_code(printerctl_printer_status_t status)
-{
-    switch (status) {
-    case PRINTERCTL_PRINTER_OK:
-        return PRINTERCTL_EXIT_OK;
-    case PRINTERCTL_PRINTER_ERR_NO_PORT:
-        return PRINTERCTL_EXIT_CONFIG_ERROR;
-    case PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND:
-        return PRINTERCTL_EXIT_SAFETY_ERROR;
-    case PRINTERCTL_PRINTER_ERR_INVALID_ARGUMENT:
-    case PRINTERCTL_PRINTER_ERR_NOT_CONNECTED:
-        return PRINTERCTL_EXIT_USAGE_ERROR;
-    case PRINTERCTL_PRINTER_ERR_SERIAL:
-    case PRINTERCTL_PRINTER_ERR_TIMEOUT:
-        return PRINTERCTL_EXIT_COMM_ERROR;
-    case PRINTERCTL_PRINTER_ERR_PRINTER_ERROR:
-    case PRINTERCTL_PRINTER_ERR_RESEND:
-    case PRINTERCTL_PRINTER_ERR_UNEXPECTED_RESPONSE:
-        return PRINTERCTL_EXIT_PRINTER_ERROR;
-    case PRINTERCTL_PRINTER_ERR_GCODE:
-        return PRINTERCTL_EXIT_GCODE_ERROR;
-    case PRINTERCTL_PRINTER_CANCELLED:
-        return PRINTERCTL_EXIT_PRINT_CANCELLED;
-    case PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE:
-        return PRINTERCTL_EXIT_PRINT_CANCELLED_POWER_FAILURE;
-    }
-    return PRINTERCTL_EXIT_COMM_ERROR;
-}
-
-/*
- * Reports a failed printer exchange: the human-readable message (which
- * may embed the port path, so it stays out of the structured log) to
- * `err`, and one generic ERROR record naming only the command and the
- * status, matching the Milestone 3 pattern for gcode failures.
- */
-static void report_printer_failure(FILE *err, printerctl_logger_t *logger, bool logger_ready,
-                                    const char *command_name_text,
-                                    printerctl_printer_status_t status,
-                                    const printerctl_printer_error_t *error)
-{
-    fprintf(err, "printerctl: %s\n", error->message);
-
-    if (logger_ready) {
-        char detail[96];
-        snprintf(detail, sizeof(detail), "command=%s status=%s",
-                 command_name_text, printer_status_name(status));
-        warn_on_log_failure(err, printerctl_log_error(logger, detail),
-            "failed to record error log");
-    }
-}
-
 /*
  * Min end-stops are enabled on all three axes, so `home` maps to a
- * fixed, safe G28 variant -- never operator-typed text, so it does not go through
- * printerctl_printer_send()'s G28 refusal (which still applies to
- * `send` and to G-code files, the only remaining paths where an
- * unconfirmed G28 could be unexpected).
+ * fixed, safe G28 variant -- never operator-typed text. Generic `send`
+ * still rejects G28 before IPC as UX, and the daemon remains the
+ * authoritative safety owner for raw-send and print execution.
  */
 static const char *home_axis_command(printerctl_home_axis_t axis)
 {
@@ -799,8 +722,11 @@ static int wire_status_to_exit_code(uint16_t wire_status)
     case PRINTERCTL_PLP1_SUCCESS:
         return PRINTERCTL_EXIT_OK;
     case PRINTERCTL_PLP1_SAFETY_REJECTED:
-    case PRINTERCTL_PLP1_INVALID_GCODE_SOURCE:
         return PRINTERCTL_EXIT_SAFETY_ERROR;
+    case PRINTERCTL_PLP1_FILE_NOT_FOUND:
+    case PRINTERCTL_PLP1_FILE_NOT_READABLE:
+    case PRINTERCTL_PLP1_INVALID_GCODE_SOURCE:
+        return PRINTERCTL_EXIT_GCODE_ERROR;
     case PRINTERCTL_PLP1_INVALID_ARGUMENT:
         return PRINTERCTL_EXIT_USAGE_ERROR;
     case PRINTERCTL_PLP1_PRINTER_ERROR:
@@ -838,6 +764,32 @@ static void report_client_failure(FILE *err, printerctl_logger_t *logger, bool l
         warn_on_log_failure(err, printerctl_log_error(logger, detail),
             "failed to record error log");
     }
+}
+
+static int run_print_start_command(const printerctl_command_args_t *args,
+                                   printerctl_logger_t *logger, bool logger_ready,
+                                   FILE *out, FILE *err)
+{
+    printerctl_client_t client;
+    printerctl_client_error_t error;
+    printerctl_client_status_t status =
+        printerctl_client_connect(&client, PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, &error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, "print", status, &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    status = printerctl_client_print_start(
+        &client, args->print_file, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+    printerctl_client_close(&client);
+
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, "print", status, &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    fprintf(out, "printerctl: print accepted by printerctld: '%s'\n", args->print_file);
+    return PRINTERCTL_EXIT_OK;
 }
 
 static double milli_to_double(int32_t value)
@@ -992,251 +944,12 @@ static int run_physical_command(const printerctl_command_args_t *args,
 }
 
 /*
- * Milestone 12: the CLI's client adapter over printerctl_print_engine_t.
- * Every operator-facing message the engine used to fprintf() directly
- * (progress, pause/resume, the power-failure notice, the marker
- * warning, the record outcome, the terminal summary) now arrives as a
- * printerctl_print_event_t; this is the one place that turns those back
- * into the exact same text run_print_command() used to print inline, so
- * `print`'s output is unchanged even though the lifecycle that produces
- * it now lives in `core/print_engine`.
- */
-typedef struct {
-    FILE *out;
-    FILE *err;
-    printerctl_logger_t *logger;
-    bool logger_ready;
-    const char *file;
-    unsigned last_percent; /* PROGRESS dedup, same rule the old renderer used. */
-} print_event_context_t;
-
-static void render_print_event(const printerctl_print_event_t *event, void *context)
-{
-    print_event_context_t *ctx = context;
-
-    switch (event->type) {
-    case PRINTERCTL_PRINT_EVENT_STARTED:
-        fprintf(ctx->out, "printerctl: printing '%s' — SIGUSR1 pauses, SIGINT cancels\n",
-                event->path);
-        fflush(ctx->out);
-        break;
-
-    case PRINTERCTL_PRINT_EVENT_PROGRESS:
-        if (event->progress->progress_percent != ctx->last_percent) {
-            fprintf(ctx->out,
-                    "printerctl: printing: %u%% (line %llu, %llu command(s) acknowledged)\n",
-                    event->progress->progress_percent,
-                    (unsigned long long)event->progress->line_number,
-                    (unsigned long long)event->progress->command_number);
-            fflush(ctx->out);
-            ctx->last_percent = event->progress->progress_percent;
-        }
-        break;
-
-    case PRINTERCTL_PRINT_EVENT_PAUSED:
-        fprintf(ctx->out, "printerctl: print paused — SIGUSR2 resumes, SIGINT cancels\n");
-        fflush(ctx->out);
-        break;
-
-    case PRINTERCTL_PRINT_EVENT_RESUMED:
-        fprintf(ctx->out, "printerctl: print resumed\n");
-        fflush(ctx->out);
-        break;
-
-    case PRINTERCTL_PRINT_EVENT_CANCELLING_POWER_FAILURE:
-        fprintf(ctx->out,
-                "printerctl: print cancelling: power-failure/low-battery signal received (SIGPWR)\n");
-        fflush(ctx->out);
-        break;
-
-    case PRINTERCTL_PRINT_EVENT_MARKER_WARNING:
-        fprintf(ctx->err,
-            "printerctl: warning: cannot record the active-print marker (%s); an "
-            "APCUPSD low-battery notification will not be able to find this print\n",
-            event->message);
-        break;
-
-    case PRINTERCTL_PRINT_EVENT_RECORD_WRITTEN:
-        fprintf(ctx->out, "printerctl: session record written to '%s'\n", event->path);
-        fflush(ctx->out);
-        break;
-
-    case PRINTERCTL_PRINT_EVENT_RECORD_FAILED:
-        fprintf(ctx->err, "printerctl: warning: no session record written: %s\n", event->message);
-        break;
-
-    case PRINTERCTL_PRINT_EVENT_COMPLETED:
-    case PRINTERCTL_PRINT_EVENT_CANCELLED:
-    case PRINTERCTL_PRINT_EVENT_FAILED: {
-        /* A cancel is the operator's (or, for a power failure, the
-         * APCUPSD script's) own request carried out, not a failure: no
-         * error report, no ERROR record -- the summary and the engine's
-         * own state_transition logging (inherited from
-         * printerctl_printer_print_file()) tell the story. */
-        if (event->type == PRINTERCTL_PRINT_EVENT_FAILED) {
-            report_printer_failure(ctx->err, ctx->logger, ctx->logger_ready, "print",
-                                    event->summary->status, event->error);
-        }
-
-        const char *state_name = "failed";
-        if (event->summary->state == PRINTERCTL_PRINT_COMPLETED) {
-            state_name = "completed";
-        } else if (event->summary->state == PRINTERCTL_PRINT_CANCELLED) {
-            state_name = "cancelled";
-        } else if (event->summary->state == PRINTERCTL_PRINT_CANCELLED_POWER_FAILURE) {
-            state_name = "cancelled_power_failure";
-        }
-
-        fprintf(ctx->out,
-            "printerctl: print %s: '%s' — %llu command(s) sent, %llu acknowledged, "
-            "last acknowledged line %llu, %u%%\n",
-            state_name,
-            ctx->file,
-            (unsigned long long)event->summary->commands_sent,
-            (unsigned long long)event->summary->commands_acknowledged,
-            (unsigned long long)event->summary->last_acknowledged_line,
-            event->summary->progress_percent);
-        fflush(ctx->out);
-        break;
-    }
-    }
-}
-
-/*
- * Milestone 12: `print FILE` control signals now feed
- * printerctl_print_engine_t directly instead of file-scope flags that a
- * CLI-owned poll function used to translate. Each handler is a single
- * call to a printerctl_print_engine_request_*() setter -- itself a
- * single sig_atomic_t assignment (see print_engine.h) -- so this stays
- * exactly as async-signal-safe as the flags it replaces. `g_active_engine`
- * is only non-NULL for the duration of run_print_command()'s call to
- * printerctl_print_engine_run(), the same window the old sigaction
- * install/restore pair used to bound.
- *
- *   SIGUSR1          pause after the current command's acknowledgement
- *   SIGUSR2          resume from the next unsent command
- *   SIGINT/SIGTERM   cancel gracefully (summary rendered, exit code 9)
- *   SIGPWR           power-failure cancel (delivered by `printerctl
- *                    power low-battery`, not the operator directly);
- *                    takes priority over an unresolved pause -- see
- *                    print_engine.c's on_control().
- */
-static printerctl_print_engine_t *g_active_engine;
-
-static void handle_print_cancel_signal(int signum)
-{
-    (void)signum;
-    if (g_active_engine != NULL) {
-        printerctl_print_engine_request_cancel(g_active_engine);
-    }
-}
-
-static void handle_print_pause_signal(int signum)
-{
-    (void)signum;
-    if (g_active_engine != NULL) {
-        printerctl_print_engine_request_pause(g_active_engine);
-    }
-}
-
-static void handle_print_resume_signal(int signum)
-{
-    (void)signum;
-    if (g_active_engine != NULL) {
-        printerctl_print_engine_request_resume(g_active_engine);
-    }
-}
-
-static void handle_print_power_failure_signal(int signum)
-{
-    (void)signum;
-    if (g_active_engine != NULL) {
-        printerctl_print_engine_request_cancel_power_failure(g_active_engine);
-    }
-}
-
-/*
- * Milestone 7/8/12 execution of `print FILE` (without --dry-run): the
- * CLI is now a thin client adapter over printerctl_print_engine_t,
- * which owns the actual lifecycle (connect, publish the active-print
- * marker, stream, interrupted-session record, disconnect) -- see
- * core/print_engine.c and docs/design/milestone-12-print-engine.md.
- * This function only wires argv/config to the engine, installs the
- * operator's session-control signal handlers for the duration of the
- * stream (restored before returning), and renders every event the
- * engine emits through render_print_event() so `print`'s output stays
- * exactly what it was before the extraction.
- */
-static int run_print_command(const printerctl_command_args_t *args,
-                              const printerctl_config_t *config,
-                              printerctl_logger_t *logger, bool logger_ready,
-                              FILE *out, FILE *err)
-{
-    printerctl_print_engine_t engine;
-    printerctl_printer_error_t error;
-
-    print_event_context_t event_context = {
-        .out = out,
-        .err = err,
-        .logger = logger,
-        .logger_ready = logger_ready,
-        .file = args->print_file,
-        .last_percent = (unsigned)-1,
-    };
-
-    printerctl_printer_status_t status = printerctl_print_engine_connect(
-        &engine, config, logger, logger_ready, render_print_event, &event_context, &error);
-    if (status != PRINTERCTL_PRINTER_OK) {
-        report_printer_failure(err, logger, logger_ready, "print", status, &error);
-        return printer_status_to_exit_code(status);
-    }
-
-    g_active_engine = &engine;
-
-    struct sigaction control_action;
-    memset(&control_action, 0, sizeof(control_action));
-    sigemptyset(&control_action.sa_mask);
-
-    struct sigaction old_int, old_term, old_usr1, old_usr2, old_pwr;
-    control_action.sa_handler = handle_print_cancel_signal;
-    sigaction(SIGINT, &control_action, &old_int);
-    sigaction(SIGTERM, &control_action, &old_term);
-    control_action.sa_handler = handle_print_pause_signal;
-    sigaction(SIGUSR1, &control_action, &old_usr1);
-    control_action.sa_handler = handle_print_resume_signal;
-    sigaction(SIGUSR2, &control_action, &old_usr2);
-    control_action.sa_handler = handle_print_power_failure_signal;
-    sigaction(SIGPWR, &control_action, &old_pwr);
-
-    printerctl_print_summary_t summary;
-    status = printerctl_print_engine_run(&engine, args->print_file, &summary, &error);
-
-    sigaction(SIGINT, &old_int, NULL);
-    sigaction(SIGTERM, &old_term, NULL);
-    sigaction(SIGUSR1, &old_usr1, NULL);
-    sigaction(SIGUSR2, &old_usr2, NULL);
-    sigaction(SIGPWR, &old_pwr, NULL);
-    g_active_engine = NULL;
-
-    printerctl_printer_error_t disconnect_error;
-    if (printerctl_print_engine_disconnect(&engine, &disconnect_error) != PRINTERCTL_PRINTER_OK) {
-        fprintf(err, "printerctl: warning: failed to close the serial port cleanly\n");
-    }
-
-    return printer_status_to_exit_code(status);
-}
-
-/*
  * Milestone 10: `power low-battery` is the command an external notifier
  * (the APCUPSD low-battery script) runs to tell printerctl that the
  * host may be about to lose power. It never touches the serial port
- * itself: it looks up the PID of the printerctl process currently
- * streaming a print (published by printerctl_print_engine_connect() to
- * the active-print marker) and sends it SIGPWR, which that process's
- * handle_print_power_failure_signal() turns into a graceful cancel via
- * printerctl_print_engine_request_cancel_power_failure() -- no new
- * G-code transmitted, file and serial port closed normally, a session
- * record written with state=cancelled_power_failure.
+ * itself: during M22 it still uses the transitional marker path to
+ * signal the daemon process that owns an active print. No new cleanup
+ * G-code is generated by the CLI.
  *
  * No print running is not an error: this command must be safely
  * idempotent for a script that may run with no print active, or run
@@ -1358,9 +1071,9 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
 
     printerctl_config_t config;
     printerctl_config_error_t config_error;
-    /* M18: direct serial CLI commands are a transitional legacy path.
-     * Migrated PLP commands must switch to the client view and stop
-     * consuming port/baud/timeout; this compatibility view is removed in M25. */
+    /* M18: remaining transitional commands use the legacy config view.
+     * Migrated PLP commands use the client view and do not consume
+     * port/baud/timeout; the compatibility view is removed in M25. */
     printerctl_config_view_t config_view =
         (is_migrated_daemon_command(request.command_args.command) ||
          is_reserved_host_control_command(request.command_args.command))
@@ -1422,7 +1135,7 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
     if (request.command_args.command == PRINTERCTL_COMMAND_PRINT && config.dry_run) {
         exit_code = run_dry_run_print(request.command_args.print_file, &logger, logger_ready, out, err);
     } else if (request.command_args.command == PRINTERCTL_COMMAND_PRINT) {
-        exit_code = run_print_command(&request.command_args, &config, &logger, logger_ready, out, err);
+        exit_code = run_print_start_command(&request.command_args, &logger, logger_ready, out, err);
     } else if (is_single_command && config.dry_run) {
         const char *tx_line = single_command_tx_line(&request.command_args);
 

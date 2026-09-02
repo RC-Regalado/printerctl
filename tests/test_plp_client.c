@@ -218,6 +218,13 @@ static void *server_thread(void *arg)
                                                        sizeof(payload), &payload_length,
                                                        &error) == PRINTERCTL_PLP1_OK,
               "encode RAW_SEND response");
+    } else if (request.message_type == PRINTERCTL_PLP1_MSG_PRINT_START) {
+        printerctl_plp1_print_start_request_t start;
+        check(printerctl_plp1_decode_print_start_request(request.payload, request.payload_length,
+                                                         &start, &error) == PRINTERCTL_PLP1_OK,
+              "decode PRINT_START request");
+        check(strcmp(start.source_path, "/tmp/client-print.gcode") == 0,
+              "PRINT_START path sent");
     } else if (request.message_type == PRINTERCTL_PLP1_MSG_HOME) {
         printerctl_plp1_home_request_t home;
         check(printerctl_plp1_decode_home_request(request.payload, request.payload_length,
@@ -454,6 +461,19 @@ static void test_physical_wrappers(void)
               "RAW_SEND succeeds");
         check(strcmp(response.transcript, "echo:Marlin\nok\n") == 0,
               "RAW_SEND transcript decoded");
+        printerctl_client_close(&client);
+        server_stop(&server);
+    }
+    {
+        server_t server;
+        server_start(&server, SERVER_VALID, PRINTERCTL_PLP1_MSG_PRINT_START);
+        printerctl_client_t client;
+        printerctl_client_error_t error;
+        check(printerctl_client_connect(&client, server.path, &error) == PRINTERCTL_CLIENT_OK,
+              "connect PRINT_START");
+        check(printerctl_client_print_start(&client, "/tmp/client-print.gcode", 1000, &error) ==
+                  PRINTERCTL_CLIENT_OK,
+              "PRINT_START succeeds");
         printerctl_client_close(&client);
         server_stop(&server);
     }

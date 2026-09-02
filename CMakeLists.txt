@@ -200,7 +200,7 @@ target_include_directories(printerctl_cli
         "${CMAKE_CURRENT_BINARY_DIR}/include"
 )
 
-target_link_libraries(printerctl_cli PUBLIC printerctl_config printerctl_logging printerctl_gcode printerctl_printer printerctl_record printerctl_core printerctl_client)
+target_link_libraries(printerctl_cli PUBLIC printerctl_config printerctl_logging printerctl_gcode printerctl_record printerctl_client)
 
 add_executable(printerctl
     src/main.c

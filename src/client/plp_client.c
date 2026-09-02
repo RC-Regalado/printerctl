@@ -358,6 +358,40 @@ printerctl_client_status_t printerctl_client_status(
     return PRINTERCTL_CLIENT_OK;
 }
 
+printerctl_client_status_t printerctl_client_print_start(
+    printerctl_client_t *client,
+    const char *path,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    uint8_t payload[PRINTERCTL_PLP1_PRINT_START_PATH_MAX + 2];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_encode_print_start_request(path, payload, sizeof(payload),
+                                                   &payload_length, &plp_error) !=
+        PRINTERCTL_PLP1_OK) {
+        if (out_error != NULL) {
+            set_error(out_error, PRINTERCTL_CLIENT_ERR_INVALID_ARGUMENT, 0,
+                      "PRINT_START request: %s", plp_error.message);
+        }
+        return PRINTERCTL_CLIENT_ERR_INVALID_ARGUMENT;
+    }
+
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, PRINTERCTL_PLP1_MSG_PRINT_START, payload, (uint16_t)payload_length, timeout_ms,
+        &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    if (printerctl_plp1_expect_no_payload(&response, &plp_error) != PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "PRINT_START response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}
+
 printerctl_client_status_t printerctl_client_query_temp(
     printerctl_client_t *client,
     int timeout_ms,

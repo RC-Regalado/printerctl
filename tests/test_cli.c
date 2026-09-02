@@ -6,10 +6,8 @@
 #include "printerctl/config.h"
 #include "printerctl/version.h"
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -357,18 +355,18 @@ static void test_unknown_command(void)
     free(err);
 }
 
-static void test_print_command_needs_port(void)
+static void test_print_command_needs_daemon(void)
 {
-    /* Since Milestone 7 'print' streams for real; without a configured
-     * port it is a configuration error, not "unavailable". */
+    /* M22 migrated 'print' to printerctld; without the daemon it fails
+     * as unavailable/communication, not as a missing serial port. */
     char *argv[] = {(char *)"printerctl", (char *)"print", (char *)"file.gcode"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "valid 'print' without a port is a configuration error");
-    check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR, "valid 'print' without a daemon is a communication error");
+    check(err != NULL && strstr(err, "connect") != NULL, "the daemon connection error is reported");
 
     free(out);
     free(err);
@@ -525,20 +523,21 @@ static void test_dry_run_home(void)
     }
 }
 
-static void test_printer_commands_need_port(void)
+static void test_migrated_print_ignores_hardware_options(void)
 {
-    /* M21 migrated explicit physical single commands to the daemon.
-     * Only legacy 'print FILE' keeps direct serial ownership. */
     char path[64];
     write_temp_gcode("M105\n", path, sizeof(path));
-    char *argv[] = {(char *)"printerctl", (char *)"print", path};
+    char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"/tmp/unused",
+                    (char *)"print", path};
     char *out = NULL;
     char *err = NULL;
 
-    int status = run_cli(3, argv, &out, &err);
+    int status = run_cli(5, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "legacy print without a port is still a configuration error");
-    check(err != NULL && strstr(err, "--port") != NULL, "the no-port error tells the operator what to pass");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "migrated print uses printerctld even when a legacy --port is present");
+    check(err != NULL && strstr(err, "/tmp/unused") == NULL,
+          "migrated print does not consume the legacy --port value");
 
     remove(path);
     free(out);
@@ -584,28 +583,22 @@ static void test_config_file_precedence(void)
     char path[64];
     write_temp_config("port=/dev/from-file\nbaud=57600\n", path, sizeof(path));
 
-    /* Use legacy print here because M21 migrated home to daemon/client
-     * config and it must not consume hardware config anymore. */
-    char gcode_path[64];
-    write_temp_gcode("M105\n", gcode_path, sizeof(gcode_path));
+    /* power low-battery still uses the transitional legacy config view
+     * until M24 moves it to daemon ownership. */
     char *argv[] = {(char *)"printerctl", (char *)"--config", path,
                      (char *)"--port", (char *)"/dev/from-cli",
-                     (char *)"print", gcode_path};
+                     (char *)"power", (char *)"low-battery"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(7, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_COMM_ERROR,
-          "'print' with the resolved config attempts to open /dev/from-cli, which does not exist");
-    check(err != NULL && strstr(err, "/dev/from-cli") != NULL,
-          "CLI port overrides the config file port (the connection failure names the CLI port)");
+    check(status == PRINTERCTL_EXIT_OK, "legacy-view command accepts merged hardware config");
     check(err != NULL && strstr(err, "/dev/from-file") == NULL, "the config file's port never took effect");
     check(err != NULL && strstr(err, "baud=57600") != NULL,
           "config file baud is applied when CLI does not override it");
 
     remove(path);
-    remove(gcode_path);
     free(out);
     free(err);
 }
@@ -780,24 +773,18 @@ static void test_config_summary_omits_raw_port_and_config_path(void)
     char path[64];
     write_temp_config("baud=57600\n", path, sizeof(path));
 
-    /* Legacy print still attempts a direct connection and fails (the port
-     * does not exist), so the port legitimately appears in the
-     * human-readable failure message elsewhere in `err` -- the
-     * assertions below check the config_summary log line specifically,
-     * not the whole buffer, matching the Milestone 2 privacy rules
-     * (structured log never leaks it; human-readable output may). */
-    char gcode_path[64];
-    write_temp_gcode("M105\n", gcode_path, sizeof(gcode_path));
+    /* The assertions below check the config_summary log line
+     * specifically, matching the Milestone 2 privacy rule that
+     * structured logs never expose raw port/config paths. */
     char *argv[] = {(char *)"printerctl", (char *)"--port", (char *)"/dev/ttyACM0",
                      (char *)"--config", path,
-                     (char *)"print", gcode_path};
+                     (char *)"power", (char *)"low-battery"};
     char *out = NULL;
     char *err = NULL;
 
     int status = run_cli(7, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_COMM_ERROR,
-          "port+config resolved 'print' attempts a real connection and fails to open the nonexistent port");
+    check(status == PRINTERCTL_EXIT_OK, "port+config resolved command succeeds");
 
     const char *summary_line = err != NULL ? strstr(err, "\tINFO\tconfig_summary\t") : NULL;
     check(summary_line != NULL, "log includes a config_summary line");
@@ -821,11 +808,8 @@ static void test_config_summary_omits_raw_port_and_config_path(void)
           "the config_summary log line itself never contains the raw port value");
     check(strstr(summary_text, path) == NULL,
           "the config_summary log line itself never contains the config file path");
-    check(err != NULL && strstr(err, "/dev/ttyACM0") != NULL,
-          "the human-readable connection-failure message may still name the port");
 
     remove(path);
-    remove(gcode_path);
     free(out);
     free(err);
 }
@@ -939,44 +923,6 @@ static void drop_temp_state_home(const char *dir)
         g_failures++;
     }
     setenv("XDG_STATE_HOME", g_default_state_home, 1);
-}
-
-/* Finds a session record under `state_home`/printerctl; returns the count. */
-static int find_session_records(const char *state_home, char *out_path, size_t out_size)
-{
-    char record_dir[128];
-    snprintf(record_dir, sizeof(record_dir), "%s/printerctl", state_home);
-
-    DIR *dir = opendir(record_dir);
-    if (dir == NULL) {
-        return 0;
-    }
-
-    int count = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, "session-", 8) == 0) {
-            count++;
-            if (out_path != NULL) {
-                snprintf(out_path, out_size, "%s/%s", record_dir, entry->d_name);
-            }
-        }
-    }
-    closedir(dir);
-    return count;
-}
-
-/* Reads a whole file into `buffer`; returns false when it cannot be read. */
-static bool read_whole_file(const char *path, char *buffer, size_t buffer_size)
-{
-    FILE *file = fopen(path, "r");
-    if (file == NULL) {
-        return false;
-    }
-    size_t n = fread(buffer, 1, buffer_size - 1, file);
-    buffer[n] = '\0';
-    fclose(file);
-    return true;
 }
 
 static void test_dry_run_print_success(void)
@@ -1163,8 +1109,8 @@ static void test_print_without_port_does_not_touch_the_file(void)
 
     int status = run_cli(3, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_CONFIG_ERROR,
-          "'print' without a port fails as a configuration error before streaming");
+    check(status == PRINTERCTL_EXIT_COMM_ERROR,
+          "'print' without a daemon fails as a communication error before local parsing");
     check(out != NULL && strstr(out, "G21") == NULL,
           "no command is parsed or reported when the connection cannot be made");
 
@@ -1194,88 +1140,6 @@ static void test_dry_run_from_config_file_enables_dry_run_print(void)
     remove(config_path);
     free(out);
     free(err);
-}
-
-/*
- * Scriptable mock Marlin printer for end-to-end CLI tests: a pty whose
- * master side is serviced by a forked child. The child waits for one
- * complete command line, writes the scripted reply (which may be
- * several lines), then keeps draining input until the parent kills it.
- * The child must run concurrently with printerctl_cli_run() because the
- * serial open flushes any input scripted in advance.
- */
-typedef struct {
-    int master;
-    pid_t child;
-    char slave_path[64];
-} cli_mock_printer_t;
-
-/*
- * Streaming variant of the mock: one scripted reply per received
- * command line, in order, then silence (drain until killed). Used by
- * the Milestone 7 print tests, where each acknowledged command triggers
- * the transmission of the next one.
- */
-static bool cli_mock_start_script(cli_mock_printer_t *mock,
-                                   const char *const *replies, size_t reply_count)
-{
-    mock->master = posix_openpt(O_RDWR | O_NOCTTY);
-    if (mock->master < 0 || grantpt(mock->master) != 0 || unlockpt(mock->master) != 0) {
-        fprintf(stderr, "FAIL: cannot create pty for the scripted mock printer\n");
-        g_failures++;
-        return false;
-    }
-
-    const char *name = ptsname(mock->master);
-    if (name == NULL || strlen(name) >= sizeof(mock->slave_path)) {
-        fprintf(stderr, "FAIL: ptsname for the scripted mock printer\n");
-        g_failures++;
-        close(mock->master);
-        return false;
-    }
-    strcpy(mock->slave_path, name);
-
-    mock->child = fork();
-    if (mock->child < 0) {
-        fprintf(stderr, "FAIL: cannot fork the scripted mock printer\n");
-        g_failures++;
-        close(mock->master);
-        return false;
-    }
-
-    if (mock->child == 0) {
-        char c;
-        for (size_t i = 0; i < reply_count; i++) {
-            for (;;) {
-                ssize_t n = read(mock->master, &c, 1);
-                if (n <= 0) {
-                    _exit(1);
-                }
-                if (c == '\n') {
-                    break;
-                }
-            }
-            size_t length = strlen(replies[i]);
-            if (write(mock->master, replies[i], length) != (ssize_t)length) {
-                _exit(1);
-            }
-        }
-        for (;;) {
-            ssize_t n = read(mock->master, &c, 1);
-            if (n <= 0) {
-                _exit(0);
-            }
-        }
-    }
-
-    return true;
-}
-
-static void cli_mock_stop(cli_mock_printer_t *mock)
-{
-    kill(mock->child, SIGKILL);
-    waitpid(mock->child, NULL, 0);
-    close(mock->master);
 }
 
 static void test_temp_end_to_end(void)
@@ -1401,150 +1265,6 @@ static void test_timeout_end_to_end(void)
     free(err);
 }
 
-static void test_print_end_to_end(void)
-{
-    char path[64];
-    write_temp_gcode("; header\nG21\nG90 ; absolute\nM105\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n", "ok\n", "ok\n"};
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script(&mock, replies, 3)) {
-        remove(path);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"--verbose", (char *)"print", path};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(6, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_OK, "'print' against the mock printer exits with success");
-    check(out != NULL && strstr(out, "print completed") != NULL,
-          "the session summary reports completion");
-    check(out != NULL && strstr(out, "3 command(s) sent, 3 acknowledged") != NULL,
-          "the session summary counts sent and acknowledged commands");
-    check(out != NULL && strstr(out, "100%") != NULL, "progress reaches 100%");
-    check(out != NULL && strstr(out, path) != NULL, "the summary names the file");
-    check(err != NULL && strstr(err, "\tDEBUG\tserial_tx\tG21") != NULL,
-          "each streamed command is logged as serial_tx");
-    check(err != NULL && strstr(err, "\tDEBUG\tserial_tx\tM105") != NULL,
-          "the last streamed command is logged as serial_tx");
-    check(err != NULL && strstr(err, "state=printing") != NULL,
-          "the print start state transition is logged");
-    check(err != NULL && strstr(err, "state=print_completed") != NULL,
-          "the print completion state transition is logged");
-    check(err != NULL && strstr(err, "\tINFO\tprogress\t") != NULL,
-          "progress is logged at INFO on percent changes");
-    check(err != NULL && strstr(err, path) == NULL, "logs never contain the G-code file path");
-
-    cli_mock_stop(&mock);
-    remove(path);
-    free(out);
-    free(err);
-}
-
-static void test_print_error_stops_gracefully_end_to_end(void)
-{
-    char path[64];
-    write_temp_gcode("G21\nG90\nM105\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n", "Error:Thermal Runaway\n"};
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script(&mock, replies, 2)) {
-        remove(path);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"print", path};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(5, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_PRINTER_ERROR,
-          "an Error: reply during a print exits with the printer error code");
-    check(err != NULL && strstr(err, "Thermal Runaway") != NULL,
-          "the printer's error message reaches the operator");
-    check(out != NULL && strstr(out, "print failed") != NULL,
-          "the session summary reports the failure");
-    check(out != NULL && strstr(out, "2 command(s) sent, 1 acknowledged") != NULL,
-          "the summary shows the exchange stopped at the failing command");
-    check(out != NULL && strstr(out, "last acknowledged line 1") != NULL,
-          "the summary names the last acknowledged source line");
-
-    cli_mock_stop(&mock);
-    remove(path);
-    free(out);
-    free(err);
-}
-
-static void test_print_g28_in_file_end_to_end(void)
-{
-    char path[64];
-    write_temp_gcode("G21\nG28\nG90\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n"};
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script(&mock, replies, 1)) {
-        remove(path);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"print", path};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(5, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_SAFETY_ERROR,
-          "a G28 in the streamed file exits with the safety error code");
-    check(err != NULL && strstr(err, "G28") != NULL, "the rejection names G28");
-    check(out != NULL && strstr(out, "1 command(s) sent, 1 acknowledged") != NULL,
-          "commands before the G28 line were streamed; the G28 line was not");
-
-    cli_mock_stop(&mock);
-    remove(path);
-    free(out);
-    free(err);
-}
-
-static void test_print_timeout_end_to_end(void)
-{
-    char path[64];
-    write_temp_gcode("G21\nG90\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n"}; /* then silence */
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script(&mock, replies, 1)) {
-        remove(path);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"--timeout", (char *)"150", (char *)"print", path};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(7, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_COMM_ERROR,
-          "a print that stops receiving acknowledgements exits with the communication error code");
-    check(err != NULL && strstr(err, "timed out") != NULL, "the timeout message is explicit");
-    check(out != NULL && strstr(out, "print failed") != NULL,
-          "the session summary reports the failure");
-    check(out != NULL && strstr(out, "2 command(s) sent, 1 acknowledged") != NULL,
-          "the summary shows where streaming stopped");
-
-    cli_mock_stop(&mock);
-    remove(path);
-    free(out);
-    free(err);
-}
-
 static void test_pause_resume_cancel_sd_end_to_end(void)
 {
     const char *commands[] = {"pause", "resume", "cancel"};
@@ -1592,471 +1312,6 @@ static void test_dry_run_sd_controls(void)
         free(out);
         free(err);
     }
-}
-
-/*
- * Slow-acknowledgement variant of the scripted mock: one reply per
- * received command line, each delayed by `delay_ms`, so a streaming
- * print stays in flight long enough for the parent to drive it with
- * signals.
- */
-static bool cli_mock_start_script_delayed(cli_mock_printer_t *mock,
-                                           const char *const *replies, size_t reply_count,
-                                           int delay_ms)
-{
-    mock->master = posix_openpt(O_RDWR | O_NOCTTY);
-    if (mock->master < 0 || grantpt(mock->master) != 0 || unlockpt(mock->master) != 0) {
-        fprintf(stderr, "FAIL: cannot create pty for the delayed mock printer\n");
-        g_failures++;
-        return false;
-    }
-
-    const char *name = ptsname(mock->master);
-    if (name == NULL || strlen(name) >= sizeof(mock->slave_path)) {
-        fprintf(stderr, "FAIL: ptsname for the delayed mock printer\n");
-        g_failures++;
-        close(mock->master);
-        return false;
-    }
-    strcpy(mock->slave_path, name);
-
-    mock->child = fork();
-    if (mock->child < 0) {
-        fprintf(stderr, "FAIL: cannot fork the delayed mock printer\n");
-        g_failures++;
-        close(mock->master);
-        return false;
-    }
-
-    if (mock->child == 0) {
-        char c;
-        for (size_t i = 0; i < reply_count; i++) {
-            for (;;) {
-                ssize_t n = read(mock->master, &c, 1);
-                if (n <= 0) {
-                    _exit(1);
-                }
-                if (c == '\n') {
-                    break;
-                }
-            }
-            poll(NULL, 0, delay_ms);
-            size_t length = strlen(replies[i]);
-            if (write(mock->master, replies[i], length) != (ssize_t)length) {
-                _exit(1);
-            }
-        }
-        for (;;) {
-            ssize_t n = read(mock->master, &c, 1);
-            if (n <= 0) {
-                _exit(0);
-            }
-        }
-    }
-
-    return true;
-}
-
-/*
- * Runs printerctl_cli_run() in a forked child with stdout captured to a
- * temp file, so the parent can watch the output live and drive the
- * print with signals — exactly how an operator controls a host stream.
- */
-typedef struct {
-    pid_t pid;
-    char out_path[64];
-} cli_print_process_t;
-
-static bool cli_print_start(cli_print_process_t *proc, int argc, char *argv[])
-{
-    snprintf(proc->out_path, sizeof(proc->out_path), "/tmp/printerctl_cli_out_XXXXXX");
-    int fd = mkstemp(proc->out_path);
-    if (fd < 0) {
-        fprintf(stderr, "FAIL: mkstemp() failed for the CLI output capture\n");
-        g_failures++;
-        return false;
-    }
-
-    proc->pid = fork();
-    if (proc->pid < 0) {
-        fprintf(stderr, "FAIL: cannot fork the CLI process\n");
-        g_failures++;
-        close(fd);
-        return false;
-    }
-
-    if (proc->pid == 0) {
-        FILE *out = fdopen(fd, "w");
-        FILE *err = fopen("/dev/null", "w");
-        if (out == NULL || err == NULL) {
-            _exit(127);
-        }
-        int code = printerctl_cli_run(argc, argv, out, err);
-        fflush(out);
-        _exit(code);
-    }
-
-    close(fd);
-    return true;
-}
-
-/* Polls the captured output until `needle` appears (or ~3 s pass). */
-static bool cli_print_wait_for_output(cli_print_process_t *proc, const char *needle)
-{
-    char buffer[4096];
-    for (int attempt = 0; attempt < 300; attempt++) {
-        FILE *file = fopen(proc->out_path, "r");
-        if (file != NULL) {
-            size_t n = fread(buffer, 1, sizeof(buffer) - 1, file);
-            buffer[n] = '\0';
-            fclose(file);
-            if (strstr(buffer, needle) != NULL) {
-                return true;
-            }
-        }
-        poll(NULL, 0, 10);
-    }
-    return false;
-}
-
-/* Bounded wait for the CLI child; kills it rather than hanging the suite. */
-static bool cli_print_wait_exit(cli_print_process_t *proc, int *out_code)
-{
-    for (int attempt = 0; attempt < 800; attempt++) {
-        int status = 0;
-        pid_t done = waitpid(proc->pid, &status, WNOHANG);
-        if (done == proc->pid) {
-            if (WIFEXITED(status)) {
-                *out_code = WEXITSTATUS(status);
-                return true;
-            }
-            return false;
-        }
-        poll(NULL, 0, 10);
-    }
-    kill(proc->pid, SIGKILL);
-    waitpid(proc->pid, NULL, 0);
-    return false;
-}
-
-/* Reads the whole captured output into `buffer`. */
-static void cli_print_read_output(cli_print_process_t *proc, char *buffer, size_t buffer_size)
-{
-    buffer[0] = '\0';
-    FILE *file = fopen(proc->out_path, "r");
-    if (file != NULL) {
-        size_t n = fread(buffer, 1, buffer_size - 1, file);
-        buffer[n] = '\0';
-        fclose(file);
-    }
-}
-
-static void test_print_pause_and_resume_by_signal_end_to_end(void)
-{
-    char path[64];
-    write_temp_gcode("G21\nG90\nM105\nM400\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n", "ok\n", "ok\n", "ok\n"};
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script_delayed(&mock, replies, 4, 150)) {
-        remove(path);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"print", path};
-    cli_print_process_t proc;
-    if (!cli_print_start(&proc, 5, argv)) {
-        cli_mock_stop(&mock);
-        remove(path);
-        return;
-    }
-
-    /* The signals land while acknowledgements are still pending, because
-     * every mock reply is delayed 150 ms. */
-    check(cli_print_wait_for_output(&proc, "printerctl: printing"), "the print announces itself");
-    kill(proc.pid, SIGUSR1);
-    check(cli_print_wait_for_output(&proc, "print paused"),
-          "SIGUSR1 pauses the print after the current acknowledgement");
-    kill(proc.pid, SIGUSR2);
-    check(cli_print_wait_for_output(&proc, "print resumed"), "SIGUSR2 resumes the print");
-
-    int code = -1;
-    check(cli_print_wait_exit(&proc, &code), "the paused-then-resumed print finishes");
-    check(code == PRINTERCTL_EXIT_OK, "the resumed print exits with success");
-
-    char output[4096];
-    cli_print_read_output(&proc, output, sizeof(output));
-    check(strstr(output, "print completed") != NULL, "the summary reports completion");
-    check(strstr(output, "4 command(s) sent, 4 acknowledged") != NULL,
-          "resume continued from the next unsent command: every command streamed");
-
-    cli_mock_stop(&mock);
-    remove(proc.out_path);
-    remove(path);
-}
-
-static void test_print_cancel_by_signal_end_to_end(void)
-{
-    char state_home[64];
-    if (!set_temp_state_home(state_home, sizeof(state_home))) {
-        return;
-    }
-
-    char path[64];
-    write_temp_gcode("G21\nG90\nM105\nM400\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n", "ok\n", "ok\n", "ok\n"};
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script_delayed(&mock, replies, 4, 150)) {
-        remove(path);
-        drop_temp_state_home(state_home);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"print", path};
-    cli_print_process_t proc;
-    if (!cli_print_start(&proc, 5, argv)) {
-        cli_mock_stop(&mock);
-        remove(path);
-        return;
-    }
-
-    check(cli_print_wait_for_output(&proc, "printerctl: printing"), "the print announces itself");
-    kill(proc.pid, SIGINT);
-
-    int code = -1;
-    check(cli_print_wait_exit(&proc, &code), "the cancelled print finishes promptly");
-    check(code == PRINTERCTL_EXIT_PRINT_CANCELLED,
-          "SIGINT during a print exits with the print-cancelled code");
-
-    char output[4096];
-    cli_print_read_output(&proc, output, sizeof(output));
-    check(strstr(output, "print cancelled") != NULL, "the summary reports the cancelled state");
-    check(strstr(output, "print completed") == NULL, "a cancelled print never reports completion");
-    check(strstr(output, "4 command(s) sent") == NULL,
-          "the cancel stopped the stream before the whole file went out");
-
-    /* A cancelled print is an interrupted session: it leaves a record. */
-    char record_path[256];
-    check(find_session_records(state_home, record_path, sizeof(record_path)) == 1,
-          "the cancelled print left exactly one session record");
-    char content[2048];
-    check(read_whole_file(record_path, content, sizeof(content)) &&
-              strstr(content, "state=cancelled\n") != NULL &&
-              strstr(content, "cause=cancelled\n") != NULL,
-          "the record carries the cancelled state and cause");
-
-    cli_mock_stop(&mock);
-    remove(proc.out_path);
-    remove(path);
-    drop_temp_state_home(state_home);
-}
-
-static void test_print_failure_writes_session_record(void)
-{
-    char state_home[64];
-    if (!set_temp_state_home(state_home, sizeof(state_home))) {
-        return;
-    }
-
-    char path[64];
-    write_temp_gcode("G21\nG90\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n"}; /* then silence */
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script(&mock, replies, 1)) {
-        remove(path);
-        drop_temp_state_home(state_home);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"--timeout", (char *)"150", (char *)"print", path};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(7, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_COMM_ERROR,
-          "the session record never changes the print's exit code");
-    check(out != NULL && strstr(out, "session record written to") != NULL,
-          "the operator is told where the record was written");
-
-    char record_path[256];
-    check(find_session_records(state_home, record_path, sizeof(record_path)) == 1,
-          "exactly one session record was written");
-
-    char content[2048];
-    check(read_whole_file(record_path, content, sizeof(content)),
-          "the session record can be read back");
-    check(strstr(content, "state=failed\n") != NULL, "the record carries the failed state");
-    check(strstr(content, "cause=timeout\n") != NULL, "the record carries the timeout cause");
-    check(content[0] != '\0' && strstr(content, path) != NULL,
-          "the record names the G-code file");
-    check(strstr(content, "commands_sent=2\n") != NULL &&
-              strstr(content, "commands_acknowledged=1\n") != NULL &&
-              strstr(content, "last_acknowledged_line=1\n") != NULL,
-          "the record shows exactly where streaming stopped");
-    check(strstr(content, "timestamp=") != NULL, "the record carries a timestamp");
-    check(strstr(content, "never resumes") != NULL,
-          "the record states the no-automatic-resume policy");
-
-    /* Privacy: the structured log names neither the record path nor the
-     * state directory — only the path-free state transition. */
-    check(err != NULL && strstr(err, "state=session_recorded") != NULL,
-          "the record is logged as a path-free state transition");
-    check(err != NULL && strstr(err, state_home) == NULL,
-          "logs never contain the state directory or record path");
-
-    cli_mock_stop(&mock);
-    remove(path);
-    drop_temp_state_home(state_home);
-    free(out);
-    free(err);
-}
-
-static void test_print_completed_writes_no_record(void)
-{
-    char state_home[64];
-    if (!set_temp_state_home(state_home, sizeof(state_home))) {
-        return;
-    }
-
-    char path[64];
-    write_temp_gcode("G21\nG90\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n", "ok\n"};
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script(&mock, replies, 2)) {
-        remove(path);
-        drop_temp_state_home(state_home);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"print", path};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(5, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_OK, "the clean print completes");
-    check(out != NULL && strstr(out, "session record") == NULL,
-          "a completed print mentions no session record");
-    check(find_session_records(state_home, NULL, 0) == 0,
-          "a completed print writes no session record");
-
-    cli_mock_stop(&mock);
-    remove(path);
-    drop_temp_state_home(state_home);
-    free(out);
-    free(err);
-}
-
-static void test_print_never_resumes_automatically(void)
-{
-    char state_home[64];
-    if (!set_temp_state_home(state_home, sizeof(state_home))) {
-        return;
-    }
-
-    char path[64];
-    write_temp_gcode("G21\nG90\n", path, sizeof(path));
-
-    /* First run: interrupted by acknowledgement silence, record written. */
-    {
-        static const char *const replies[] = {"ok\n"};
-        cli_mock_printer_t mock;
-        if (!cli_mock_start_script(&mock, replies, 1)) {
-            remove(path);
-            drop_temp_state_home(state_home);
-            return;
-        }
-
-        char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                         (char *)"--timeout", (char *)"150", (char *)"print", path};
-        char *out = NULL;
-        char *err = NULL;
-        run_cli(7, argv, &out, &err);
-        cli_mock_stop(&mock);
-        free(out);
-        free(err);
-    }
-    check(find_session_records(state_home, NULL, 0) == 1,
-          "the interrupted run left a session record");
-
-    /* Second run of the same file: the record present, the whole file
-     * streams again from its first command — printerctl never resumes
-     * from a record (power or serial failure must not trigger resume). */
-    {
-        static const char *const replies[] = {"ok\n", "ok\n"};
-        cli_mock_printer_t mock;
-        if (!cli_mock_start_script(&mock, replies, 2)) {
-            remove(path);
-            drop_temp_state_home(state_home);
-            return;
-        }
-
-        char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                         (char *)"print", path};
-        char *out = NULL;
-        char *err = NULL;
-
-        int status = run_cli(5, argv, &out, &err);
-
-        check(status == PRINTERCTL_EXIT_OK, "the rerun completes");
-        check(out != NULL && strstr(out, "2 command(s) sent, 2 acknowledged") != NULL,
-              "the rerun streamed the whole file from its first command, not a suffix");
-
-        cli_mock_stop(&mock);
-        free(out);
-        free(err);
-    }
-    check(find_session_records(state_home, NULL, 0) == 1,
-          "the completed rerun added no record and consumed none");
-
-    remove(path);
-    drop_temp_state_home(state_home);
-}
-
-static void test_session_record_failure_is_only_a_warning(void)
-{
-    /* An absolute but uncreatable state home: the record cannot be
-     * written, the print outcome must not change. */
-    setenv("XDG_STATE_HOME", "/dev/null/printerctl-state", 1);
-
-    char path[64];
-    write_temp_gcode("G21\nG90\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n"};
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script(&mock, replies, 1)) {
-        remove(path);
-        setenv("XDG_STATE_HOME", g_default_state_home, 1);
-        return;
-    }
-
-    char *argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                     (char *)"--timeout", (char *)"150", (char *)"print", path};
-    char *out = NULL;
-    char *err = NULL;
-
-    int status = run_cli(7, argv, &out, &err);
-
-    check(status == PRINTERCTL_EXIT_COMM_ERROR,
-          "a failed record write never changes the print's exit code");
-    check(err != NULL && strstr(err, "no session record written") != NULL,
-          "the operator is warned that no record was written");
-    check(out != NULL && strstr(out, "session record written") == NULL,
-          "no record path is claimed when the write failed");
-
-    cli_mock_stop(&mock);
-    remove(path);
-    setenv("XDG_STATE_HOME", g_default_state_home, 1);
-    free(out);
-    free(err);
 }
 
 static void test_dry_run_single_commands(void)
@@ -2230,103 +1485,6 @@ static void test_power_low_battery_cleans_up_a_stale_marker(void)
     drop_temp_state_home(state_home);
 }
 
-/*
- * Full Milestone 10 acceptance scenario: a real streaming print, still
- * in flight, is cancelled by `printerctl power low-battery` acting on
- * the same active-print marker the print published -- exactly the path
- * an APCUPSD script drives through scripts/apcupsd/printerctl-low-battery.sh.
- */
-static void test_power_low_battery_cancels_active_print_end_to_end(void)
-{
-    char state_home[64];
-    if (!set_temp_state_home(state_home, sizeof(state_home))) {
-        return;
-    }
-
-    char path[64];
-    write_temp_gcode("G21\nG90\nM105\nM400\n", path, sizeof(path));
-
-    static const char *const replies[] = {"ok\n", "ok\n", "ok\n", "ok\n"};
-    cli_mock_printer_t mock;
-    if (!cli_mock_start_script_delayed(&mock, replies, 4, 150)) {
-        remove(path);
-        drop_temp_state_home(state_home);
-        return;
-    }
-
-    char *print_argv[] = {(char *)"printerctl", (char *)"--port", mock.slave_path,
-                           (char *)"print", path};
-    cli_print_process_t proc;
-    if (!cli_print_start(&proc, 5, print_argv)) {
-        cli_mock_stop(&mock);
-        remove(path);
-        drop_temp_state_home(state_home);
-        return;
-    }
-
-    check(cli_print_wait_for_output(&proc, "printerctl: printing"), "the print announces itself");
-
-    /* The active-print marker is published early in the stream; give it
-     * a moment to land before asking for it. */
-    char *power_argv[] = {(char *)"printerctl", (char *)"power", (char *)"low-battery"};
-    char *out = NULL;
-    char *err = NULL;
-    int power_status = -1;
-    for (int attempt = 0; attempt < 300; attempt++) {
-        power_status = run_cli(3, power_argv, &out, &err);
-        if (out != NULL && strstr(out, "no active print") == NULL) {
-            break;
-        }
-        free(out);
-        free(err);
-        out = NULL;
-        err = NULL;
-        poll(NULL, 0, 10);
-    }
-
-    check(power_status == PRINTERCTL_EXIT_OK, "'power low-battery' itself reports success");
-    check(out != NULL && strstr(out, "signalled the active print") != NULL,
-          "'power low-battery' found and signalled the running print");
-
-    int code = -1;
-    check(cli_print_wait_exit(&proc, &code), "the power-cancelled print finishes promptly");
-    check(code == PRINTERCTL_EXIT_PRINT_CANCELLED_POWER_FAILURE,
-          "the print exits with the power-failure cancellation code, not the operator one");
-
-    char output[4096];
-    cli_print_read_output(&proc, output, sizeof(output));
-    check(strstr(output, "print cancelled_power_failure") != NULL,
-          "the summary names the power-failure cancellation specifically");
-    check(strstr(output, "print completed") == NULL, "a power-cancelled print never reports completion");
-
-    char record_path[256];
-    check(find_session_records(state_home, record_path, sizeof(record_path)) == 1,
-          "the power-cancelled print left exactly one session record");
-    char content[2048];
-    check(read_whole_file(record_path, content, sizeof(content)) &&
-              strstr(content, "state=cancelled_power_failure\n") != NULL &&
-              strstr(content, "cause=apcupsd_low_battery\n") != NULL,
-          "the record distinguishes a power-failure cancellation from an operator one");
-
-    /* The marker is removed once the print ends: a second notification
-     * now finds nothing to cancel. */
-    free(out);
-    free(err);
-    out = NULL;
-    err = NULL;
-    int second_status = run_cli(3, power_argv, &out, &err);
-    check(second_status == PRINTERCTL_EXIT_OK && out != NULL &&
-              strstr(out, "no active print") != NULL,
-          "the marker is cleaned up once the print ends, so a later notification is a no-op");
-
-    cli_mock_stop(&mock);
-    remove(proc.out_path);
-    remove(path);
-    free(out);
-    free(err);
-    drop_temp_state_home(state_home);
-}
-
 static void test_safety_error_adds_single_error_log_line(void)
 {
     /* 'home' no longer produces a safety rejection now that min
@@ -2375,7 +1533,7 @@ int main(void)
     test_invalid_baud_value();
     test_invalid_timeout_value();
     test_unknown_command();
-    test_print_command_needs_port();
+    test_print_command_needs_daemon();
     test_print_missing_file();
     test_print_extra_arguments();
     test_send_command();
@@ -2383,7 +1541,7 @@ int main(void)
     test_home_no_longer_mentions_retired_confirmation_flag();
     test_home_axis_argument_grammar();
     test_dry_run_home();
-    test_printer_commands_need_port();
+    test_migrated_print_ignores_hardware_options();
     test_global_option_after_command_rejected();
     test_cli_value_equal_to_default();
     test_config_file_precedence();
@@ -2416,24 +1574,13 @@ int main(void)
     test_send_g28_blocked_end_to_end();
     test_printer_error_end_to_end();
     test_timeout_end_to_end();
-    test_print_end_to_end();
-    test_print_error_stops_gracefully_end_to_end();
-    test_print_g28_in_file_end_to_end();
-    test_print_timeout_end_to_end();
     test_pause_resume_cancel_sd_end_to_end();
     test_dry_run_sd_controls();
-    test_print_pause_and_resume_by_signal_end_to_end();
-    test_print_cancel_by_signal_end_to_end();
-    test_print_failure_writes_session_record();
-    test_print_completed_writes_no_record();
-    test_print_never_resumes_automatically();
-    test_session_record_failure_is_only_a_warning();
     test_dry_run_single_commands();
     test_power_requires_low_battery_subcommand();
     test_power_low_battery_dry_run();
     test_power_low_battery_with_no_active_print();
     test_power_low_battery_cleans_up_a_stale_marker();
-    test_power_low_battery_cancels_active_print_end_to_end();
 
     {
         char command[128];

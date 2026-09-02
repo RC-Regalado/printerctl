@@ -147,12 +147,11 @@ Implementation notes:
   use PLP/1 and no longer use the legacy CLI hardware-config view.
 - Bare `pause`, `resume` and `cancel` are reserved for host-stream
   control in M23 and are not SD aliases.
-- `print FILE` remains the only legacy direct-serial printer command
-  until M22.
+- M22 removes the final direct-serial `print FILE` CLI path.
 
 ## M22 — Host Print CLI Migration
 
-**Status:** PROPOSED
+**Status:** IMPLEMENTED
 
 Migrate:
 
@@ -164,7 +163,16 @@ to daemon-owned execution over `PRINT_START`.
 
 The daemon validates/opens the source authoritatively.
 
-The client may remain attached as observer using STATUS polling, but execution lifetime is independent from client lifetime.
+Implementation notes:
+
+- non-dry-run `printerctl print FILE` sends PLP/1 `PRINT_START` through
+  the reusable M19 client API;
+- the CLI exits after daemon acceptance; execution lifetime is owned by
+  `printerctld` and survives client disconnect;
+- `--dry-run print FILE` remains local and never connects to the daemon
+  or serial;
+- migrated `print` no longer consumes `port`, `baud` or Marlin
+  `timeout`, and has no direct-serial fallback.
 
 ## M23 — Host Print Control UX
 

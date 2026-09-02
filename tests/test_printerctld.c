@@ -189,6 +189,20 @@ static pid_t start_printerctld_default_with_port(const char *port_path)
     return child;
 }
 
+static pid_t start_printerctld_default_with_port_and_state(const char *port_path,
+                                                           const char *state_home)
+{
+    pid_t child = fork();
+    check(child >= 0, "fork");
+    if (child == 0) {
+        setenv("XDG_STATE_HOME", state_home, 1);
+        execl(TEST_PRINTERCTLD_PATH, "printerctld", "--port", port_path, "--timeout", "1000",
+              (char *)NULL);
+        _exit(127);
+    }
+    return child;
+}
+
 static pid_t start_printerctld_with_config(const char *socket_path, const char *config_path,
                                            const char *state_home)
 {
@@ -376,35 +390,6 @@ static printerctl_plp1_frame_t read_response_frame(int client, uint8_t expected_
     check(decoded.message_type == expected_type, "response type matches");
     check(decoded.request_id == expected_request_id, "response id matches");
     return decoded;
-}
-
-static int run_legacy_send(const char *port_path)
-{
-    pid_t child = fork();
-    check(child >= 0, "fork legacy");
-    if (child == 0) {
-        execl(TEST_PRINTERCTL_PATH, "printerctl", "--port", port_path, "--timeout", "200",
-              "send", "M105", (char *)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    check(waitpid(child, &status, 0) == child, "wait legacy");
-    check(WIFEXITED(status), "legacy exits");
-    return WEXITSTATUS(status);
-}
-
-static pid_t start_legacy_print(const char *port_path, const char *gcode_path,
-                                const char *state_home)
-{
-    pid_t child = fork();
-    check(child >= 0, "fork legacy print");
-    if (child == 0) {
-        setenv("XDG_STATE_HOME", state_home, 1);
-        execl(TEST_PRINTERCTL_PATH, "printerctl", "--port", port_path, "--timeout", "1000",
-              "print", gcode_path, (char *)NULL);
-        _exit(127);
-    }
-    return child;
 }
 
 static void expect_child_exit(pid_t child, int expected_exit)
@@ -739,81 +724,6 @@ static void test_print_cancel_ack_window_blocks_next_command(void)
     rmdir(dir);
 }
 
-static void test_daemon_owned_serial_rejects_legacy_cli(void)
-{
-    char socket_path[108];
-    char dir[128];
-    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
-    char state_home[128];
-    make_temp_state_home(state_home, sizeof(state_home));
-    char gcode_path[128];
-    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nM114\n");
-
-    mock_printer_t mock;
-    mock_open(&mock);
-    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
-    start_daemon_print(child, socket_path, gcode_path, &mock);
-
-    check(run_legacy_send(mock.slave_path) == PRINTERCTL_EXIT_COMM_ERROR,
-          "legacy CLI fails cleanly while daemon owns serial");
-    mock_reply_ok(&mock);
-    mock_expect_command(&mock, "M114\n");
-    mock_reply_ok(&mock);
-
-    stop_printerctld(child);
-    mock_close(&mock);
-    unlink(gcode_path);
-    remove_tree(state_home);
-    unlink(socket_path);
-    rmdir(dir);
-}
-
-static void test_legacy_owned_serial_rejects_daemon_start(void)
-{
-    char socket_path[108];
-    char dir[128];
-    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
-    char state_home[128];
-    make_temp_state_home(state_home, sizeof(state_home));
-    char legacy_state_home[128];
-    make_temp_state_home(legacy_state_home, sizeof(legacy_state_home));
-    char daemon_gcode_path[128];
-    char legacy_gcode_path[128];
-    write_gcode_file(daemon_gcode_path, sizeof(daemon_gcode_path), "M114\n");
-    write_gcode_file(legacy_gcode_path, sizeof(legacy_gcode_path), "M105\nM114\n");
-
-    mock_printer_t mock;
-    mock_open(&mock);
-    pid_t daemon = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
-    int ready_fd = connect_with_retry(socket_path);
-    close(ready_fd);
-
-    pid_t legacy = start_legacy_print(mock.slave_path, legacy_gcode_path, legacy_state_home);
-    mock_expect_command(&mock, "M105\n");
-
-    int client = connect_with_retry(socket_path);
-    send_print_start(client, 201, daemon_gcode_path);
-    printerctl_plp1_frame_t response =
-        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_START, 201);
-    check(response.status == PRINTERCTL_PLP1_SERIAL_ERROR,
-          "daemon START fails with SERIAL_ERROR while legacy owns serial");
-    close(client);
-
-    mock_reply_ok(&mock);
-    mock_expect_command(&mock, "M114\n");
-    mock_reply_ok(&mock);
-    expect_child_exit(legacy, 0);
-
-    stop_printerctld(daemon);
-    mock_close(&mock);
-    unlink(daemon_gcode_path);
-    unlink(legacy_gcode_path);
-    remove_tree(state_home);
-    remove_tree(legacy_state_home);
-    unlink(socket_path);
-    rmdir(dir);
-}
-
 static void test_cli_read_only_queries_use_daemon(void)
 {
     unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
@@ -932,6 +842,75 @@ static void test_cli_explicit_physical_commands_use_daemon(void)
     rmdir(config_home);
 }
 
+static void test_cli_print_uses_daemon_print_start(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "G21\nM105\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port_and_state(mock.slave_path, state_home);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_args("print", gcode_path, NULL, config_home, &out_fd);
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    char output[512];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "print accepted by printerctld") != NULL,
+          "CLI print reports daemon acceptance");
+
+    mock_expect_command(&mock, "G21\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "M105\n");
+    mock_reply_ok(&mock);
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+static void test_cli_print_source_error_is_daemon_reported(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port_and_state(mock.slave_path, state_home);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_args("print", "/tmp/printerctld-missing-cli.gcode", NULL,
+                                      config_home, &out_fd);
+    expect_child_exit(cli, PRINTERCTL_EXIT_GCODE_ERROR);
+    char output[128];
+    read_output(out_fd, output, sizeof(output));
+    check(output[0] == '\0', "missing source prints no acceptance message");
+    mock_expect_no_command(&mock);
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    remove_tree(state_home);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
 int main(void)
 {
     test_ping_and_clean_shutdown();
@@ -942,9 +921,9 @@ int main(void)
     test_sigterm_during_active_print_is_safe();
     test_sigpwr_during_active_print_uses_daemon_marker_and_is_safe();
     test_print_cancel_ack_window_blocks_next_command();
-    test_daemon_owned_serial_rejects_legacy_cli();
-    test_legacy_owned_serial_rejects_daemon_start();
     test_cli_read_only_queries_use_daemon();
     test_cli_explicit_physical_commands_use_daemon();
+    test_cli_print_uses_daemon_print_start();
+    test_cli_print_source_error_is_daemon_reported();
     return 0;
 }

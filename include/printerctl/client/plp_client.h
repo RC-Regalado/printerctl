@@ -68,6 +68,12 @@ printerctl_client_status_t printerctl_client_status(
     printerctl_plp1_status_response_t *out_status,
     printerctl_client_error_t *out_error);
 
+printerctl_client_status_t printerctl_client_print_start(
+    printerctl_client_t *client,
+    const char *path,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
 printerctl_client_status_t printerctl_client_query_temp(
     printerctl_client_t *client,
     int timeout_ms,
