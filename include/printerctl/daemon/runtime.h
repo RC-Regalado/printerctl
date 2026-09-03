@@ -96,6 +96,7 @@ typedef struct {
     uint8_t progress_percent;
     uint32_t commands_sent;
     uint32_t commands_acknowledged;
+    uint32_t commands_total; /* best-effort; 0 = unknown, see print_engine.h */
     uint32_t source_position;
     uint16_t failure_reason;
     char last_runtime_error[PRINTERCTL_DAEMON_ERROR_MAX]; /* empty when none recorded */
@@ -268,6 +269,14 @@ printerctl_daemon_status_t printerctl_daemon_runtime_wait_command(
 printerctl_daemon_status_t printerctl_daemon_runtime_drain_events(
     printerctl_daemon_runtime_t *runtime,
     printerctl_daemon_error_t *out_error);
+
+/*
+ * Borrowed control-context fd for polling runtime event availability.
+ * Callers must not read from or close it directly; when it is readable,
+ * call printerctl_daemon_runtime_drain_events() so the single logical
+ * control consumer updates the published snapshot.
+ */
+int printerctl_daemon_runtime_event_fd(const printerctl_daemon_runtime_t *runtime);
 
 /*
  * Blocks for exactly one event_pipe message and returns it via

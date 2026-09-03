@@ -431,9 +431,10 @@ present, always in canonical order regardless of the order requested.
 | 6 | 0x0040 | commands_acknowledged |
 | 7 | 0x0080 | source_position |
 | 8 | 0x0100 | failure_reason |
+| 9 | 0x0200 | commands_total (PRINT-OBS-001) |
 
-Bits 9-31 are reserved
-(`PRINTERCTL_PLP1_STATUS_FIELD_KNOWN_MASK = 0x01FF` covers bits 0-8).
+Bits 10-31 are reserved
+(`PRINTERCTL_PLP1_STATUS_FIELD_KNOWN_MASK = 0x03FF` covers bits 0-9).
 Both `printerctl_plp1_decode_status_response()` (`present_fields`) and
 `printerctl_plp1_decode_status_request()` (`requested_fields`) reject
 any bit outside that mask, as `INVALID_PAYLOAD` — a decoder cannot
@@ -466,6 +467,7 @@ M14 fixes them as follows, recorded here rather than left implicit:
 | commands_acknowledged | 4 bytes | same rationale |
 | source_position | 4 bytes | source line number; a file with >4 billion lines is not plausible |
 | failure_reason | 2 bytes | reuses `printerctl_plp1_wire_status_t`'s numeric space; 0 = none |
+| commands_total | 4 bytes | PRINT-OBS-001; best-effort pre-scanned source command count, appended after failure_reason in canonical order; same rationale as commands_sent; 0 = unknown, and a STATUS response never sets this bit when the daemon has no value for it (same "absent, not fictitious" rule as failure_reason) |
 
 `daemon_state` wire enum: `0 UNKNOWN, 1 STARTING, 2 RUNNING, 3 STOPPING,
 4 STOPPED, 5 FAILED`. `worker_state` wire enum: `0 UNKNOWN, 1

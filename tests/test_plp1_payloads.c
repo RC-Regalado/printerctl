@@ -151,6 +151,51 @@ static void test_status_response_canonical_ordering(void)
           "both fields decode correctly regardless of request order");
 }
 
+/* PRINT-OBS-001: commands_total is a uint32 appended after failure_reason
+ * in canonical order. */
+static void test_status_response_commands_total(void)
+{
+    printerctl_plp1_status_response_t value;
+    memset(&value, 0, sizeof(value));
+    value.present_fields = PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON |
+                            PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL;
+    value.failure_reason = 0;
+    value.commands_total = 1240;
+
+    uint8_t payload[64];
+    size_t length = 0;
+    printerctl_plp1_error_t error;
+    check(printerctl_plp1_encode_status_response(&value, payload, sizeof(payload), &length,
+                                                  &error) == PRINTERCTL_PLP1_OK,
+          "encoding a STATUS response with commands_total succeeds");
+    /* present_fields(4) + failure_reason(2) + commands_total(4) */
+    check(length == 4 + 2 + 4, "commands_total adds exactly 4 bytes at the wire's end");
+
+    printerctl_plp1_status_response_t decoded;
+    check(printerctl_plp1_decode_status_response(payload, length, &decoded, &error) ==
+              PRINTERCTL_PLP1_OK,
+          "decoding a STATUS response with commands_total succeeds");
+    check(decoded.commands_total == 1240, "commands_total round-trips exactly");
+
+    /* A response that never requested commands_total decodes it as
+     * absent/zero, never as a fictitious value. */
+    printerctl_plp1_status_response_t no_total;
+    memset(&no_total, 0, sizeof(no_total));
+    no_total.present_fields = PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED;
+    no_total.commands_acknowledged = 583;
+    size_t no_total_length = 0;
+    check(printerctl_plp1_encode_status_response(&no_total, payload, sizeof(payload),
+                                                  &no_total_length, &error) == PRINTERCTL_PLP1_OK,
+          "encoding a STATUS response without commands_total succeeds");
+    printerctl_plp1_status_response_t decoded_no_total;
+    check(printerctl_plp1_decode_status_response(payload, no_total_length, &decoded_no_total,
+                                                  &error) == PRINTERCTL_PLP1_OK,
+          "decoding a STATUS response without commands_total succeeds");
+    check((decoded_no_total.present_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL) == 0 &&
+              decoded_no_total.commands_total == 0,
+          "commands_total is absent and zero when never requested");
+}
+
 static void test_status_response_truncated(void)
 {
     printerctl_plp1_status_response_t value;
@@ -398,7 +443,7 @@ static void test_trailing_bytes_rejected(void)
 static void test_status_response_reserved_bits(void)
 {
     /* A present_fields value with a bit outside PRINTERCTL_PLP1_STATUS_FIELD_KNOWN_MASK
-     * (0x01FF) set must be rejected -- the decoder cannot safely size or
+     * (0x03FF) set must be rejected -- the decoder cannot safely size or
      * skip a field it does not know about. */
     uint8_t payload[4];
     uint32_t present = PRINTERCTL_PLP1_STATUS_FIELD_DAEMON_STATE | 0x8000u; /* bit 15: reserved */
@@ -426,7 +471,7 @@ static void test_encode_status_request_rejects_reserved_bits(void)
     uint8_t payload[8];
     size_t length = 0;
     printerctl_plp1_error_t error;
-    uint32_t requested = PRINTERCTL_PLP1_STATUS_FIELD_PROGRESS | 0x0200u; /* bit 9: reserved */
+    uint32_t requested = PRINTERCTL_PLP1_STATUS_FIELD_PROGRESS | 0x0400u; /* bit 10: reserved */
 
     check(printerctl_plp1_encode_status_request(requested, payload, sizeof(payload), &length,
                                                  &error) == PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT,
@@ -613,6 +658,7 @@ int main(void)
     test_status_request();
     test_status_response_partial_fields();
     test_status_response_canonical_ordering();
+    test_status_response_commands_total();
     test_status_response_truncated();
     test_status_response_reserved_bits();
     test_encode_status_request_rejects_reserved_bits();

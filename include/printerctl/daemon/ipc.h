@@ -97,6 +97,7 @@ typedef struct {
     uint8_t progress_percent;
     uint32_t commands_sent;
     uint32_t commands_acknowledged;
+    uint32_t commands_total;   /* best-effort; 0 = unknown, see print_engine.h */
     uint32_t source_position;
     uint16_t failure_reason;
     uint16_t wire_status; /* COMMAND_COMPLETED error status; 0 on success/unused */

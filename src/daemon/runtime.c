@@ -451,6 +451,7 @@ printerctl_daemon_status_t printerctl_daemon_runtime_wait_event(
         runtime->snapshot.progress_percent = out_event->progress_percent;
         runtime->snapshot.commands_sent = out_event->commands_sent;
         runtime->snapshot.commands_acknowledged = out_event->commands_acknowledged;
+        runtime->snapshot.commands_total = out_event->commands_total;
         runtime->snapshot.source_position = out_event->source_position;
         runtime->snapshot.failure_reason = out_event->failure_reason;
         if (out_event->detail[0] != '\0') {
@@ -527,8 +528,16 @@ printerctl_daemon_status_t printerctl_daemon_runtime_drain_events(
                       strerror(errno));
             return out_error->status;
         }
-        if (rc == 0 || (pfd.revents & POLLIN) == 0) {
+        if (rc == 0) {
             return PRINTERCTL_DAEMON_OK;
+        }
+        if ((pfd.revents & POLLIN) == 0) {
+            set_error(out_error, PRINTERCTL_DAEMON_ERR_IO,
+                      "event_pipe poll reported unusable fd");
+            runtime->snapshot.daemon_state = PRINTERCTL_DAEMON_FAILED;
+            snprintf(runtime->snapshot.last_runtime_error,
+                     sizeof(runtime->snapshot.last_runtime_error), "%s", out_error->message);
+            return out_error->status;
         }
 
         printerctl_daemon_event_t event;
@@ -538,6 +547,11 @@ printerctl_daemon_status_t printerctl_daemon_runtime_drain_events(
             return status;
         }
     }
+}
+
+int printerctl_daemon_runtime_event_fd(const printerctl_daemon_runtime_t *runtime)
+{
+    return runtime != NULL ? runtime->event_pipe[0] : -1;
 }
 
 printerctl_daemon_status_t printerctl_daemon_runtime_shutdown(

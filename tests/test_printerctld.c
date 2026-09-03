@@ -189,6 +189,19 @@ static pid_t start_printerctld_default_with_port(const char *port_path)
     return child;
 }
 
+static pid_t start_printerctld_default_with_port_timeout(const char *port_path,
+                                                         const char *timeout_ms)
+{
+    pid_t child = fork();
+    check(child >= 0, "fork");
+    if (child == 0) {
+        execl(TEST_PRINTERCTLD_PATH, "printerctld", "--port", port_path, "--timeout",
+              timeout_ms, (char *)NULL);
+        _exit(127);
+    }
+    return child;
+}
+
 static pid_t start_printerctld_default_with_port_and_state(const char *port_path,
                                                            const char *state_home)
 {
@@ -257,6 +270,12 @@ static void mock_close(mock_printer_t *mock)
 static void mock_reply_ok(mock_printer_t *mock)
 {
     check(write(mock->master, "ok\n", 3) == 3, "mock writes ok");
+}
+
+static void mock_write_text(mock_printer_t *mock, const char *text)
+{
+    size_t length = strlen(text);
+    check(write(mock->master, text, length) == (ssize_t)length, "mock writes text");
 }
 
 static void sleep_ms(long milliseconds)
@@ -377,6 +396,58 @@ static void send_print_cancel(int client, uint32_t request_id)
     write_full(client, request, request_length);
 }
 
+static void send_print_pause(int client, uint32_t request_id)
+{
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_PRINT_PAUSE, request_id, NULL, 0,
+                                           request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+static void send_print_resume(int client, uint32_t request_id)
+{
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_PRINT_RESUME, request_id, NULL, 0,
+                                           request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+
+static void send_status(int client, uint32_t request_id, uint32_t requested_fields)
+{
+    uint8_t payload[4];
+    payload[0] = (uint8_t)(requested_fields >> 24);
+    payload[1] = (uint8_t)(requested_fields >> 16);
+    payload[2] = (uint8_t)(requested_fields >> 8);
+    payload[3] = (uint8_t)requested_fields;
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_STATUS, request_id, payload,
+                                           sizeof(payload), request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+static void send_query_temp(int client, uint32_t request_id)
+{
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_QUERY_TEMP, request_id, NULL, 0,
+                                           request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+static void send_home(int client, uint32_t request_id, uint8_t axis)
+{
+    uint8_t payload[1];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    check(printerctl_plp1_encode_home_request(axis, payload, sizeof(payload), &payload_length,
+                                              &plp_error) == PRINTERCTL_PLP1_OK,
+          "encode HOME payload");
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_HOME, request_id, payload,
+                                           (uint16_t)payload_length, request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
 static printerctl_plp1_frame_t read_response_frame(int client, uint8_t expected_type,
                                                    uint32_t expected_request_id)
 {
@@ -392,11 +463,67 @@ static printerctl_plp1_frame_t read_response_frame(int client, uint8_t expected_
     return decoded;
 }
 
+/* Sends STATUS for EXECUTION_STATE|PROGRESS|COMMANDS_ACKNOWLEDGED|COMMANDS_TOTAL
+ * on a fresh connection and decodes the response, so callers can model an
+ * independent observer (PRINT-OBS-001 client-independence coverage). */
+static printerctl_plp1_status_response_t query_print_status(const char *socket_path,
+                                                             uint32_t request_id)
+{
+    int client = connect_with_retry(socket_path);
+    send_status(client, request_id,
+               PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE |
+                   PRINTERCTL_PLP1_STATUS_FIELD_PROGRESS |
+                   PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED |
+                   PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL);
+    printerctl_plp1_frame_t response =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_STATUS, request_id);
+    check(response.status == PRINTERCTL_PLP1_SUCCESS, "STATUS succeeds");
+    printerctl_plp1_status_response_t decoded;
+    printerctl_plp1_error_t error;
+    check(printerctl_plp1_decode_status_response(response.payload, response.payload_length,
+                                                 &decoded, &error) == PRINTERCTL_PLP1_OK,
+          "STATUS response decodes");
+    close(client);
+    return decoded;
+}
+
+/* Retries query_print_status() until commands_acknowledged reaches
+ * min_acknowledged or the budget is exhausted. The daemon updates its
+ * snapshot asynchronously (worker thread -> event_pipe -> control
+ * context) relative to this test process's own socket round-trip, so a
+ * query issued immediately after mock_reply_ok() can occasionally
+ * observe the previous count; the mock never acknowledges a further
+ * command until the test explicitly calls mock_reply_ok() again, so
+ * commands_acknowledged can only be at-or-below min_acknowledged here,
+ * never overshoot it. */
+static printerctl_plp1_status_response_t query_print_status_at_least(
+    const char *socket_path, uint32_t request_id, uint32_t min_acknowledged)
+{
+    printerctl_plp1_status_response_t decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        decoded = query_print_status(socket_path, request_id);
+        if (decoded.commands_acknowledged >= min_acknowledged) {
+            return decoded;
+        }
+        sleep_ms(10);
+    }
+    check(decoded.commands_acknowledged >= min_acknowledged,
+          "commands_acknowledged reaches the expected value within the retry budget");
+    return decoded;
+}
+
 static void expect_child_exit(pid_t child, int expected_exit)
 {
     int status = 0;
     check(waitpid(child, &status, 0) == child, "wait child");
     check(WIFEXITED(status) && WEXITSTATUS(status) == expected_exit, "child exit status matches");
+}
+
+static void expect_child_still_running(pid_t child)
+{
+    int status = 0;
+    check(waitpid(child, &status, WNOHANG) == 0, "child is still running");
 }
 
 static pid_t start_printerctl_query(const char *command, const char *config_home, int *out_read_fd)
@@ -443,6 +570,36 @@ static pid_t start_printerctl_args(const char *arg1, const char *arg2, const cha
     }
     close(stdout_pipe[1]);
     *out_read_fd = stdout_pipe[0];
+    return child;
+}
+
+static pid_t start_printerctl_args_combined(const char *arg1, const char *arg2,
+                                            const char *arg3, const char *config_home,
+                                            int *out_read_fd)
+{
+    int output_pipe[2];
+    check(pipe(output_pipe) == 0, "output pipe");
+    pid_t child = fork();
+    check(child >= 0, "fork printerctl command");
+    if (child == 0) {
+        close(output_pipe[0]);
+        dup2(output_pipe[1], STDOUT_FILENO);
+        dup2(output_pipe[1], STDERR_FILENO);
+        close(output_pipe[1]);
+        if (config_home != NULL) {
+            setenv("XDG_CONFIG_HOME", config_home, 1);
+        }
+        if (arg3 != NULL) {
+            execl(TEST_PRINTERCTL_PATH, "printerctl", arg1, arg2, arg3, (char *)NULL);
+        } else if (arg2 != NULL) {
+            execl(TEST_PRINTERCTL_PATH, "printerctl", arg1, arg2, (char *)NULL);
+        } else {
+            execl(TEST_PRINTERCTL_PATH, "printerctl", arg1, (char *)NULL);
+        }
+        _exit(127);
+    }
+    close(output_pipe[1]);
+    *out_read_fd = output_pipe[0];
     return child;
 }
 
@@ -619,6 +776,415 @@ static void start_daemon_print(pid_t child, const char *socket_path, const char 
     check(response.status == PRINTERCTL_PLP1_SUCCESS, "daemon PRINT_START succeeds");
     close(client);
     mock_expect_command(mock, "M105\n");
+}
+
+static void start_daemon_print_without_waiting_for_command(const char *socket_path,
+                                                           const char *gcode_path)
+{
+    int client = connect_with_retry(socket_path);
+    send_print_start(client, 200, gcode_path);
+    printerctl_plp1_frame_t response =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_START, 200);
+    check(response.status == PRINTERCTL_PLP1_SUCCESS, "daemon PRINT_START succeeds");
+    close(client);
+}
+
+static void assert_ping_ok(const char *socket_path)
+{
+    int client = connect_with_retry(socket_path);
+    uint8_t request[PRINTERCTL_PLP1_HEADER_SIZE];
+    size_t request_length = encode_ping(request, sizeof(request));
+    write_full(client, request, request_length);
+    printerctl_plp1_frame_t response = read_response_frame(client, PRINTERCTL_PLP1_MSG_PING, 123);
+    check(response.status == PRINTERCTL_PLP1_SUCCESS, "daemon PING succeeds");
+    close(client);
+}
+
+static void write_linear_gcode_file(char *path, size_t path_size, int count)
+{
+    char contents[4096];
+    size_t used = 0;
+    for (int i = 0; i < count; ++i) {
+        int n = snprintf(contents + used, sizeof(contents) - used, "G1 X%d\n", i);
+        check(n > 0 && used + (size_t)n < sizeof(contents), "linear gcode fits");
+        used += (size_t)n;
+    }
+    write_gcode_file(path, path_size, contents);
+}
+
+static void test_print_advances_after_m109_without_secondary_request(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path),
+                     "G1 X0\nG1 X1\nG1 X2\nG1 X3\nG1 X4\nG1 X5\nG1 X6\nG1 X7\nG1 X8\n"
+                     "M109 S200\nG1 X10\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+
+    char expected[32];
+    for (int i = 0; i < 9; ++i) {
+        snprintf(expected, sizeof(expected), "G1 X%d\n", i);
+        mock_expect_command(&mock, expected);
+        mock_reply_ok(&mock);
+    }
+    mock_expect_command(&mock, "M109 S200\n");
+    mock_write_text(&mock, "T:180 /200\n");
+    mock_write_text(&mock, "echo:busy: processing\n");
+    mock_write_text(&mock, "T:190 /200\n");
+    mock_write_text(&mock, "echo:busy: processing\n");
+    mock_write_text(&mock, "T:200 /200\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 X10\n");
+    mock_reply_ok(&mock);
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+static void test_print_progress_event_backlog_does_not_stall_execution(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 48);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+
+    char expected[32];
+    for (int i = 0; i < 48; ++i) {
+        snprintf(expected, sizeof(expected), "G1 X%d\n", i);
+        mock_expect_command(&mock, expected);
+        mock_reply_ok(&mock);
+    }
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+static void test_status_during_print_has_no_serial_side_effects(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "G1 X0\nG1 X1\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+    mock_expect_command(&mock, "G1 X0\n");
+
+    int client = connect_with_retry(socket_path);
+    send_status(client, 260, PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE |
+                                 PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_SENT);
+    printerctl_plp1_frame_t status = read_response_frame(client, PRINTERCTL_PLP1_MSG_STATUS, 260);
+    check(status.status == PRINTERCTL_PLP1_SUCCESS, "STATUS succeeds during active print");
+    close(client);
+    mock_expect_no_command(&mock);
+
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 X1\n");
+    mock_reply_ok(&mock);
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+static void test_temp_during_print_is_busy_and_has_no_serial_side_effects(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "G1 X0\nG1 X1\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+    mock_expect_command(&mock, "G1 X0\n");
+
+    int client = connect_with_retry(socket_path);
+    send_query_temp(client, 270);
+    printerctl_plp1_frame_t temp = read_response_frame(client, PRINTERCTL_PLP1_MSG_QUERY_TEMP, 270);
+    check(temp.status == PRINTERCTL_PLP1_BUSY, "TEMP returns BUSY during active print");
+    close(client);
+    mock_expect_no_command(&mock);
+
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 X1\n");
+    mock_reply_ok(&mock);
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+/* PRINT-OBS-001: acknowledged/total progress advances and is monotonic
+ * across a 10-command print, and STATUS itself sends nothing to the
+ * printer. */
+static void test_print_progress_advances_with_acknowledgements(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 10);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+
+    uint32_t previous_acknowledged = 0;
+    char expected[32];
+    for (int i = 0; i < 10; ++i) {
+        snprintf(expected, sizeof(expected), "G1 X%d\n", i);
+        mock_expect_command(&mock, expected);
+        mock_reply_ok(&mock);
+
+        printerctl_plp1_status_response_t decoded =
+            query_print_status_at_least(socket_path, 300 + (uint32_t)i, (uint32_t)(i + 1));
+        /* The 10th acknowledgement is also the file's last command, so
+         * the engine may already have reached EOF and transitioned to
+         * COMPLETED by the time this query runs. */
+        bool is_last = i == 9;
+        check(decoded.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING ||
+                  (is_last && decoded.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED),
+              "execution_state is RUNNING while acknowledgements are still arriving "
+              "(or COMPLETED exactly at the final acknowledgement)");
+        check(decoded.commands_acknowledged == (uint32_t)(i + 1),
+              "commands_acknowledged reflects exactly the acknowledgements observed so far");
+        check(decoded.commands_total == 10,
+              "commands_total reports the pre-scanned source command count");
+        check(decoded.commands_acknowledged >= previous_acknowledged,
+              "commands_acknowledged never regresses between polls (monotonicity)");
+        previous_acknowledged = decoded.commands_acknowledged;
+    }
+    check(previous_acknowledged == 10, "the final poll observed all 10 acknowledgements");
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+/* PRINT-OBS-001: pausing must not reset progress, and resuming must
+ * continue from the same acknowledged count -- never from zero. */
+static void test_print_pause_resume_preserves_progress(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 10);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+
+    char expected[32];
+    for (int i = 0; i < 4; ++i) {
+        snprintf(expected, sizeof(expected), "G1 X%d\n", i);
+        mock_expect_command(&mock, expected);
+        mock_reply_ok(&mock);
+    }
+
+    /* The 5th command (G1 X4) is sent but deliberately held un-acked --
+     * the same ack-window technique test_print_cancel_ack_window_blocks_
+     * next_command() above uses -- so PRINT_PAUSE is guaranteed to
+     * commit (via poll_control_commands()'s ack-wait polling) before
+     * on_control() is ever consulted for the next command, making the
+     * "G1 X5 must not be sent" assertion below deterministic rather
+     * than racing the engine's own control poll. */
+    mock_expect_command(&mock, "G1 X4\n");
+
+    int control = connect_with_retry(socket_path);
+    send_print_pause(control, 311);
+    printerctl_plp1_frame_t pause_response =
+        read_response_frame(control, PRINTERCTL_PLP1_MSG_PRINT_PAUSE, 311);
+    check(pause_response.status == PRINTERCTL_PLP1_SUCCESS, "PRINT_PAUSE is accepted");
+    close(control);
+
+    mock_reply_ok(&mock); /* releases G1 X4's ack: 5 of 10 now acknowledged */
+    mock_expect_no_command(&mock); /* G1 X5 must not be transmitted while paused */
+
+    printerctl_plp1_status_response_t paused = query_print_status(socket_path, 312);
+    check(paused.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED,
+          "execution_state reports PAUSED");
+    check(paused.commands_acknowledged == 5,
+          "commands_acknowledged is unchanged by pausing (not reset to 0)");
+    check(paused.progress > 0, "progress percent is not reset to 0 by pausing");
+
+    int resume = connect_with_retry(socket_path);
+    send_print_resume(resume, 313);
+    printerctl_plp1_frame_t resume_response =
+        read_response_frame(resume, PRINTERCTL_PLP1_MSG_PRINT_RESUME, 313);
+    check(resume_response.status == PRINTERCTL_PLP1_SUCCESS, "PRINT_RESUME is accepted");
+    close(resume);
+
+    for (int i = 5; i < 10; ++i) {
+        snprintf(expected, sizeof(expected), "G1 X%d\n", i);
+        mock_expect_command(&mock, expected);
+        mock_reply_ok(&mock);
+    }
+
+    printerctl_plp1_status_response_t completed = query_print_status_at_least(socket_path, 314, 10);
+    check(completed.commands_acknowledged == 10,
+          "printing resumes from 5 and continues to completion, never restarting from 0");
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+/* PRINT-OBS-001: client independence -- the client that started the
+ * print may disconnect; a second, unrelated client must still observe
+ * correct current progress from the daemon-owned snapshot. */
+static void test_print_progress_client_independence(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 10);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+
+    /* Client A starts the print and disconnects immediately (mirrors
+     * start_daemon_print_without_waiting_for_command, but explicit here
+     * about client A's lifetime). */
+    int client_a = connect_with_retry(socket_path);
+    send_print_start(client_a, 320, gcode_path);
+    printerctl_plp1_frame_t accepted =
+        read_response_frame(client_a, PRINTERCTL_PLP1_MSG_PRINT_START, 320);
+    check(accepted.status == PRINTERCTL_PLP1_SUCCESS, "PRINT_START is accepted");
+    close(client_a);
+
+    char expected[32];
+    for (int i = 0; i < 6; ++i) {
+        snprintf(expected, sizeof(expected), "G1 X%d\n", i);
+        mock_expect_command(&mock, expected);
+        mock_reply_ok(&mock);
+    }
+
+    /* Client B never sent PRINT_START and has no prior connection to
+     * this daemon -- everything it needs comes from the daemon-owned
+     * snapshot. */
+    printerctl_plp1_status_response_t observed_by_b =
+        query_print_status_at_least(socket_path, 330, 6);
+    check(observed_by_b.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING,
+          "client B observes the print still running after client A disconnected");
+    check(observed_by_b.commands_acknowledged == 6,
+          "client B observes the correct current acknowledged count");
+    check(observed_by_b.commands_total == 10,
+          "client B observes the correct commands_total known only to the daemon");
+
+    for (int i = 6; i < 10; ++i) {
+        snprintf(expected, sizeof(expected), "G1 X%d\n", i);
+        mock_expect_command(&mock, expected);
+        mock_reply_ok(&mock);
+    }
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+/* PRINT-OBS-001: repeated STATUS polling during an active print must
+ * never itself produce serial traffic. */
+static void test_repeated_status_polling_has_no_serial_side_effects(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "G1 X0\nG1 X1\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+    mock_expect_command(&mock, "G1 X0\n");
+
+    for (int i = 0; i < 10; ++i) {
+        printerctl_plp1_status_response_t decoded = query_print_status(socket_path, 340 + (uint32_t)i);
+        check(decoded.commands_acknowledged == 0,
+              "repeated STATUS polling does not itself advance execution");
+    }
+    mock_expect_no_command(&mock);
+
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 X1\n");
+    mock_reply_ok(&mock);
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
 }
 
 static void test_sigterm_during_active_print_is_safe(void)
@@ -861,16 +1427,24 @@ static void test_cli_print_uses_daemon_print_start(void)
 
     int out_fd = -1;
     pid_t cli = start_printerctl_args("print", gcode_path, NULL, config_home, &out_fd);
+
+    /* PRINT-OBS-001: the CLI now remains attached, polling STATUS until
+     * a terminal execution_state -- it no longer exits right after
+     * acceptance -- so the mock exchange must happen before waiting for
+     * the CLI to exit (same ordering test_home_quick_completion_
+     * remains_synchronous() above already uses for `home`). */
+    mock_expect_command(&mock, "G21\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "M105\n");
+    mock_reply_ok(&mock);
+
     expect_child_exit(cli, PRINTERCTL_EXIT_OK);
     char output[512];
     read_output(out_fd, output, sizeof(output));
     check(strstr(output, "print accepted by printerctld") != NULL,
           "CLI print reports daemon acceptance");
-
-    mock_expect_command(&mock, "G21\n");
-    mock_reply_ok(&mock);
-    mock_expect_command(&mock, "M105\n");
-    mock_reply_ok(&mock);
+    check(strstr(output, "Completed") != NULL,
+          "CLI print reports the terminal Completed state before exiting");
 
     stop_printerctld(daemon);
     mock_close(&mock);
@@ -911,6 +1485,181 @@ static void test_cli_print_source_error_is_daemon_reported(void)
     rmdir(config_home);
 }
 
+static void test_home_quick_completion_remains_synchronous(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port(mock.slave_path);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_args("home", NULL, NULL, config_home, &out_fd);
+    mock_expect_command(&mock, "G28\n");
+    mock_reply_ok(&mock);
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    char output[512];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "home complete: all axes") != NULL,
+          "quick HOME reports terminal completion");
+
+    int ping = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ping);
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+static void test_home_waits_beyond_short_plp_deadline(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port_timeout(mock.slave_path, "8000");
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_args("home", NULL, NULL, config_home, &out_fd);
+    mock_expect_command(&mock, "G28\n");
+    sleep_ms(5500);
+    expect_child_still_running(cli);
+    mock_reply_ok(&mock);
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    char output[512];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "home complete: all axes") != NULL,
+          "delayed HOME reports terminal completion after ok");
+
+    int ping = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ping);
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+static void test_home_marlin_timeout_is_daemon_authoritative(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port(mock.slave_path);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_args_combined("home", NULL, NULL, config_home, &out_fd);
+    mock_expect_command(&mock, "G28\n");
+    expect_child_exit(cli, PRINTERCTL_EXIT_COMM_ERROR);
+    char output[1024];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "wire_status=0x0403") != NULL ||
+              strstr(output, "remote status 0x0403") != NULL,
+          "HOME timeout is reported as PLP PRINTER_TIMEOUT");
+
+    int ping = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ping);
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+static void test_home_printer_error_is_propagated(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port(mock.slave_path);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_args_combined("home", NULL, NULL, config_home, &out_fd);
+    mock_expect_command(&mock, "G28\n");
+    const char *error = "Error: simulated homing failure\n";
+    check(write(mock.master, error, strlen(error)) == (ssize_t)strlen(error),
+          "mock writes HOME printer error");
+    expect_child_exit(cli, PRINTERCTL_EXIT_PRINTER_ERROR);
+    char output[1024];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "wire_status=0x0401") != NULL ||
+              strstr(output, "remote status 0x0401") != NULL,
+          "HOME printer error is reported as PLP PRINTER_ERROR");
+
+    int ping = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ping);
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+static void run_home_disconnect_case(bool reset)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port(mock.slave_path);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int client = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    send_home(client, 330, PRINTERCTL_PLP1_HOME_ALL);
+    mock_expect_command(&mock, "G28\n");
+    if (reset) {
+        struct linger linger_opt = {.l_onoff = 1, .l_linger = 0};
+        check(setsockopt(client, SOL_SOCKET, SO_LINGER, &linger_opt,
+                         sizeof(linger_opt)) == 0,
+              "enable reset-on-close");
+    }
+    close(client);
+    sleep_ms(100);
+    mock_expect_no_command(&mock);
+    mock_reply_ok(&mock);
+    sleep_ms(250);
+    mock_expect_no_command(&mock);
+
+    int ping = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    uint8_t request[PRINTERCTL_PLP1_HEADER_SIZE];
+    size_t request_length = encode_ping(request, sizeof(request));
+    write_full(ping, request, request_length);
+    printerctl_plp1_frame_t response =
+        read_response_frame(ping, PRINTERCTL_PLP1_MSG_PING, 123);
+    check(response.status == PRINTERCTL_PLP1_SUCCESS,
+          "daemon remains alive after undeliverable HOME response");
+    close(ping);
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+}
+
+static void test_home_client_disconnect_after_g28_is_not_fatal(void)
+{
+    run_home_disconnect_case(false);
+    run_home_disconnect_case(true);
+}
+
 int main(void)
 {
     test_ping_and_clean_shutdown();
@@ -921,9 +1670,22 @@ int main(void)
     test_sigterm_during_active_print_is_safe();
     test_sigpwr_during_active_print_uses_daemon_marker_and_is_safe();
     test_print_cancel_ack_window_blocks_next_command();
+    test_print_advances_after_m109_without_secondary_request();
+    test_print_progress_event_backlog_does_not_stall_execution();
+    test_status_during_print_has_no_serial_side_effects();
+    test_temp_during_print_is_busy_and_has_no_serial_side_effects();
+    test_print_progress_advances_with_acknowledgements();
+    test_print_pause_resume_preserves_progress();
+    test_print_progress_client_independence();
+    test_repeated_status_polling_has_no_serial_side_effects();
     test_cli_read_only_queries_use_daemon();
     test_cli_explicit_physical_commands_use_daemon();
     test_cli_print_uses_daemon_print_start();
     test_cli_print_source_error_is_daemon_reported();
+    test_home_quick_completion_remains_synchronous();
+    test_home_waits_beyond_short_plp_deadline();
+    test_home_marlin_timeout_is_daemon_authoritative();
+    test_home_printer_error_is_propagated();
+    test_home_client_disconnect_after_g28_is_not_fatal();
     return 0;
 }

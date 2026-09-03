@@ -139,6 +139,9 @@ struct printerctl_print_engine {
     bool marker_active;
     char serial_device[PRINTERCTL_RECORD_DEVICE_MAX];
 
+    uint64_t commands_total; /* best-effort pre-scan count, see
+                               * printerctl_print_engine_commands_total(); 0 = unknown */
+
     bool paused;
     bool cancel_power_failure_notified;
     pthread_mutex_t tx_gate;
@@ -224,6 +227,19 @@ void printerctl_print_engine_set_control_poll(
     printerctl_print_engine_t *engine,
     printerctl_print_engine_control_poll_fn on_control_poll,
     void *context);
+
+/*
+ * The total source command count printerctl_print_engine_run() counted
+ * for the print currently (or most recently) running, via a best-effort
+ * local pre-scan of the source file done before streaming begins (see
+ * docs/milestones/print-obs-remediation.md, PRINT-OBS-001). Returns 0
+ * before the first run() call, and also 0 if the pre-scan itself could
+ * not complete (e.g. an unreadable or malformed source) -- the real
+ * streaming pass performs its own independent validation regardless, so
+ * an unknown total never blocks or changes a print's outcome. `engine`
+ * may be NULL (returns 0).
+ */
+uint64_t printerctl_print_engine_commands_total(const printerctl_print_engine_t *engine);
 
 /*
  * Removes the active-print marker if it is still active (idempotent)

@@ -220,12 +220,15 @@ int main(int argc, char *argv[])
     while (!stop_requested) {
         process_power_failure(&runtime);
 
-        struct pollfd pfd;
-        pfd.fd = server.listen_fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
+        struct pollfd pfds[2];
+        pfds[0].fd = server.listen_fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].fd = printerctl_daemon_runtime_event_fd(&runtime);
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
 
-        int rc = poll(&pfd, 1, 250);
+        int rc = poll(pfds, 2, 250);
         if (rc < 0) {
             if (errno == EINTR) {
                 continue;
@@ -237,7 +240,18 @@ int main(int argc, char *argv[])
         if (rc == 0) {
             continue;
         }
-        if (pfd.revents & POLLIN) {
+
+        if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+            if (printerctl_daemon_runtime_drain_events(&runtime, &runtime_error) !=
+                PRINTERCTL_DAEMON_OK) {
+                fprintf(stderr, "printerctld: runtime event drain failed: %s\n",
+                        runtime_error.message);
+                exit_code = 1;
+                break;
+            }
+        }
+
+        if (pfds[0].revents & POLLIN) {
             if (printerctl_daemon_socket_serve_one_interruptible(&server, should_stop_client, NULL,
                                                                  &socket_error) !=
                 PRINTERCTL_DAEMON_SOCKET_OK) {

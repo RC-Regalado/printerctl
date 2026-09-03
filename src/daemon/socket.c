@@ -206,6 +206,9 @@ static printerctl_daemon_socket_status_t write_full(
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EPIPE || errno == ECONNRESET) {
+                return PRINTERCTL_DAEMON_SOCKET_OK;
+            }
             set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_IO, "write(client): %s",
                       strerror(errno));
             return out_error->status;
@@ -502,6 +505,11 @@ static printerctl_daemon_socket_status_t handle_frame(
             value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON;
             value.failure_reason = snapshot.failure_reason;
         }
+        if ((requested_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL) &&
+            snapshot.commands_total != 0) {
+            value.present_fields |= PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL;
+            value.commands_total = snapshot.commands_total;
+        }
 
         uint8_t payload[32];
         size_t payload_length = 0;
@@ -685,21 +693,39 @@ printerctl_daemon_socket_status_t printerctl_daemon_socket_serve_one_interruptib
             return PRINTERCTL_DAEMON_SOCKET_OK;
         }
 
-        struct pollfd pfd;
-        pfd.fd = client_fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        int poll_rc = poll(&pfd, 1, 250);
+        struct pollfd pfds[2];
+        pfds[0].fd = client_fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].fd = printerctl_daemon_runtime_event_fd(server->runtime);
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+        int poll_rc = poll(pfds, 2, 250);
         if (poll_rc < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_IO, "poll(client): %s",
+            set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_IO, "poll(client/runtime): %s",
                       strerror(errno));
             close(client_fd);
             return out_error->status;
         }
         if (poll_rc == 0) {
+            continue;
+        }
+
+        if (pfds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) {
+            printerctl_daemon_error_t runtime_error;
+            if (printerctl_daemon_runtime_drain_events(server->runtime, &runtime_error) !=
+                PRINTERCTL_DAEMON_OK) {
+                set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_IO,
+                          "runtime event drain: %s", runtime_error.message);
+                close(client_fd);
+                return out_error->status;
+            }
+        }
+
+        if ((pfds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) == 0) {
             continue;
         }
 
@@ -712,6 +738,10 @@ printerctl_daemon_socket_status_t printerctl_daemon_socket_serve_one_interruptib
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
+            }
+            if (errno == ECONNRESET) {
+                close(client_fd);
+                return PRINTERCTL_DAEMON_SOCKET_OK;
             }
             set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_IO, "read(client): %s",
                       strerror(errno));

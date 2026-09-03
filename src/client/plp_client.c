@@ -172,13 +172,16 @@ static printerctl_client_status_t read_response(
             return out_error->status;
         }
 
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
-                          (now.tv_nsec - start.tv_nsec) / 1000000L;
-        int remaining_ms = timeout_ms - (int)elapsed_ms;
-        if (remaining_ms < 0) {
-            remaining_ms = 0;
+        int remaining_ms = -1;
+        if (timeout_ms > 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
+                              (now.tv_nsec - start.tv_nsec) / 1000000L;
+            remaining_ms = timeout_ms - (int)elapsed_ms;
+            if (remaining_ms < 0) {
+                remaining_ms = 0;
+            }
         }
 
         struct pollfd pfd;

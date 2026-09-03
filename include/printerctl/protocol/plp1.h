@@ -299,7 +299,9 @@ printerctl_plp1_result_t printerctl_plp1_decode_status_request(
 #define PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED 0x0040u
 #define PRINTERCTL_PLP1_STATUS_FIELD_SOURCE_POSITION 0x0080u
 #define PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON 0x0100u
-#define PRINTERCTL_PLP1_STATUS_FIELD_KNOWN_MASK 0x01FFu /* bits 0-8; any other
+#define PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL 0x0200u /* PRINT-OBS-001; best-effort,
+    0 = unknown -- see docs/milestones/print-obs-remediation.md */
+#define PRINTERCTL_PLP1_STATUS_FIELD_KNOWN_MASK 0x03FFu /* bits 0-9; any other
     bit set in a response's present_fields is rejected -- a decoder cannot
     safely size/skip a field it does not know about (see plp1_parser.h's
     structural-vs-semantic split: this is decode_status_response()'s own
@@ -356,6 +358,8 @@ typedef struct {
     uint32_t commands_acknowledged;
     uint32_t source_position;
     uint16_t failure_reason;
+    uint32_t commands_total; /* PRINT-OBS-001; wire order: appended after failure_reason,
+                              * see printerctl_plp1_encode_status_response() */
 } printerctl_plp1_status_response_t;
 
 /*

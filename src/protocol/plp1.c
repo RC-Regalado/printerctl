@@ -747,6 +747,7 @@ printerctl_plp1_result_t printerctl_plp1_encode_status_response(
     if (present & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED) needed += 4;
     if (present & PRINTERCTL_PLP1_STATUS_FIELD_SOURCE_POSITION) needed += 4;
     if (present & PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON) needed += 2;
+    if (present & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL) needed += 4;
 
     if (out_payload_size < needed) {
         set_error(out_error, PRINTERCTL_PLP1_ERR_BUFFER_TOO_SMALL, PRINTERCTL_PLP1_SUCCESS,
@@ -789,6 +790,10 @@ printerctl_plp1_result_t printerctl_plp1_encode_status_response(
     if (present & PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON) {
         write_u16be(out_payload + offset, value->failure_reason);
         offset += 2;
+    }
+    if (present & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL) {
+        write_u32be(out_payload + offset, value->commands_total);
+        offset += 4;
     }
 
     *out_length = offset;
@@ -872,6 +877,7 @@ printerctl_plp1_result_t printerctl_plp1_decode_status_response(
     PLP1_STATUS_READ_U32(PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED, commands_acknowledged)
     PLP1_STATUS_READ_U32(PRINTERCTL_PLP1_STATUS_FIELD_SOURCE_POSITION, source_position)
     PLP1_STATUS_READ_U16(PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON, failure_reason)
+    PLP1_STATUS_READ_U32(PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL, commands_total)
 
 #undef PLP1_STATUS_READ_U8
 #undef PLP1_STATUS_READ_U16

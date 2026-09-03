@@ -23,6 +23,9 @@ typedef struct {
     bool print_active;
     bool shutdown_after_print;
     uint32_t shutdown_token;
+    printerctl_print_summary_t last_progress; /* most recent PROGRESS snapshot; reused for
+                                               * PAUSED/RESUMED so those transitions don't
+                                               * reset counters to zero (PRINT-OBS-001) */
 } worker_context_t;
 
 static atomic_int g_signal_cancel_requested;
@@ -48,8 +51,8 @@ static void emit_raw(int event_write_fd, printerctl_daemon_event_type_t type, ui
                      printerctl_daemon_result_t result, const char *detail,
                      uint8_t execution_state, uint8_t progress_percent,
                      uint32_t commands_sent, uint32_t commands_acknowledged,
-                     uint32_t source_position, uint16_t failure_reason,
-                     uint16_t wire_status)
+                     uint32_t commands_total, uint32_t source_position,
+                     uint16_t failure_reason, uint16_t wire_status)
 {
     printerctl_daemon_event_t event;
     memset(&event, 0, sizeof(event));
@@ -61,6 +64,7 @@ static void emit_raw(int event_write_fd, printerctl_daemon_event_type_t type, ui
     event.progress_percent = progress_percent;
     event.commands_sent = commands_sent;
     event.commands_acknowledged = commands_acknowledged;
+    event.commands_total = commands_total;
     event.source_position = source_position;
     event.failure_reason = failure_reason;
     event.wire_status = wire_status;
@@ -73,7 +77,7 @@ static void emit_raw(int event_write_fd, printerctl_daemon_event_type_t type, ui
 static void emit(int event_write_fd, printerctl_daemon_event_type_t type, uint32_t token,
                  printerctl_daemon_result_t result, const char *detail)
 {
-    emit_raw(event_write_fd, type, token, result, detail, 0, 0, 0, 0, 0, 0, 0);
+    emit_raw(event_write_fd, type, token, result, detail, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 static uint16_t map_printer_status(printerctl_printer_status_t status)
@@ -101,7 +105,7 @@ static void emit_command_result(worker_context_t *ctx, uint32_t token,
                                 const char *detail)
 {
     emit_raw(ctx->event_write_fd, PRINTERCTL_DAEMON_EVENT_COMMAND_COMPLETED, token, result,
-             detail, 0, 0, 0, 0, 0, 0, wire_status);
+             detail, 0, 0, 0, 0, 0, 0, 0, wire_status);
 }
 
 static printerctl_daemon_event_t command_result_event(uint32_t token,
@@ -271,9 +275,11 @@ static void emit_print_update(worker_context_t *ctx, uint8_t execution_state,
         source_position =
             summary->bytes_consumed > UINT32_MAX ? UINT32_MAX : (uint32_t)summary->bytes_consumed;
     }
+    uint64_t total64 = printerctl_print_engine_commands_total(&ctx->engine);
+    uint32_t total = total64 > UINT32_MAX ? UINT32_MAX : (uint32_t)total64;
     emit_raw(ctx->event_write_fd, PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE, 0,
              PRINTERCTL_DAEMON_RESULT_OK, detail, execution_state, progress, sent, acknowledged,
-             source_position, failure_reason, 0);
+             total, source_position, failure_reason, 0);
 }
 
 static uint16_t validate_print_source(const char *path)
@@ -297,6 +303,7 @@ static void on_print_event(const printerctl_print_event_t *event, void *context)
     worker_context_t *ctx = context;
 
     if (event->type == PRINTERCTL_PRINT_EVENT_STARTED) {
+        memset(&ctx->last_progress, 0, sizeof(ctx->last_progress));
         emit_print_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING, NULL, NULL, 0);
     } else if (event->type == PRINTERCTL_PRINT_EVENT_PROGRESS && event->progress != NULL) {
         printerctl_print_summary_t summary;
@@ -305,11 +312,16 @@ static void on_print_event(const printerctl_print_event_t *event, void *context)
         summary.commands_acknowledged = event->progress->command_number;
         summary.bytes_consumed = event->progress->bytes_consumed;
         summary.progress_percent = event->progress->progress_percent;
+        ctx->last_progress = summary;
         emit_print_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING, &summary, NULL, 0);
     } else if (event->type == PRINTERCTL_PRINT_EVENT_PAUSED) {
-        emit_print_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED, NULL, NULL, 0);
+        /* Reuse the last known progress -- see worker_context_t.last_progress's
+         * doc comment; passing NULL here would zero progress on pause. */
+        emit_print_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED, &ctx->last_progress, NULL,
+                          0);
     } else if (event->type == PRINTERCTL_PRINT_EVENT_RESUMED) {
-        emit_print_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING, NULL, NULL, 0);
+        emit_print_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING, &ctx->last_progress, NULL,
+                          0);
     } else if (event->type == PRINTERCTL_PRINT_EVENT_COMPLETED && event->summary != NULL) {
         emit_print_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED, event->summary, NULL, 0);
     } else if (event->type == PRINTERCTL_PRINT_EVENT_CANCELLED && event->summary != NULL) {

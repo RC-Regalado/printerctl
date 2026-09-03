@@ -303,14 +303,15 @@ static void wait_until_execution(printerctl_daemon_runtime_t *runtime, uint8_t s
 {
     printerctl_daemon_error_t error;
     for (;;) {
-        printerctl_daemon_event_t event;
-        check(printerctl_daemon_runtime_wait_event(runtime, &event, &error) == PRINTERCTL_DAEMON_OK,
-              "wait print event");
         printerctl_daemon_snapshot_t snapshot;
         printerctl_daemon_runtime_snapshot(runtime, &snapshot);
         if (snapshot.execution_state == state) {
             return;
         }
+
+        printerctl_daemon_event_t event;
+        check(printerctl_daemon_runtime_wait_event(runtime, &event, &error) == PRINTERCTL_DAEMON_OK,
+              "wait print event");
     }
 }
 
@@ -837,11 +838,11 @@ static void test_second_print_start_maps_to_busy_over_socket(void)
     check(resume.status == PRINTERCTL_PLP1_SUCCESS, "RESUME accepted after BUSY check");
     mock_expect_command(&mock, "M114\n");
     mock_reply_ok(&mock);
-    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
 
     shutdown(client, SHUT_WR);
     check(pthread_join(thread, NULL) == 0, "serve thread joins");
     close(client);
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
 
     stop_runtime_and_socket(&runtime, &server);
     mock_close(&mock);

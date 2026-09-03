@@ -40,7 +40,9 @@ printerctl_client_status_t printerctl_client_connect(
 void printerctl_client_close(printerctl_client_t *client);
 
 /* On success, out_response->payload borrows from client-owned storage
- * and remains valid until the next request or close. */
+ * and remains valid until the next request or close. timeout_ms == 0
+ * means no client-side response deadline; the daemon remains authoritative
+ * for Marlin/execution failures. */
 printerctl_client_status_t printerctl_client_request(
     printerctl_client_t *client,
     uint8_t message_type,

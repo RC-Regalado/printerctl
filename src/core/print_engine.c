@@ -300,6 +300,42 @@ static void write_session_record(printerctl_print_engine_t *engine, const char *
     emit(engine, &event);
 }
 
+/*
+ * Best-effort total-command pre-scan (PRINT-OBS-001): a second,
+ * throw-away reader pass over the same source, opened with the same
+ * allow_g28 policy the real streaming pass uses (printer.c's
+ * print_file_controlled() opens with allow_g28 = false), so the count
+ * reflects what will actually be streamed. Any non-EOF terminal status
+ * (open failure, unsafe G28, malformed line, file changed mid-scan,
+ * ...) yields 0/unknown rather than failing the print here -- the real
+ * streaming pass independently re-validates the file and is the only
+ * one authorized to fail the print.
+ */
+static uint64_t count_source_commands(const char *path)
+{
+    printerctl_gcode_reader_t reader;
+    printerctl_gcode_error_t error;
+    if (printerctl_gcode_reader_open(&reader, path, false, &error) != PRINTERCTL_GCODE_OK) {
+        return 0;
+    }
+
+    printerctl_gcode_status_t status;
+    do {
+        printerctl_gcode_result_t result;
+        status = printerctl_gcode_reader_next(&reader, &result, &error);
+    } while (status == PRINTERCTL_GCODE_OK);
+
+    uint64_t total = status == PRINTERCTL_GCODE_EOF ? reader.command_count : 0;
+    printerctl_gcode_error_t close_error;
+    printerctl_gcode_reader_close(&reader, &close_error);
+    return total;
+}
+
+uint64_t printerctl_print_engine_commands_total(const printerctl_print_engine_t *engine)
+{
+    return engine != NULL ? engine->commands_total : 0;
+}
+
 printerctl_printer_status_t printerctl_print_engine_run(
     printerctl_print_engine_t *engine,
     const char *path,
@@ -318,6 +354,8 @@ printerctl_printer_status_t printerctl_print_engine_run(
         return out_error->status;
     }
     memset(out_summary, 0, sizeof(*out_summary));
+
+    engine->commands_total = count_source_commands(path);
 
     printerctl_print_event_t started;
     memset(&started, 0, sizeof(started));

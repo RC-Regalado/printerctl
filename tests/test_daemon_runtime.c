@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "printerctl/daemon/runtime.h"
+#include "printerctl/protocol/plp1.h"
 
 #include <dirent.h>
 #include <signal.h>
@@ -341,6 +342,43 @@ static void test_shutdown_after_drained_fault_does_not_deadlock(void)
           "daemon_state still reaches STOPPED even though the worker's last observed state was FAULTED");
 }
 
+/* PRINT-OBS-001: PRINT_UPDATE's commands_total reaches the published
+ * snapshot exactly like the other print-visibility fields already
+ * covered above -- a synthetic event injected directly on event_pipe,
+ * no worker/print_engine involved. */
+static void test_print_update_propagates_commands_total(void)
+{
+    printerctl_daemon_runtime_t runtime;
+    printerctl_daemon_error_t error;
+    check(printerctl_daemon_runtime_start(&runtime, NULL, NULL, &error) == PRINTERCTL_DAEMON_OK,
+          "start() succeeds");
+
+    printerctl_daemon_event_t update;
+    memset(&update, 0, sizeof(update));
+    update.wire_size = sizeof(update);
+    update.type = PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE;
+    update.execution_state = PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING;
+    update.progress_percent = 47;
+    update.commands_sent = 583;
+    update.commands_acknowledged = 583;
+    update.commands_total = 1240;
+    check(printerctl_daemon_ipc_write_event(runtime.event_pipe[1], &update) ==
+              PRINTERCTL_DAEMON_IPC_OK,
+          "synthetic PRINT_UPDATE write succeeds");
+
+    printerctl_daemon_event_t observed;
+    check(printerctl_daemon_runtime_wait_event(&runtime, &observed, &error) ==
+              PRINTERCTL_DAEMON_OK,
+          "wait_event() observes the synthetic PRINT_UPDATE");
+
+    printerctl_daemon_snapshot_t snapshot;
+    printerctl_daemon_runtime_snapshot(&runtime, &snapshot);
+    check(snapshot.commands_total == 1240, "commands_total reaches the published snapshot");
+    check(snapshot.commands_acknowledged == 583, "commands_acknowledged reaches the snapshot too");
+
+    printerctl_daemon_runtime_shutdown(&runtime, &error);
+}
+
 static void test_repeated_shutdown_is_rejected(void)
 {
     printerctl_daemon_runtime_t runtime;
@@ -405,6 +443,7 @@ int main(void)
     test_pipe_creation_failure_leaks_nothing();
     test_cmd_pipe_eof_is_orderly();
     test_event_pipe_failure_is_reported();
+    test_print_update_propagates_commands_total();
     test_shutdown_after_drained_fault_does_not_deadlock();
     test_repeated_shutdown_is_rejected();
     test_repeated_lifecycle_leaks_nothing();

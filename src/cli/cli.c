@@ -11,9 +11,19 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PRINTERCTL_CLI_PLP_TIMEOUT_MS 5000
+#define PRINTERCTL_CLI_PLP_WAIT_FOREVER_MS 0
+
+/* PRINT-OBS-001: interval between STATUS polls while printerctl print FILE
+ * remains attached as an observer after PRINT_START acceptance. */
+#define PRINTERCTL_CLI_PRINT_POLL_INTERVAL_MS 200
+#define PRINTERCTL_CLI_PRINT_STATUS_FIELDS                                                     \
+    (PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE | PRINTERCTL_PLP1_STATUS_FIELD_PROGRESS |    \
+     PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED |                                      \
+     PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL | PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON)
 
 static void set_error(printerctl_cli_error_t *out_error, const char *format, ...)
 {
@@ -766,6 +776,106 @@ static void report_client_failure(FILE *err, printerctl_logger_t *logger, bool l
     }
 }
 
+static void sleep_ms(long milliseconds)
+{
+    struct timespec delay;
+    delay.tv_sec = milliseconds / 1000;
+    delay.tv_nsec = (milliseconds % 1000) * 1000000L;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+}
+
+static const char *execution_state_label(uint8_t state)
+{
+    switch (state) {
+    case PRINTERCTL_PLP1_EXECUTION_STATE_IDLE: return "Idle";
+    case PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING: return "Printing";
+    case PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED: return "Paused";
+    case PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLING: return "Cancelling";
+    case PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED: return "Completed";
+    case PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED: return "Cancelled";
+    case PRINTERCTL_PLP1_EXECUTION_STATE_FAILED: return "Failed";
+    default: return "Unknown";
+    }
+}
+
+static bool execution_state_is_terminal(uint8_t state)
+{
+    return state == PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED ||
+           state == PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED ||
+           state == PRINTERCTL_PLP1_EXECUTION_STATE_FAILED;
+}
+
+/* "Printing: 47% (583/1240)" when commands_total is known, otherwise
+ * "Printing: 47% (583 acknowledged)" -- commands_total is best-effort
+ * (see docs/design/protocol-v1.md STATUS §16) and may be unavailable. */
+static void render_print_progress(FILE *out, const printerctl_plp1_status_response_t *status)
+{
+    fprintf(out, "printerctl: %s: %u%%", execution_state_label(status->execution_state),
+            (unsigned)status->progress);
+    if ((status->present_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL) != 0) {
+        fprintf(out, " (%u/%u)", (unsigned)status->commands_acknowledged,
+                (unsigned)status->commands_total);
+    } else if ((status->present_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED) !=
+               0) {
+        fprintf(out, " (%u acknowledged)", (unsigned)status->commands_acknowledged);
+    }
+    fprintf(out, "\n");
+}
+
+/*
+ * PRINT-OBS-001: remains attached on `client` after PRINT_START
+ * acceptance, polling STATUS (snapshot-only, zero serial I/O) until the
+ * daemon reports a terminal execution_state -- never merely because
+ * progress reaches 100%, and never on a client-side timer/heuristic.
+ * `client` is left open; the caller closes it.
+ */
+static int run_print_progress_observer(printerctl_client_t *client, FILE *out, FILE *err,
+                                       printerctl_logger_t *logger, bool logger_ready)
+{
+    bool have_previous = false;
+    uint8_t previous_state = 0;
+    uint8_t previous_progress = 0;
+    uint32_t previous_acknowledged = 0;
+
+    for (;;) {
+        printerctl_plp1_status_response_t status_response;
+        printerctl_client_error_t error;
+        printerctl_client_status_t status = printerctl_client_status(
+            client, PRINTERCTL_CLI_PRINT_STATUS_FIELDS, PRINTERCTL_CLI_PLP_TIMEOUT_MS,
+            &status_response, &error);
+        if (status != PRINTERCTL_CLIENT_OK) {
+            report_client_failure(err, logger, logger_ready, "print", status, &error);
+            return client_status_to_exit_code(status, error.wire_status);
+        }
+
+        if (!have_previous || status_response.execution_state != previous_state ||
+            status_response.progress != previous_progress ||
+            status_response.commands_acknowledged != previous_acknowledged) {
+            render_print_progress(out, &status_response);
+            have_previous = true;
+            previous_state = status_response.execution_state;
+            previous_progress = status_response.progress;
+            previous_acknowledged = status_response.commands_acknowledged;
+        }
+
+        if (execution_state_is_terminal(status_response.execution_state)) {
+            if (status_response.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_FAILED) {
+                uint16_t reason =
+                    (status_response.present_fields &
+                     PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON) != 0
+                        ? status_response.failure_reason
+                        : PRINTERCTL_PLP1_INTERNAL_ERROR;
+                fprintf(err, "printerctl: print failed\n");
+                return wire_status_to_exit_code(reason);
+            }
+            return PRINTERCTL_EXIT_OK;
+        }
+
+        sleep_ms(PRINTERCTL_CLI_PRINT_POLL_INTERVAL_MS);
+    }
+}
+
 static int run_print_start_command(const printerctl_command_args_t *args,
                                    printerctl_logger_t *logger, bool logger_ready,
                                    FILE *out, FILE *err)
@@ -781,15 +891,17 @@ static int run_print_start_command(const printerctl_command_args_t *args,
 
     status = printerctl_client_print_start(
         &client, args->print_file, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
-    printerctl_client_close(&client);
-
     if (status != PRINTERCTL_CLIENT_OK) {
+        printerctl_client_close(&client);
         report_client_failure(err, logger, logger_ready, "print", status, &error);
         return client_status_to_exit_code(status, error.wire_status);
     }
 
     fprintf(out, "printerctl: print accepted by printerctld: '%s'\n", args->print_file);
-    return PRINTERCTL_EXIT_OK;
+
+    int exit_code = run_print_progress_observer(&client, out, err, logger, logger_ready);
+    printerctl_client_close(&client);
+    return exit_code;
 }
 
 static double milli_to_double(int32_t value)
@@ -909,7 +1021,7 @@ static int run_physical_command(const printerctl_command_args_t *args,
         const char *command = home_axis_command(args->home_axis);
         fprintf(out, "> %s\n", command);
         status = printerctl_client_home(&client, plp_home_axis(args->home_axis),
-                                        PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+                                        PRINTERCTL_CLI_PLP_WAIT_FOREVER_MS, &error);
         if (status == PRINTERCTL_CLIENT_OK) {
             fprintf(out, "printerctl: home complete: %s (%s acknowledged)\n",
                     home_axis_name(args->home_axis), command);
