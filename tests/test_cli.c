@@ -1265,8 +1265,12 @@ static void test_timeout_end_to_end(void)
     free(err);
 }
 
-static void test_pause_resume_cancel_sd_end_to_end(void)
+static void test_pause_resume_cancel_use_daemon_end_to_end(void)
 {
+    /* M23: bare pause/resume/cancel are daemon-owned host-print controls,
+     * migrated exactly like send/temp/home -- with no daemon listening,
+     * they fail cleanly the same way those commands do, never falling
+     * back to a client-owned execution model. */
     const char *commands[] = {"pause", "resume", "cancel"};
 
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
@@ -1276,10 +1280,33 @@ static void test_pause_resume_cancel_sd_end_to_end(void)
 
         int status = run_cli(2, argv, &out, &err);
 
-        check(status == PRINTERCTL_EXIT_UNAVAILABLE,
-              "bare pause/resume/cancel are reserved for host control until M23");
-        check(err != NULL && strstr(err, "use 'sd") != NULL,
-              "the operator is pointed at the SD namespace");
+        check(status == PRINTERCTL_EXIT_COMM_ERROR,
+              "bare pause/resume/cancel report a clean communication error with no daemon");
+        check(err != NULL && strstr(err, "connect") != NULL,
+              "the daemon connection error is reported");
+
+        free(out);
+        free(err);
+    }
+}
+
+static void test_dry_run_host_controls(void)
+{
+    const char *commands[] = {"pause", "resume", "cancel"};
+
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)commands[i]};
+        char *out = NULL;
+        char *err = NULL;
+
+        int status = run_cli(3, argv, &out, &err);
+
+        check(status == PRINTERCTL_EXIT_OK,
+              "a dry-run host-print control exits with success without a daemon");
+        check(out != NULL && strstr(out, commands[i]) != NULL,
+              "the dry-run host-print control names the requested action");
+        check(out != NULL && strstr(out, "no serial device is opened") != NULL,
+              "the dry-run host-print control reports no serial access");
 
         free(out);
         free(err);
@@ -1574,7 +1601,8 @@ int main(void)
     test_send_g28_blocked_end_to_end();
     test_printer_error_end_to_end();
     test_timeout_end_to_end();
-    test_pause_resume_cancel_sd_end_to_end();
+    test_pause_resume_cancel_use_daemon_end_to_end();
+    test_dry_run_host_controls();
     test_dry_run_sd_controls();
     test_dry_run_single_commands();
     test_power_requires_low_battery_subcommand();

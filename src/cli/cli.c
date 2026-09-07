@@ -106,7 +106,11 @@ static bool is_migrated_daemon_command(printerctl_command_t command)
            is_migrated_physical_command(command);
 }
 
-static bool is_reserved_host_control_command(printerctl_command_t command)
+/* M23: bare pause/resume/cancel control the daemon-owned host stream
+ * (PLP PRINT_PAUSE/PRINT_RESUME/PRINT_CANCEL), distinct from 'sd
+ * pause'/'sd resume'/'sd cancel', which target a print running from
+ * the printer's own SD card. */
+static bool is_host_control_command(printerctl_command_t command)
 {
     return command == PRINTERCTL_COMMAND_PAUSE ||
            command == PRINTERCTL_COMMAND_RESUME ||
@@ -408,10 +412,11 @@ static void print_help(FILE *out)
         "\n"
         "Command-line controller for Marlin-based 3D printers through printerctld.\n"
         "'print FILE' starts daemon-owned host streaming over printerctld\n"
-        "(Milestone 22); 'temp', 'position' and 'info' query through printerctld\n"
-        "(Milestone 20); 'send', 'home' and 'sd pause/resume/cancel' run through printerctld (M21).\n"
-        "'pause', 'resume' and 'cancel' are reserved for host prints (M23; see Print session\n"
-        "control below for host streams). 'power low-battery' notifies a\n"
+        "(Milestone 22); 'pause', 'resume' and 'cancel' control that same host\n"
+        "stream (M23; see Print session control below); 'temp', 'position' and\n"
+        "'info' query through printerctld (Milestone 20); 'send', 'home' and\n"
+        "'sd pause/resume/cancel' run through printerctld (M21).\n"
+        "'power low-battery' notifies a\n"
         "running print of an external low-battery condition (Milestone 10;\n"
         "meant to be run by an APCUPSD script, see scripts/apcupsd/). 'home'\n"
         "(and its single-axis variants) homes the printer now that min\n"
@@ -433,9 +438,9 @@ static void print_help(FILE *out)
         "                                       no daemon or serial access)\n"
         "  send COMMAND                        Send one raw command\n"
         "  home [X|Y|Z]                        Home all axes, or a single one\n"
-        "  pause                                Host print pause (reserved until M23)\n"
-        "  resume                               Host print resume (reserved until M23)\n"
-        "  cancel                               Host print cancel (reserved until M23)\n"
+        "  pause                                Pause the active daemon-owned host print\n"
+        "  resume                               Resume the active daemon-owned host print\n"
+        "  cancel                               Cancel the active daemon-owned host print\n"
         "  sd pause                             Pause the printer's SD print (M25)\n"
         "  sd resume                            Resume the printer's SD print (M24)\n"
         "  sd cancel                            Abort the printer's SD print (M524)\n"
@@ -447,9 +452,17 @@ static void print_help(FILE *out)
         "Print session control:\n"
         "  'print FILE' starts daemon-owned host streaming and returns after\n"
         "  printerctld accepts the request; the stream continues if the client\n"
-        "  disconnects. Host pause/resume/cancel are added in M23.\n"
-        "  Nothing is sent to the printer on pause/resume/cancel/power-cancel of\n"
-        "  a host stream: it never moves, heats or parks on its own.\n"
+        "  disconnects, and 'printerctl print' remains attached only to report\n"
+        "  progress -- interrupting it (Ctrl+C) detaches the observer without\n"
+        "  affecting the print. 'pause', 'resume' and 'cancel' control that same\n"
+        "  host stream from any client, whether or not it is the one that\n"
+        "  started it: 'pause' stops the daemon from sending its next queued\n"
+        "  command, 'resume' continues from the same counters (never resets\n"
+        "  progress), and 'cancel' stops the stream for good. Repeating\n"
+        "  'pause' while already paused, or 'resume' while already running,\n"
+        "  is a safe no-op. Nothing is sent to the printer on\n"
+        "  pause/resume/cancel/power-cancel of a host stream: it never moves,\n"
+        "  heats or parks on its own.\n"
         "  The 'sd pause', 'sd resume' and 'sd cancel' commands instead talk\n"
         "  to a print running from the printer's SD card; they cannot reach a\n"
         "  host stream.\n"
@@ -869,6 +882,22 @@ static int run_print_progress_observer(printerctl_client_t *client, FILE *out, F
                 fprintf(err, "printerctl: print failed\n");
                 return wire_status_to_exit_code(reason);
             }
+            if (status_response.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED) {
+                /* M23: any client's PRINT_CANCEL reaches every observer this
+                 * way -- there is no separate client-owned cancellation
+                 * path any more. failure_reason distinguishes an operator
+                 * 'cancel' (absent, matching PRINT_START's own "absent,
+                 * not fictitious" convention) from a SIGPWR-driven one
+                 * (SHUTTING_DOWN), the same distinction worker.c's
+                 * on_print_event() already encodes for PRINTERCTL_PRINT_
+                 * EVENT_CANCELLED. */
+                bool power_failure =
+                    (status_response.present_fields &
+                     PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON) != 0 &&
+                    status_response.failure_reason == PRINTERCTL_PLP1_SHUTTING_DOWN;
+                return power_failure ? PRINTERCTL_EXIT_PRINT_CANCELLED_POWER_FAILURE
+                                     : PRINTERCTL_EXIT_PRINT_CANCELLED;
+            }
             return PRINTERCTL_EXIT_OK;
         }
 
@@ -1056,23 +1085,78 @@ static int run_physical_command(const printerctl_command_args_t *args,
 }
 
 /*
+ * M23: bare `pause`/`resume`/`cancel` control the daemon-owned host
+ * stream over PLP PRINT_PAUSE/PRINT_RESUME/PRINT_CANCEL. Unlike `send`/
+ * `home`/`sd ...`, these never correspond to a Marlin command the CLI
+ * can name up front -- pausing a host stream only stops the daemon
+ * from sending its *next* queued command; nothing is written to the
+ * printer as a result of the request itself. Any connected client may
+ * issue these regardless of which client's PRINT_START began the
+ * print (see PRINT-OBS-001's client-independence guarantee, which this
+ * extends to control, not just observation).
+ */
+static int run_host_control_command(const printerctl_command_args_t *args,
+                                    printerctl_logger_t *logger, bool logger_ready,
+                                    FILE *out, FILE *err)
+{
+    printerctl_client_t client;
+    printerctl_client_error_t error;
+    printerctl_client_status_t status =
+        printerctl_client_connect(&client, PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, &error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, command_name(args->command), status,
+                              &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    if (args->command == PRINTERCTL_COMMAND_PAUSE) {
+        status = printerctl_client_print_pause(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: host print pause requested\n");
+        }
+    } else if (args->command == PRINTERCTL_COMMAND_RESUME) {
+        status = printerctl_client_print_resume(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: host print resume requested\n");
+        }
+    } else {
+        status = printerctl_client_print_cancel(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &error);
+        if (status == PRINTERCTL_CLIENT_OK) {
+            fprintf(out, "printerctl: host print cancel requested\n");
+        }
+    }
+
+    printerctl_client_close(&client);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, command_name(args->command), status,
+                              &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+    return PRINTERCTL_EXIT_OK;
+}
+
+/*
  * Milestone 10: `power low-battery` is the command an external notifier
  * (the APCUPSD low-battery script) runs to tell printerctl that the
- * host may be about to lose power. It never touches the serial port
- * itself: during M22 it still uses the transitional marker path to
- * signal the daemon process that owns an active print. No new cleanup
- * G-code is generated by the CLI.
+ * host may be about to lose power. It never touches the serial port,
+ * and never talks PLP/1 to printerctld either: it resolves the
+ * active-print marker under $XDG_STATE_HOME and signals that PID with
+ * SIGPWR directly. As of Milestone 24, this marker/PID/SIGPWR path is
+ * printerctld's own PID (print_engine writes it from inside the
+ * daemon's worker thread, since Milestone 16/22 moved print execution
+ * there) -- this is the deliberately preserved, audited mechanism, not
+ * a transitional stand-in for a future PLP operation (see
+ * docs/design/m24-power-integration.md: "do not replace SIGPWR merely
+ * for PLP symmetry"). No new cleanup G-code is generated by the CLI.
  *
  * No print running is not an error: this command must be safely
  * idempotent for a script that may run with no print active, or run
- * more than once (the roadmap requires exactly this for the future
- * daemon-backed version, and there is no reason for the pre-daemon
- * version to behave any differently). A stale marker whose
+ * more than once. A stale marker whose
  * process is gone (`kill(pid, 0)` fails) is cleaned up rather than
  * treated as a fatal error. A stale marker whose PID has since been
  * reused by some unrelated live process cannot be distinguished from a
  * legitimate one this way; see the Milestone 10 design note for why
- * this residual risk is accepted in the pre-daemon MVP.
+ * this residual risk is accepted.
  */
 static int run_power_low_battery_command(printerctl_logger_t *logger, bool logger_ready,
                                           FILE *out, FILE *err)
@@ -1188,7 +1272,7 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
      * port/baud/timeout; the compatibility view is removed in M25. */
     printerctl_config_view_t config_view =
         (is_migrated_daemon_command(request.command_args.command) ||
-         is_reserved_host_control_command(request.command_args.command))
+         is_host_control_command(request.command_args.command))
             ? PRINTERCTL_CONFIG_VIEW_CLIENT
             : PRINTERCTL_CONFIG_VIEW_LEGACY_CLI;
     printerctl_config_status_t status = printerctl_config_resolve_for_view(
@@ -1282,13 +1366,14 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
         exit_code = PRINTERCTL_EXIT_OK;
     } else if (is_migrated_query_command(request.command_args.command)) {
         exit_code = run_query_command(&request.command_args, &logger, logger_ready, out, err);
-    } else if (is_reserved_host_control_command(request.command_args.command)) {
-        fprintf(err,
-                "printerctl: command '%s' is reserved for host print control and is not "
-                "available until M23; use 'sd %s' for SD-card prints\n",
-                command_name(request.command_args.command),
-                command_name(request.command_args.command));
-        exit_code = PRINTERCTL_EXIT_UNAVAILABLE;
+    } else if (is_host_control_command(request.command_args.command) && config.dry_run) {
+        fprintf(out,
+            "printerctl: dry run: would ask printerctld to %s the active host print "
+            "(no serial device is opened; nothing is sent to the printer)\n",
+            command_name(request.command_args.command));
+        exit_code = PRINTERCTL_EXIT_OK;
+    } else if (is_host_control_command(request.command_args.command)) {
+        exit_code = run_host_control_command(&request.command_args, &logger, logger_ready, out, err);
     } else if (request.command_args.command == PRINTERCTL_COMMAND_POWER_LOW_BATTERY && config.dry_run) {
         /* No serial device is ever opened by this command in the first
          * place, but --dry-run still reports rather than acts, exactly

@@ -20,7 +20,7 @@ primary verification method.
 
 ## Test binaries
 
-Eighteen independent CMake/ctest targets, one per module plus integration
+Nineteen independent CMake/ctest targets, one per module plus integration
 suites:
 
 | Binary | Covers |
@@ -43,6 +43,7 @@ suites:
 | `printerctl_daemon_socket_tests` | Milestone 15 Unix socket transport: real `AF_UNIX`, fragmented/coalesced requests, stale/live socket paths, sequential clients and malformed-client containment |
 | `printerctld_tests` | Daemon executable smoke/config/CLI-migration test: fork `printerctld`, connect through PLP/1, validate `PING`, terminate with `SIGTERM`, load valid daemon config, reject invalid daemon config, and cover M20/M21 CLI-to-daemon commands over PTY |
 | `printerctl_daemon_print_tests` | Milestone 16 daemon print integration: worker-owned print engine, pseudo-terminal Marlin, pause/resume/cancel and second-start rejection |
+| `printerctl_build_boundary_tests` | Milestone 25 build/dependency gate: runs `nm` on the real, linked `printerctl` executable and fails if any `printerctl_serial`/`printerctl_printer`/`printerctl_marlin`/`printerctl_core` (print_engine) symbol appears in it |
 
 Run all of them:
 
@@ -152,7 +153,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-This should configure, build and pass all eighteen suites with no manual
-setup beyond a C17 compiler, CMake >= 3.16, and the standard POSIX
-tools the test suites use (`posix_openpt` and friends, already part of
-glibc on the project's Linux target).
+This should configure, build and pass all nineteen suites with no manual
+setup beyond a C17 compiler, CMake >= 3.16, and the standard POSIX/
+binutils tools the test suites use (`posix_openpt` and friends, already
+part of glibc on the project's Linux target, plus `nm` for the M25
+build-boundary gate).

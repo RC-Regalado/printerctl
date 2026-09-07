@@ -128,10 +128,11 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * As of Milestones 20-21, `temp`, `position`, `info`, `send COMMAND`,
  * `home [X|Y|Z]` and `sd pause`/`sd resume`/`sd cancel` execute through
  * printerctld over PLP/1 and no longer open serial from the CLI.
- * `pause`, `resume` and `cancel` are reserved for host-print control in
- * M23 and are not SD aliases anymore. Under --dry-run the migrated
- * physical commands print the line they would transmit and exit
- * PRINTERCTL_EXIT_OK without requiring daemon or serial access.
+ * `pause`, `resume` and `cancel` are not SD aliases: they control
+ * daemon-owned host-print execution instead (see Milestone 23 below).
+ * Under --dry-run the migrated physical commands print the line they
+ * would transmit and exit PRINTERCTL_EXIT_OK without requiring daemon
+ * or serial access.
  *
  * As of Milestone 7, `print FILE` without --dry-run streams the file
  * for real via printerctl_printer_print_file(): one normalized command
@@ -173,6 +174,23 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * command. With `home` now fully implemented, no command reaches
  * PRINTERCTL_EXIT_UNAVAILABLE in ordinary use; the fallback path
  * remains only as a defensive default.
+ *
+ * As of Milestone 22 (daemon-owned `print FILE`), the streaming session
+ * described above under Milestones 7-10 (client-side print_engine,
+ * SIGUSR1/SIGUSR2/SIGINT/SIGTERM/SIGPWR handling inside `printerctl`
+ * itself) is superseded: the CLI no longer owns execution and installs
+ * no signal handlers of its own. `printerctl print FILE` returns after
+ * printerctld accepts the request and then only observes progress by
+ * polling PLP STATUS (PRINT-OBS-001); an unhandled SIGINT/SIGTERM to
+ * that observer terminates the CLI process without affecting the
+ * daemon-owned print, which continues exactly as if the client had
+ * disconnected for any other reason. As of Milestone 23, `pause`,
+ * `resume` and `cancel` send PLP PRINT_PAUSE/PRINT_RESUME/PRINT_CANCEL
+ * to control that same daemon-owned stream from any client -- they
+ * are not the SIGUSR1/SIGUSR2/SIGINT signals described above, and no
+ * PID-based control path exists any more. `sd pause`/`sd resume`/
+ * `sd cancel` are unaffected: they still address a print running from
+ * the printer's own SD card.
  */
 int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err);
 

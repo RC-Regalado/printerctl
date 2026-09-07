@@ -603,6 +603,33 @@ static pid_t start_printerctl_args_combined(const char *arg1, const char *arg2,
     return child;
 }
 
+/* M24: `printerctl power low-battery` never talks to `printerctld`
+ * over PLP/1 -- it resolves the active-print marker under
+ * $XDG_STATE_HOME and signals that PID directly (the audited SIGPWR
+ * path from Milestone 10, preserved unchanged through the daemon
+ * migration; see docs/design/m24-power-integration.md). It needs the
+ * SAME state_home the daemon was started with, unlike every other
+ * `start_printerctl_*` helper above, which only ever set
+ * XDG_CONFIG_HOME. */
+static pid_t start_printerctl_power_low_battery(const char *state_home, int *out_read_fd)
+{
+    int stdout_pipe[2];
+    check(pipe(stdout_pipe) == 0, "stdout pipe");
+    pid_t child = fork();
+    check(child >= 0, "fork printerctl power low-battery");
+    if (child == 0) {
+        close(stdout_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        close(stdout_pipe[1]);
+        setenv("XDG_STATE_HOME", state_home, 1);
+        execl(TEST_PRINTERCTL_PATH, "printerctl", "power", "low-battery", (char *)NULL);
+        _exit(127);
+    }
+    close(stdout_pipe[1]);
+    *out_read_fd = stdout_pipe[0];
+    return child;
+}
+
 static void read_output(int fd, char *buffer, size_t buffer_size)
 {
     size_t used = 0;
@@ -1088,6 +1115,99 @@ static void test_print_pause_resume_preserves_progress(void)
     rmdir(dir);
 }
 
+/* M23: repeated PRINT_PAUSE while already paused, and repeated
+ * PRINT_RESUME while already running, must both stay safe no-ops --
+ * neither resets progress nor is rejected -- and every PAUSE/RESUME in
+ * this test arrives on its own fresh connection, distinct from the one
+ * that issued PRINT_START, proving control is not tied to a particular
+ * client (docs/design/m23-host-control-ux.md's "no context-sensitive
+ * dispatch" concern is about SD vs. host syntax, not about which
+ * connection may issue a given, unambiguous host-control request). */
+static void test_print_pause_resume_repeated_and_second_client(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 6);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+
+    mock_expect_command(&mock, "G1 X0\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 X1\n");
+    mock_reply_ok(&mock);
+
+    /* Ack-window technique (see test_print_pause_resume_preserves_progress
+     * above): G1 X2 is sent but held un-acked so both PRINT_PAUSE
+     * requests below are guaranteed to commit, via poll_control_commands()'s
+     * ack-wait polling, before on_control() is next consulted for G1 X3. */
+    mock_expect_command(&mock, "G1 X2\n");
+
+    int pause_a = connect_with_retry(socket_path);
+    send_print_pause(pause_a, 401);
+    check(read_response_frame(pause_a, PRINTERCTL_PLP1_MSG_PRINT_PAUSE, 401).status ==
+              PRINTERCTL_PLP1_SUCCESS,
+          "first PRINT_PAUSE (client A) is accepted");
+    close(pause_a);
+
+    int pause_b = connect_with_retry(socket_path);
+    send_print_pause(pause_b, 402);
+    check(read_response_frame(pause_b, PRINTERCTL_PLP1_MSG_PRINT_PAUSE, 402).status ==
+              PRINTERCTL_PLP1_SUCCESS,
+          "repeated PRINT_PAUSE (client B, already paused) is still accepted");
+    close(pause_b);
+
+    mock_reply_ok(&mock); /* releases G1 X2's ack: 3 of 6 now acknowledged */
+    mock_expect_no_command(&mock); /* G1 X3 must not be transmitted while paused */
+
+    printerctl_plp1_status_response_t paused = query_print_status(socket_path, 403);
+    check(paused.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED,
+          "execution_state reports PAUSED after two PAUSE requests from two clients");
+    check(paused.commands_acknowledged == 3,
+          "repeated pause does not disturb commands_acknowledged");
+
+    int resume_a = connect_with_retry(socket_path);
+    send_print_resume(resume_a, 404);
+    check(read_response_frame(resume_a, PRINTERCTL_PLP1_MSG_PRINT_RESUME, 404).status ==
+              PRINTERCTL_PLP1_SUCCESS,
+          "first PRINT_RESUME (client C) is accepted");
+    close(resume_a);
+
+    /* G1 X3 is not yet acked, so the print is still active regardless of
+     * pause state -- this second RESUME cannot race a completed print. */
+    int resume_b = connect_with_retry(socket_path);
+    send_print_resume(resume_b, 405);
+    check(read_response_frame(resume_b, PRINTERCTL_PLP1_MSG_PRINT_RESUME, 405).status ==
+              PRINTERCTL_PLP1_SUCCESS,
+          "repeated PRINT_RESUME (client D, already running) is still accepted");
+    close(resume_b);
+
+    for (int i = 3; i < 6; ++i) {
+        char expected[32];
+        snprintf(expected, sizeof(expected), "G1 X%d\n", i);
+        mock_expect_command(&mock, expected);
+        mock_reply_ok(&mock);
+    }
+
+    printerctl_plp1_status_response_t completed = query_print_status_at_least(socket_path, 406, 6);
+    check(completed.commands_acknowledged == 6,
+          "printing resumes from 3 and reaches completion despite repeated pause/resume");
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
 /* PRINT-OBS-001: client independence -- the client that started the
  * print may disconnect; a second, unrelated client must still observe
  * correct current progress from the daemon-owned snapshot. */
@@ -1255,6 +1375,125 @@ static void test_sigpwr_during_active_print_uses_daemon_marker_and_is_safe(void)
     rmdir(dir);
 }
 
+/* M24: `test_sigpwr_during_active_print_uses_daemon_marker_and_is_safe`
+ * above already proves the daemon-side half of the "APCUPSD ->
+ * printerctl power low-battery -> daemon marker/PID -> SIGPWR
+ * printerctld" path -- but it delivers SIGPWR with a raw kill(),
+ * never through the real `printerctl power low-battery` command. This
+ * test is the missing end-to-end link: a real `printerctl` subprocess
+ * resolves the marker printerctld itself wrote and signals it. */
+static void test_cli_power_low_battery_signals_daemon_owned_print(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nM114\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print(daemon, socket_path, gcode_path, &mock);
+    check(read_active_marker_pid(state_home) == daemon,
+          "active marker targets printerctld before signalling it");
+
+    int out_fd = -1;
+    pid_t power = start_printerctl_power_low_battery(state_home, &out_fd);
+    expect_child_exit(power, PRINTERCTL_EXIT_OK);
+    char output[256];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "signalled the active print") != NULL,
+          "'printerctl power low-battery' reports signalling the daemon-owned print");
+
+    mock_reply_ok(&mock);
+    mock_expect_no_command(&mock);
+    check(!active_marker_exists(state_home),
+          "active marker removed once printerctld cancels after the CLI's SIGPWR");
+    assert_ping_ok(socket_path);
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+/* M24: SIGPWR must win even while a daemon-owned print is genuinely
+ * PAUSED (M23), not only while blocked on an in-flight command's ack
+ * (the scenario test_sigpwr_during_active_print_uses_daemon_marker_
+ * and_is_safe above exercises). on_control() checks power-failure
+ * cancellation before pause state on every iteration of the pause-wait
+ * loop (src/core/print_engine.c), so this must cancel promptly rather
+ * than waiting for a resume that never comes. */
+static void test_sigpwr_while_paused_cancels_with_power_failure_semantics(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 4);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t child = start_printerctld_with_port(socket_path, mock.slave_path, state_home);
+    start_daemon_print_without_waiting_for_command(socket_path, gcode_path);
+
+    mock_expect_command(&mock, "G1 X0\n");
+    mock_reply_ok(&mock);
+
+    /* Ack-window technique: hold G1 X1's ack so PRINT_PAUSE is
+     * guaranteed to commit before G1 X2 is ever considered. */
+    mock_expect_command(&mock, "G1 X1\n");
+    int control = connect_with_retry(socket_path);
+    send_print_pause(control, 411);
+    check(read_response_frame(control, PRINTERCTL_PLP1_MSG_PRINT_PAUSE, 411).status ==
+              PRINTERCTL_PLP1_SUCCESS,
+          "PRINT_PAUSE is accepted");
+    close(control);
+    mock_reply_ok(&mock); /* releases G1 X1's ack: 2 of 4 now acknowledged */
+    mock_expect_no_command(&mock); /* G1 X2 must not be transmitted while paused */
+
+    printerctl_plp1_status_response_t paused = query_print_status(socket_path, 412);
+    check(paused.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED,
+          "execution_state reports PAUSED before SIGPWR");
+
+    check(kill(child, SIGPWR) == 0, "SIGPWR printerctld while paused");
+    assert_ping_ok(socket_path);
+    mock_expect_no_command(&mock); /* no resume, no cleanup G-code after power-failure cancel */
+    check(!active_marker_exists(state_home),
+          "active marker removed after SIGPWR cancels a paused print");
+
+    int status_client = connect_with_retry(socket_path);
+    send_status(status_client, 413,
+               PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE |
+                   PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON);
+    printerctl_plp1_frame_t response =
+        read_response_frame(status_client, PRINTERCTL_PLP1_MSG_STATUS, 413);
+    printerctl_plp1_status_response_t decoded;
+    printerctl_plp1_error_t decode_error;
+    check(printerctl_plp1_decode_status_response(response.payload, response.payload_length,
+                                                 &decoded, &decode_error) == PRINTERCTL_PLP1_OK,
+          "decode STATUS after SIGPWR-while-paused");
+    close(status_client);
+    check(decoded.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED,
+          "a paused print reaches CANCELLED, not stuck PAUSED, after SIGPWR");
+    check((decoded.present_fields & PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON) != 0 &&
+              decoded.failure_reason == PRINTERCTL_PLP1_SHUTTING_DOWN,
+          "failure_reason distinguishes the power-failure cancel from an operator cancel");
+
+    stop_printerctld(child);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
 static void test_print_cancel_ack_window_blocks_next_command(void)
 {
     char socket_path[108];
@@ -1404,6 +1643,207 @@ static void test_cli_explicit_physical_commands_use_daemon(void)
 
     stop_printerctld(daemon);
     mock_close(&mock);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+/* M23: `printerctl pause`/`printerctl resume` reach the daemon-owned
+ * host stream through the same PLP client library `print`/`send`/`home`
+ * already use -- proving the CLI wiring, not just the protocol/socket
+ * layer (which test_second_print_start_maps_to_busy_over_socket and the
+ * PRINT_PAUSE/PRINT_RESUME PTY tests above already cover directly). */
+static void test_cli_pause_resume_use_daemon_print_control(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 4);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port_and_state(mock.slave_path, state_home);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    send_print_start(ready, 500, gcode_path);
+    check(read_response_frame(ready, PRINTERCTL_PLP1_MSG_PRINT_START, 500).status ==
+              PRINTERCTL_PLP1_SUCCESS,
+          "PRINT_START accepted before CLI pause/resume");
+    close(ready);
+
+    mock_expect_command(&mock, "G1 X0\n");
+    mock_reply_ok(&mock);
+
+    /* Ack-window technique: G1 X1 is sent but held un-acked so
+     * `printerctl pause` is guaranteed to commit before G1 X2 is ever
+     * considered (see test_print_pause_resume_preserves_progress). */
+    mock_expect_command(&mock, "G1 X1\n");
+
+    int out_fd = -1;
+    pid_t cli_pause = start_printerctl_args("pause", NULL, NULL, config_home, &out_fd);
+    expect_child_exit(cli_pause, PRINTERCTL_EXIT_OK);
+    char output[256];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "host print pause requested") != NULL,
+          "CLI pause renders daemon acknowledgement");
+
+    mock_reply_ok(&mock); /* releases G1 X1's ack: 2 of 4 now acknowledged */
+    mock_expect_no_command(&mock); /* G1 X2 must not be transmitted while paused */
+
+    printerctl_plp1_status_response_t paused =
+        query_print_status(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, 501);
+    check(paused.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED,
+          "'printerctl pause' actually pauses the daemon-owned host print");
+    check(paused.commands_acknowledged == 2, "pause via the CLI does not disturb progress");
+
+    pid_t cli_resume = start_printerctl_args("resume", NULL, NULL, config_home, &out_fd);
+    expect_child_exit(cli_resume, PRINTERCTL_EXIT_OK);
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "host print resume requested") != NULL,
+          "CLI resume renders daemon acknowledgement");
+
+    mock_expect_command(&mock, "G1 X2\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 X3\n");
+    mock_reply_ok(&mock);
+
+    printerctl_plp1_status_response_t completed =
+        query_print_status_at_least(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, 502, 4);
+    check(completed.commands_acknowledged == 4,
+          "'printerctl resume' continues the print from 2, never restarting from 0");
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+/* M23: `printerctl cancel` reaches the daemon-owned host stream the
+ * same way; unlike pause/resume the print never reaches its own
+ * COMPLETED state, so this is verified with its own daemon instance. */
+static void test_cli_cancel_uses_daemon_print_control(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+    char state_home[128];
+    make_temp_state_home(state_home, sizeof(state_home));
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 4);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port_and_state(mock.slave_path, state_home);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    send_print_start(ready, 600, gcode_path);
+    check(read_response_frame(ready, PRINTERCTL_PLP1_MSG_PRINT_START, 600).status ==
+              PRINTERCTL_PLP1_SUCCESS,
+          "PRINT_START accepted before CLI cancel");
+    close(ready);
+
+    /* Ack-window technique: G1 X0 is sent but held un-acked so
+     * `printerctl cancel` is guaranteed to commit (via
+     * poll_control_commands()'s ack-wait polling) before the held ACK
+     * is released, exactly like test_print_cancel_ack_window_blocks_
+     * next_command() above. */
+    mock_expect_command(&mock, "G1 X0\n");
+
+    int out_fd = -1;
+    pid_t cli_cancel = start_printerctl_args("cancel", NULL, NULL, config_home, &out_fd);
+    expect_child_exit(cli_cancel, PRINTERCTL_EXIT_OK);
+    char output[256];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "host print cancel requested") != NULL,
+          "CLI cancel renders daemon acknowledgement");
+
+    mock_reply_ok(&mock);
+    mock_expect_no_command(&mock); /* G1 X1 must not be transmitted after cancel */
+    check(!active_marker_exists(state_home), "active marker removed after CLI cancel");
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(gcode_path);
+    remove_tree(state_home);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+/* M23 / docs/phase-2-testing.md's "Ctrl+C observer": the CLI's print
+ * progress observer (PRINT-OBS-001) installs no signal handler of its
+ * own -- client signals are a UI concern, never an execution-ownership
+ * one (docs/design/m23-host-control-ux.md: "Do not restore PID-based
+ * host execution control through the client"). Sending SIGINT to the
+ * observer while it is attached must kill only the observer process;
+ * the daemon-owned print continues exactly as if the client had
+ * disconnected for any other reason, all the way to completion. */
+static void test_cli_print_sigint_kills_observer_not_the_print(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+    char gcode_path[128];
+    write_linear_gcode_file(gcode_path, sizeof(gcode_path), 4);
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    pid_t daemon = start_printerctld_default_with_port(mock.slave_path);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t observer = start_printerctl_args("print", gcode_path, NULL, config_home, &out_fd);
+
+    mock_expect_command(&mock, "G1 X0\n");
+    mock_reply_ok(&mock);
+
+    /* Ack-window technique: G1 X1 is sent but held un-acked so the
+     * print stays blocked mid-stream while SIGINT is delivered below.
+     * Unlike the other CLI-level tests above, the observer's own
+     * connection stays open the whole time here (printerctld serves
+     * one client connection at a time -- see
+     * printerctl_daemon_socket_serve_one_interruptible()), so this test
+     * deliberately never opens a second, overlapping connection of its
+     * own while the observer is still attached; it only reads STATUS
+     * afterwards, once the observer's connection is gone. */
+    mock_expect_command(&mock, "G1 X1\n");
+
+    /* Give the observer several poll intervals (200ms each, per cli.c's
+     * PRINTERCTL_CLI_PRINT_POLL_INTERVAL_MS) to actually connect, accept
+     * PRINT_START and start polling STATUS before it is interrupted --
+     * otherwise a SIGINT delivered before it even connects would not
+     * exercise the intended path. */
+    sleep_ms(600);
+    expect_child_still_running(observer);
+
+    check(kill(observer, SIGINT) == 0, "SIGINT the print observer");
+    int status = 0;
+    check(waitpid(observer, &status, 0) == observer, "wait for observer");
+    check(WIFSIGNALED(status) && WTERMSIG(status) == SIGINT,
+          "the observer dies of the unhandled SIGINT itself (no client-side cancellation logic)");
+    close(out_fd);
+
+    mock_reply_ok(&mock); /* releases G1 X1's ack: 2 of 4 now acknowledged */
+    mock_expect_command(&mock, "G1 X2\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 X3\n");
+    mock_reply_ok(&mock);
+
+    printerctl_plp1_status_response_t completed =
+        query_print_status_at_least(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, 701, 4);
+    check(completed.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED,
+          "the daemon-owned print reaches COMPLETED despite the observer's SIGINT death");
+    check(completed.commands_acknowledged == 4,
+          "the print streams to completion unaffected by the observer dying");
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(gcode_path);
     unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
     rmdir(config_home);
 }
@@ -1669,6 +2109,8 @@ int main(void)
     test_daemon_invalid_config_file_fails_before_listen();
     test_sigterm_during_active_print_is_safe();
     test_sigpwr_during_active_print_uses_daemon_marker_and_is_safe();
+    test_cli_power_low_battery_signals_daemon_owned_print();
+    test_sigpwr_while_paused_cancels_with_power_failure_semantics();
     test_print_cancel_ack_window_blocks_next_command();
     test_print_advances_after_m109_without_secondary_request();
     test_print_progress_event_backlog_does_not_stall_execution();
@@ -1676,10 +2118,14 @@ int main(void)
     test_temp_during_print_is_busy_and_has_no_serial_side_effects();
     test_print_progress_advances_with_acknowledgements();
     test_print_pause_resume_preserves_progress();
+    test_print_pause_resume_repeated_and_second_client();
     test_print_progress_client_independence();
     test_repeated_status_polling_has_no_serial_side_effects();
     test_cli_read_only_queries_use_daemon();
     test_cli_explicit_physical_commands_use_daemon();
+    test_cli_pause_resume_use_daemon_print_control();
+    test_cli_cancel_uses_daemon_print_control();
+    test_cli_print_sigint_kills_observer_not_the_print();
     test_cli_print_uses_daemon_print_start();
     test_cli_print_source_error_is_daemon_reported();
     test_home_quick_completion_remains_synchronous();

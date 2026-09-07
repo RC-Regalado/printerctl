@@ -122,4 +122,24 @@ printerctl_client_status_t printerctl_client_sd_cancel(
     int timeout_ms,
     printerctl_client_error_t *out_error);
 
+/* M23: host-stream print control (PRINT_PAUSE/PRINT_RESUME/PRINT_CANCEL).
+ * Distinct from sd_pause/sd_resume/sd_cancel above, which target a print
+ * running from the printer's own SD card; these instead control the
+ * daemon-owned host stream started by PRINT_START, and can be called by
+ * any connected client regardless of which client started the print. */
+printerctl_client_status_t printerctl_client_print_pause(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_print_resume(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_print_cancel(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
 #endif

@@ -502,6 +502,18 @@ static void test_physical_wrappers(void)
         printerctl_client_close(&client);
         server_stop(&server);
     }
+    {
+        server_t server;
+        server_start(&server, SERVER_VALID, PRINTERCTL_PLP1_MSG_PRINT_PAUSE);
+        printerctl_client_t client;
+        printerctl_client_error_t error;
+        check(printerctl_client_connect(&client, server.path, &error) == PRINTERCTL_CLIENT_OK,
+              "connect PRINT_PAUSE");
+        check(printerctl_client_print_pause(&client, 1000, &error) == PRINTERCTL_CLIENT_OK,
+              "PRINT_PAUSE succeeds");
+        printerctl_client_close(&client);
+        server_stop(&server);
+    }
 }
 
 int main(void)

@@ -176,7 +176,7 @@ Implementation notes:
 
 ## M23 — Host Print Control UX
 
-**Status:** PROPOSED
+**Status:** IMPLEMENTED
 
 Make:
 
@@ -198,9 +198,28 @@ printerctl sd cancel
 
 Add explicit repeated-pause and repeated-resume tests.
 
+Implementation notes:
+
+- `pause`, `resume` and `cancel` use the M19 PLP client (`printerctl_
+  client_print_pause/resume/cancel()`) over the pre-existing PLP/1
+  `PRINT_PAUSE`/`PRINT_RESUME`/`PRINT_CANCEL` messages and daemon-side
+  handling (already built and socket-tested ahead of this milestone);
+  no new PLP/1 wire messages were needed.
+- Repeated pause (while paused) and repeated resume (while running)
+  are safe no-ops, and any connected client may issue any of the three
+  regardless of which client's `PRINT_START` began the print.
+- `printerctl print FILE`'s attached progress observer (PRINT-OBS-001)
+  installs no signal handler: an unhandled Ctrl+C kills only the
+  observer, never the daemon-owned print. A latent bug in that same
+  observer was fixed alongside `cancel`'s CLI wiring: it now reports
+  `PRINTERCTL_EXIT_PRINT_CANCELLED`/`_POWER_FAILURE` instead of exit 0
+  when the print it is observing is cancelled by another client.
+- See `docs/design/m23-host-control-ux.md`'s "As-built notes" and
+  `docs/milestones/milestone-23.md` for full details.
+
 ## M24 — Power Integration Alignment
 
-**Status:** PROPOSED
+**Status:** IMPLEMENTED
 
 Preferred initial path:
 
@@ -216,9 +235,35 @@ SIGPWR printerctld
 
 Preserve the audited SIGPWR path unless a concrete requirement justifies changing it.
 
+Implementation notes:
+
+- No code change was required to make the diagram above literally
+  true: `print_engine` has written the active-print marker with its
+  own PID since Milestone 16/22 moved print execution into
+  `printerctld`'s worker thread, so `printerctl power low-battery`
+  (unchanged since Milestone 10) was already signalling the daemon,
+  not a legacy CLI process. `power low-battery` still never talks
+  PLP/1 to `printerctld` — it resolves the marker and signals SIGPWR
+  directly, exactly as designed.
+- M24's actual work was closing a real test-coverage gap: no existing
+  test ran the real `printerctl power low-battery` command against a
+  live `printerctld` process end-to-end (every prior SIGPWR test
+  delivered the signal with a raw `kill()`, bypassing the CLI
+  entirely) — added in `tests/test_printerctld.c`.
+- Added a regression test for a scenario M23 made possible for the
+  first time: SIGPWR arriving while a daemon-owned print is genuinely
+  `PAUSED` (not just blocked on an in-flight command's ack). Confirmed
+  `on_control()`'s existing priority order (power-failure beats pause)
+  already handles it correctly.
+- A stale doc-comment in `src/cli/cli.c` describing the marker/SIGPWR
+  path as "transitional... until M24" was corrected to describe it as
+  the final, deliberately preserved mechanism.
+- See `docs/design/m24-power-integration.md`'s "As-built notes" and
+  `docs/milestones/milestone-24.md` for full details.
+
 ## M25 — Remove Legacy Serial Ownership
 
-**Status:** PROPOSED
+**Status:** IMPLEMENTED
 
 Remove from real `printerctl` execution paths:
 
@@ -237,6 +282,36 @@ printerctl -> host print_engine execution
 ```
 
 Add deterministic build/dependency checks.
+
+Implementation notes:
+
+- All four forbidden dependencies were already gone from `printerctl`'s
+  real execution paths as a side effect of M20-M22's migrations: the
+  `printerctl_cli` CMake target links only `printerctl_config`,
+  `printerctl_logging`, `printerctl_gcode` (dry-run parsing only),
+  `printerctl_record` (session/marker files) and `printerctl_client`
+  (PLP) — none of which pull in `printerctl_serial`,
+  `printerctl_printer`, `printerctl_marlin` or `printerctl_core`
+  (print_engine). No source change was needed to achieve the removal
+  itself.
+- The one genuinely missing piece — "add deterministic build/
+  dependency checks" — is now a permanent `ctest` target,
+  `printerctl_build_boundary_tests` (`tests/test_build_boundaries.c`):
+  it runs `nm` on the actual built `printerctl` executable and fails if
+  any `printerctl_serial_*`/`printerctl_printer_*`/`printerctl_marlin_*`/
+  `printerctl_print_engine_*` symbol appears in it — a physical
+  guarantee about the linked binary, not just a CMakeLists.txt
+  link-graph audit, so it would catch a forbidden dependency
+  reintroduced through any path.
+- "Local G-code parsing may remain only for dry-run" already held:
+  `printerctl_gcode` is used only by `run_dry_run_print()`.
+- "Migrated command → explicit failure, never silent direct-serial
+  fallback" is now structurally guaranteed, not just behaviorally
+  tested: since no serial code is linked into `printerctl` at all, a
+  silent direct-serial fallback is physically impossible, not merely
+  absent by convention.
+- See `docs/design/m25-remove-legacy-serial.md`'s "As-built notes" and
+  `docs/milestones/milestone-25.md` for full details.
 
 ## M26 — Compatibility & Fault Validation
 

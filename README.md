@@ -70,8 +70,9 @@ passes through. `print FILE` now sends `PRINT_START` to `printerctld`,
 which validates the source, opens serial and owns host streaming through
 the worker/print engine. The CLI exits after daemon acceptance; the print
 continues if the client disconnects. `pause`, `resume` and `cancel`
-are reserved for daemon-owned host-print control in M23; SD-card print
-control is explicit under `sd pause`, `sd resume` and `sd cancel`.
+control that daemon-owned host print from any client, over the same
+`printerctld` connection as every other migrated command; SD-card print
+control remains explicit under `sd pause`, `sd resume` and `sd cancel`.
 `--dry-run print FILE` parses and normalizes the file without opening a
 serial device; `--dry-run` with a single command prints the line it
 would transmit and exits `0`. A daemon-owned print that started but did
@@ -111,7 +112,7 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. 18
+Use `build-clang` instead of `build` if you configured with Clang. 19
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 logging integration, daemon-unavailable paths and dry-run behavior),
 `printerctl_config_tests` (configuration module),
@@ -136,6 +137,10 @@ PLP client library, including M20 query wrappers, M21 physical-command
 wrappers and M22 `PRINT_START`.
 wrappers. `printerctld_tests` also covers M20 CLI-to-daemon read-only
 queries and M21 explicit physical commands over a pseudo-terminal mock.
+`printerctl_build_boundary_tests` is the M25 build/dependency gate: it
+inspects the actual linked `printerctl` binary and fails if it ever
+regains a `printerctl_serial`/`printerctl_printer`/`printerctl_marlin`/
+`printerctl_core` (print_engine) symbol.
 Run the daemon runtime/socket/process tests under ThreadSanitizer when checking
 concurrency changes. See
 `docs/testing.md` for what each covers in detail, the patterns behind
@@ -213,8 +218,13 @@ oversized lines with exit code `6`, and rejects `G28` with exit code `4`.
 No serial device is opened.
 
 `print FILE` starts daemon-owned streaming and returns after
-`printerctld` accepts the job. Host `pause`, `resume` and `cancel` remain
-reserved until M23.
+`printerctld` accepts the job. Host `pause`, `resume` and `cancel`
+control that daemon-owned stream from any client, whether or not it is
+the one that started it: `pause` stops the daemon from sending its next
+queued command, `resume` continues from the same counters (never resets
+progress), and `cancel` stops the stream for good. Repeating `pause`
+while already paused, or `resume` while already running, is a safe
+no-op.
 
 Nothing is sent to the printer on pause/resume/cancel/power-cancel of a
 host stream: it never moves, heats or parks on its own, so a long pause
@@ -228,9 +238,10 @@ They cannot reach a host stream. On
 firmware without SD support Marlin answers `echo:Unknown command`
 (rendered) and still acknowledges, so the command is a visible no-op.
 
-`temp`, `position`, `info`, `send COMMAND`, `home`, `print FILE` and
-`sd pause`/`sd resume`/`sd cancel` require `printerctld` and do not
-consume `--port`/`--baud`/`--timeout` in `printerctl`. `send`
+`temp`, `position`, `info`, `send COMMAND`, `home`, `print FILE`,
+`pause`/`resume`/`cancel` and `sd pause`/`sd resume`/`sd cancel` require
+`printerctld` and do not consume `--port`/`--baud`/`--timeout` in
+`printerctl`. `send`
 refuses `G28` (exit code `4`, no bypass). Under `--dry-run`, migrated
 physical commands print the line they would send and exit `0` without
 touching daemon or serial.
@@ -311,8 +322,8 @@ and never changes the print's exit code.
 | `6` | G-code file error |
 | `7` | Communication error (cannot open port, I/O failure, timeout) |
 | `8` | Printer error (`Error:`/`Resend:` reply, or missing report) |
-| `9` | Print cancelled by the operator (SIGINT/SIGTERM during `print`) |
-| `10` | Print cancelled by a power-failure/low-battery signal (SIGPWR) |
+| `9` | Print observed to end cancelled (e.g. another client ran `cancel`) |
+| `10` | Print observed to end cancelled by a power-failure/low-battery signal |
 
 ### Configuration file
 

@@ -149,3 +149,21 @@ add_executable(printerctl_daemon_print_tests
 target_link_libraries(printerctl_daemon_print_tests PRIVATE printerctl_daemon_runtime)
 
 add_test(NAME printerctl_daemon_print_tests COMMAND printerctl_daemon_print_tests)
+
+# Milestone 25: deterministic build/dependency gate. Deliberately links
+# against NOTHING but the C runtime -- it must not itself gain a
+# dependency on any printerctl_* library, since it inspects the final
+# printerctl binary from the outside (via nm) rather than by linking
+# against it.
+add_executable(printerctl_build_boundary_tests
+    test_build_boundaries.c
+)
+
+target_compile_definitions(printerctl_build_boundary_tests
+    PRIVATE
+        TEST_PRINTERCTL_PATH="$<TARGET_FILE:printerctl>"
+)
+
+add_dependencies(printerctl_build_boundary_tests printerctl)
+
+add_test(NAME printerctl_build_boundary_tests COMMAND printerctl_build_boundary_tests)

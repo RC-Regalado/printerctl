@@ -532,9 +532,14 @@ printerctl_client_status_t printerctl_client_home(
     return PRINTERCTL_CLIENT_OK;
 }
 
-static printerctl_client_status_t sd_control(
+/* Shared by every no-payload control request/response pair (SD-print
+ * controls and, since M23, host-stream print controls): request carries
+ * no payload, and a successful response carries none either. `label`
+ * only shapes the message of a protocol-level error. */
+static printerctl_client_status_t control_no_payload(
     printerctl_client_t *client,
     uint8_t message_type,
+    const char *label,
     int timeout_ms,
     printerctl_client_error_t *out_error)
 {
@@ -547,7 +552,7 @@ static printerctl_client_status_t sd_control(
     printerctl_plp1_error_t plp_error;
     if (printerctl_plp1_expect_no_payload(&response, &plp_error) != PRINTERCTL_PLP1_OK) {
         set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
-                  "SD response: %s", plp_error.message);
+                  "%s response: %s", label, plp_error.message);
         return out_error->status;
     }
     return PRINTERCTL_CLIENT_OK;
@@ -558,7 +563,7 @@ printerctl_client_status_t printerctl_client_sd_pause(
     int timeout_ms,
     printerctl_client_error_t *out_error)
 {
-    return sd_control(client, PRINTERCTL_PLP1_MSG_SD_PAUSE, timeout_ms, out_error);
+    return control_no_payload(client, PRINTERCTL_PLP1_MSG_SD_PAUSE, "SD", timeout_ms, out_error);
 }
 
 printerctl_client_status_t printerctl_client_sd_resume(
@@ -566,7 +571,7 @@ printerctl_client_status_t printerctl_client_sd_resume(
     int timeout_ms,
     printerctl_client_error_t *out_error)
 {
-    return sd_control(client, PRINTERCTL_PLP1_MSG_SD_RESUME, timeout_ms, out_error);
+    return control_no_payload(client, PRINTERCTL_PLP1_MSG_SD_RESUME, "SD", timeout_ms, out_error);
 }
 
 printerctl_client_status_t printerctl_client_sd_cancel(
@@ -574,5 +579,32 @@ printerctl_client_status_t printerctl_client_sd_cancel(
     int timeout_ms,
     printerctl_client_error_t *out_error)
 {
-    return sd_control(client, PRINTERCTL_PLP1_MSG_SD_CANCEL, timeout_ms, out_error);
+    return control_no_payload(client, PRINTERCTL_PLP1_MSG_SD_CANCEL, "SD", timeout_ms, out_error);
+}
+
+printerctl_client_status_t printerctl_client_print_pause(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    return control_no_payload(client, PRINTERCTL_PLP1_MSG_PRINT_PAUSE, "PRINT_PAUSE", timeout_ms,
+                              out_error);
+}
+
+printerctl_client_status_t printerctl_client_print_resume(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    return control_no_payload(client, PRINTERCTL_PLP1_MSG_PRINT_RESUME, "PRINT_RESUME", timeout_ms,
+                              out_error);
+}
+
+printerctl_client_status_t printerctl_client_print_cancel(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    return control_no_payload(client, PRINTERCTL_PLP1_MSG_PRINT_CANCEL, "PRINT_CANCEL", timeout_ms,
+                              out_error);
 }
