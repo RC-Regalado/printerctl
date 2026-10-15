@@ -60,10 +60,13 @@ static int install_signal_handlers(void)
     return 0;
 }
 
+static void process_power_failure(printerctl_daemon_runtime_t *runtime);
+
 static bool should_stop_client(void *context)
 {
-    (void)context;
-    return stop_requested || power_failure_requested;
+    /* Power cancellation is a control operation, not a client disconnect. */
+    if (power_failure_requested) process_power_failure(context);
+    return stop_requested;
 }
 
 static void process_power_failure(printerctl_daemon_runtime_t *runtime)
@@ -252,7 +255,7 @@ int main(int argc, char *argv[])
         }
 
         if (pfds[0].revents & POLLIN) {
-            if (printerctl_daemon_socket_serve_one_interruptible(&server, should_stop_client, NULL,
+            if (printerctl_daemon_socket_serve_one_interruptible(&server, should_stop_client, &runtime,
                                                                  &socket_error) !=
                 PRINTERCTL_DAEMON_SOCKET_OK) {
                 fprintf(stderr, "printerctld: client handling failed: %s\n", socket_error.message);

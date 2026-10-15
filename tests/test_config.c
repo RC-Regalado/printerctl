@@ -524,6 +524,74 @@ static void test_owner_views_still_validate_cross_owned_keys(void)
     remove(path);
 }
 
+static void test_calibration_config_keys_and_precedence(void)
+{
+    char path[64];
+    write_temp_config(
+        "calibration.min_x=10\n"
+        "calibration.max_x=90\n"
+        "calibration.min_y=20\n"
+        "calibration.max_y=120\n"
+        "calibration.safe_z=5\n"
+        "calibration.xy_feedrate=1500\n"
+        "calibration.z_feedrate=300\n",
+        path, sizeof(path));
+
+    printerctl_config_overrides_t overrides;
+    printerctl_config_overrides_init(&overrides);
+    snprintf(overrides.config_path, sizeof(overrides.config_path), "%s", path);
+    overrides.has_config_path = true;
+    overrides.has_calibration_safe_z = true;
+    overrides.calibration_safe_z = 7.0;
+
+    printerctl_config_t config;
+    printerctl_config_error_t error;
+    printerctl_config_status_t status = printerctl_config_resolve_for_view(
+        &overrides, PRINTERCTL_CONFIG_VIEW_DAEMON, &config, &error);
+
+    check(status == PRINTERCTL_CONFIG_OK, "calibration config resolves");
+    check(config.has_calibration_min_x && config.calibration_min_x == 10.0,
+          "calibration.min_x parsed");
+    check(config.has_calibration_max_x && config.calibration_max_x == 90.0,
+          "calibration.max_x parsed");
+    check(config.has_calibration_min_y && config.calibration_min_y == 20.0,
+          "calibration.min_y parsed");
+    check(config.has_calibration_max_y && config.calibration_max_y == 120.0,
+          "calibration.max_y parsed");
+    check(config.has_calibration_safe_z && config.calibration_safe_z == 7.0,
+          "CLI override precedence applies to calibration.safe_z");
+    check(config.has_calibration_xy_feedrate && config.calibration_xy_feedrate == 1500.0,
+          "calibration.xy_feedrate parsed");
+    check(config.has_calibration_z_feedrate && config.calibration_z_feedrate == 300.0,
+          "calibration.z_feedrate parsed");
+
+    status = printerctl_config_resolve_for_view(
+        &overrides, PRINTERCTL_CONFIG_VIEW_CLIENT, &config, &error);
+    check(status == PRINTERCTL_CONFIG_OK, "client view resolves calibration file");
+    check(!config.has_calibration_safe_z, "client view ignores daemon-owned calibration keys");
+
+    remove(path);
+}
+
+static void test_calibration_config_rejects_nan_inf(void)
+{
+    char path[64];
+    write_temp_config("calibration.safe_z=nan\n", path, sizeof(path));
+
+    printerctl_config_overrides_t overrides;
+    printerctl_config_overrides_init(&overrides);
+    printerctl_config_error_t error;
+    printerctl_config_status_t status = printerctl_config_load_file(path, &overrides, &error);
+    check(status == PRINTERCTL_CONFIG_ERR_INVALID_VALUE, "calibration NaN is rejected");
+    remove(path);
+
+    write_temp_config("calibration.safe_z=inf\n", path, sizeof(path));
+    printerctl_config_overrides_init(&overrides);
+    status = printerctl_config_load_file(path, &overrides, &error);
+    check(status == PRINTERCTL_CONFIG_ERR_INVALID_VALUE, "calibration Inf is rejected");
+    remove(path);
+}
+
 int main(void)
 {
     test_defaults();
@@ -548,6 +616,8 @@ int main(void)
     test_resolve_file_boolean_survives_without_cli_override();
     test_owner_views_apply_only_owned_fields();
     test_owner_views_still_validate_cross_owned_keys();
+    test_calibration_config_keys_and_precedence();
+    test_calibration_config_rejects_nan_inf();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

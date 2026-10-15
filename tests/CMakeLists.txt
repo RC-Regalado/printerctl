@@ -22,6 +22,14 @@ target_link_libraries(printerctl_gcode_tests PRIVATE printerctl_gcode)
 
 add_test(NAME printerctl_gcode_tests COMMAND printerctl_gcode_tests)
 
+add_executable(printerctl_macro_tests
+    test_macro.c
+)
+
+target_link_libraries(printerctl_macro_tests PRIVATE printerctl_macro)
+
+add_test(NAME printerctl_macro_tests COMMAND printerctl_macro_tests)
+
 add_executable(printerctl_marlin_tests
     test_marlin.c
 )

@@ -1315,7 +1315,7 @@ static void test_sigterm_during_active_print_is_safe(void)
     char state_home[128];
     make_temp_state_home(state_home, sizeof(state_home));
     char gcode_path[128];
-    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nM114\n");
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nG28\n");
 
     mock_printer_t mock;
     mock_open(&mock);
@@ -1345,7 +1345,7 @@ static void test_sigpwr_during_active_print_uses_daemon_marker_and_is_safe(void)
     char state_home[128];
     make_temp_state_home(state_home, sizeof(state_home));
     char gcode_path[128];
-    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nM114\n");
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nG28\n");
 
     mock_printer_t mock;
     mock_open(&mock);
@@ -1502,7 +1502,7 @@ static void test_print_cancel_ack_window_blocks_next_command(void)
     char state_home[128];
     make_temp_state_home(state_home, sizeof(state_home));
     char gcode_path[128];
-    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nM114\n");
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\nG28\n");
 
     mock_printer_t mock;
     mock_open(&mock);
@@ -1857,7 +1857,7 @@ static void test_cli_print_uses_daemon_print_start(void)
     char state_home[128];
     make_temp_state_home(state_home, sizeof(state_home));
     char gcode_path[128];
-    write_gcode_file(gcode_path, sizeof(gcode_path), "G21\nM105\n");
+    write_gcode_file(gcode_path, sizeof(gcode_path), "G21\nG28\nG28 X\nG28 Y\nG28 Z\nM105\n");
 
     mock_printer_t mock;
     mock_open(&mock);
@@ -1875,6 +1875,12 @@ static void test_cli_print_uses_daemon_print_start(void)
      * remains_synchronous() above already uses for `home`). */
     mock_expect_command(&mock, "G21\n");
     mock_reply_ok(&mock);
+    const char *homing_commands[] = {"G28\n", "G28 X\n", "G28 Y\n", "G28 Z\n"};
+    for (size_t i = 0; i < sizeof(homing_commands) / sizeof(homing_commands[0]); ++i) {
+        mock_expect_command(&mock, homing_commands[i]);
+        mock_expect_no_command(&mock);
+        mock_reply_ok(&mock);
+    }
     mock_expect_command(&mock, "M105\n");
     mock_reply_ok(&mock);
 
@@ -1885,6 +1891,8 @@ static void test_cli_print_uses_daemon_print_start(void)
           "CLI print reports daemon acceptance");
     check(strstr(output, "Completed") != NULL,
           "CLI print reports the terminal Completed state before exiting");
+    check(strstr(output, "(6/6)") != NULL,
+          "source command count includes homing commands");
 
     stop_printerctld(daemon);
     mock_close(&mock);
@@ -1956,7 +1964,7 @@ static void test_home_quick_completion_remains_synchronous(void)
     rmdir(config_home);
 }
 
-static void test_home_waits_beyond_short_plp_deadline(void)
+static void test_physical_command_waits_beyond_short_plp_deadline(bool raw_send)
 {
     unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
     char config_home[128];
@@ -1970,16 +1978,18 @@ static void test_home_waits_beyond_short_plp_deadline(void)
     close(ready);
 
     int out_fd = -1;
-    pid_t cli = start_printerctl_args("home", NULL, NULL, config_home, &out_fd);
-    mock_expect_command(&mock, "G28\n");
+    pid_t cli = start_printerctl_args(raw_send ? "send" : "home",
+                                    raw_send ? "M303 E0 S200 C6" : NULL,
+                                    NULL, config_home, &out_fd);
+    mock_expect_command(&mock, raw_send ? "M303 E0 S200 C6\n" : "G28\n");
     sleep_ms(5500);
     expect_child_still_running(cli);
     mock_reply_ok(&mock);
     expect_child_exit(cli, PRINTERCTL_EXIT_OK);
     char output[512];
     read_output(out_fd, output, sizeof(output));
-    check(strstr(output, "home complete: all axes") != NULL,
-          "delayed HOME reports terminal completion after ok");
+    check(strstr(output, raw_send ? "< ok" : "home complete: all axes") != NULL,
+          "delayed physical command reports terminal completion after ok");
 
     int ping = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
     close(ping);
@@ -1989,7 +1999,7 @@ static void test_home_waits_beyond_short_plp_deadline(void)
     rmdir(config_home);
 }
 
-static void test_home_marlin_timeout_is_daemon_authoritative(void)
+static void test_physical_command_marlin_timeout_is_daemon_authoritative(bool raw_send)
 {
     unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
     char config_home[128];
@@ -2003,14 +2013,16 @@ static void test_home_marlin_timeout_is_daemon_authoritative(void)
     close(ready);
 
     int out_fd = -1;
-    pid_t cli = start_printerctl_args_combined("home", NULL, NULL, config_home, &out_fd);
-    mock_expect_command(&mock, "G28\n");
+    pid_t cli = start_printerctl_args_combined(raw_send ? "send" : "home",
+                                             raw_send ? "M303 E0 S200 C6" : NULL,
+                                             NULL, config_home, &out_fd);
+    mock_expect_command(&mock, raw_send ? "M303 E0 S200 C6\n" : "G28\n");
     expect_child_exit(cli, PRINTERCTL_EXIT_COMM_ERROR);
     char output[1024];
     read_output(out_fd, output, sizeof(output));
     check(strstr(output, "wire_status=0x0403") != NULL ||
               strstr(output, "remote status 0x0403") != NULL,
-          "HOME timeout is reported as PLP PRINTER_TIMEOUT");
+          "physical command timeout is reported as PLP PRINTER_TIMEOUT");
 
     int ping = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
     close(ping);
@@ -2129,8 +2141,10 @@ int main(void)
     test_cli_print_uses_daemon_print_start();
     test_cli_print_source_error_is_daemon_reported();
     test_home_quick_completion_remains_synchronous();
-    test_home_waits_beyond_short_plp_deadline();
-    test_home_marlin_timeout_is_daemon_authoritative();
+    test_physical_command_waits_beyond_short_plp_deadline(false);
+    test_physical_command_waits_beyond_short_plp_deadline(true);
+    test_physical_command_marlin_timeout_is_daemon_authoritative(false);
+    test_physical_command_marlin_timeout_is_daemon_authoritative(true);
     test_home_printer_error_is_propagated();
     test_home_client_disconnect_after_g28_is_not_fatal();
     return 0;

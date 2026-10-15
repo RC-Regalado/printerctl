@@ -9,8 +9,9 @@ power-failure references.
 
 ## Status
 
-This repository currently implements Milestone 22 (Host Print CLI Migration),
-continuing Phase 2 CLI client migration after completing
+This repository has completed Phase 2 CLI client migration and is in
+Phase 3 — Safe Macros with Milestone 28 (Built-in Macro Execution),
+after completing
 `docs/roadmap.md`'s Phase 1 —
 Daemon Foundation + Single-Print IPC (milestones 0-9 keep their original
 scope; milestones 10+ follow the revised roadmap). Milestone 12 (Print
@@ -27,7 +28,11 @@ support. Milestone 18 added owner-aware configuration views, and
 Milestone 19 adds a reusable PLP client library, Milestone 20 migrates
 `temp`, `position` and `info` through `printerctld`, and Milestone 21
 migrates `send`, `home` and `sd pause`/`sd resume`/`sd cancel`; Milestone
-22 migrates `print FILE` to daemon-owned `PRINT_START`. The Phase 1
+22 migrates `print FILE` to daemon-owned `PRINT_START`; milestones 23-26
+complete host print control, power alignment, legacy serial removal and Phase 2
+validation. M27 adds a pure typed macro domain and built-in macro registry
+metadata; M28 adds worker-owned physical execution for validated built-in
+MOVE macros only, without PLP macro operations or CLI macro UX. The Phase 1
 remediation audit is recorded in
 `docs/audit/phase-1.md`. See
 `docs/milestones/milestone-22.md` /
@@ -112,11 +117,12 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. 19
+Use `build-clang` instead of `build` if you configured with Clang. 20
 independent test binaries are run: `printerctl_tests` (CLI grammar,
 logging integration, daemon-unavailable paths and dry-run behavior),
 `printerctl_config_tests` (configuration module),
-`printerctl_gcode_tests` (G-code reader), `printerctl_marlin_tests`
+`printerctl_gcode_tests` (G-code reader), `printerctl_macro_tests` (macro
+domain validation and registry), `printerctl_marlin_tests`
 (Marlin response parser), `printerctl_serial_tests` (serial transport
 over pseudo-terminals), `printerctl_printer_tests` (printer session
 against scripted mock printers), `printerctl_record_tests` (session
@@ -204,17 +210,17 @@ Min end-stops are enabled on all three axes (X, Y, Z), so `home` needs
 no confirmation flag: it sends `G28` through the daemon-owned execution
 path. `home X`, `home Y` and
 `home Z` home a single axis, sending `G28 X`, `G28 Y` and `G28 Z`
-respectively. `G28` remains refused everywhere else — `send "G28"` is
-rejected before IPC as UX and by daemon policy, and daemon-owned print
-execution rejects `G28` from sliced files with no bypass — so homing is
-only ever available through the dedicated `home` command, never an
-unexpected side effect of a raw command or a sliced file. See
+respectively. After operator verification of the minimum end-stops,
+`print FILE` also permits `G28` and axis variants present in the source.
+Review your slicer's start G-code: these commands will home when printed.
+`send "G28"` remains rejected before IPC and by daemon policy; use
+`home` for standalone homing. No homing is inserted automatically. See
 `docs/safety.md` for the full safety policy reference.
 
 `--dry-run print FILE` exits `0` when the file parses cleanly and writes
 the normalized command stream with source line numbers and whole-percent
 progress. It strips comments and blank lines, rejects malformed or
-oversized lines with exit code `6`, and rejects `G28` with exit code `4`.
+oversized lines with exit code `6`, and accepts source `G28` commands.
 No serial device is opened.
 
 `print FILE` starts daemon-owned streaming and returns after
@@ -245,6 +251,14 @@ firmware without SD support Marlin answers `echo:Unknown command`
 refuses `G28` (exit code `4`, no bypass). Under `--dry-run`, migrated
 physical commands print the line they would send and exit `0` without
 touching daemon or serial.
+
+`send` and `home` wait for the daemon's terminal response without a
+client-side 5-second deadline. Marlin's silence timeout remains owned
+by `printerctld`: for slow commands such as `send "M303 E0 S200 C6"`,
+start the daemon with an appropriate `--timeout` (for example, `60000`
+milliseconds). Each received response line restarts that timeout;
+it does not limit the total command duration. A CLI timeout or disconnect
+does not abort an operation already running in firmware.
 
 `power low-battery` never requires a port and never opens a serial
 device itself — see Power events below.

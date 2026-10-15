@@ -69,19 +69,46 @@ static printerctl_printer_status_t write_command_line(
     return PRINTERCTL_PRINTER_OK;
 }
 
+typedef struct {
+    printerctl_printer_control_fn poll;
+    void *context;
+    printerctl_printer_status_t status;
+} exchange_control_t;
+
+static bool interrupt_exchange(void *context)
+{
+    exchange_control_t *control = context;
+    if (control->poll == NULL) return false;
+    printerctl_print_control_t request = control->poll(control->context);
+    if (request == PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE) {
+        control->status = PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE;
+    } else if (request == PRINTERCTL_PRINT_CONTROL_CANCEL) {
+        control->status = PRINTERCTL_PRINTER_CANCELLED;
+    }
+    return control->status != PRINTERCTL_PRINTER_OK;
+}
+
 static printerctl_printer_status_t wait_for_terminal_response(
     printerctl_printer_session_t *session,
     printerctl_printer_line_fn on_line,
     void *context,
     printerctl_serial_wait_hook_fn on_wait,
     void *wait_context,
+    exchange_control_t *control,
     printerctl_printer_error_t *out_error)
 {
     for (;;) {
         char line[PRINTERCTL_PRINTER_LINE_MAX];
         printerctl_serial_error_t serial_error;
-        printerctl_serial_status_t serial_status = printerctl_serial_read_line_with_hook(
-            &session->port, line, sizeof(line), on_wait, wait_context, &serial_error);
+        printerctl_serial_status_t serial_status = control != NULL
+            ? printerctl_serial_read_line_interruptible(&session->port, line, sizeof(line),
+                                                        interrupt_exchange, control, &serial_error)
+            : printerctl_serial_read_line_with_hook(&session->port, line, sizeof(line),
+                                                    on_wait, wait_context, &serial_error);
+        if (serial_status == PRINTERCTL_SERIAL_INTERRUPTED) {
+            set_error(out_error, control->status, "command cancelled during ACK wait");
+            return control->status;
+        }
         if (serial_status != PRINTERCTL_SERIAL_OK) {
             printerctl_printer_status_t status =
                 serial_status == PRINTERCTL_SERIAL_ERR_TIMEOUT
@@ -189,11 +216,12 @@ printerctl_printer_status_t printerctl_printer_connect(
     return PRINTERCTL_PRINTER_OK;
 }
 
-printerctl_printer_status_t printerctl_printer_execute(
+static printerctl_printer_status_t execute_command(
     printerctl_printer_session_t *session,
     const char *command,
     printerctl_printer_line_fn on_line,
     void *context,
+    exchange_control_t *control,
     printerctl_printer_error_t *out_error)
 {
     if (out_error == NULL) {
@@ -214,11 +242,31 @@ printerctl_printer_status_t printerctl_printer_execute(
         return out_error->status;
     }
 
+    if (control != NULL && interrupt_exchange(control)) {
+        set_error(out_error, control->status, "command cancelled before TX");
+        return control->status;
+    }
     printerctl_printer_status_t status = write_command_line(session, command, out_error);
     if (status != PRINTERCTL_PRINTER_OK) {
         return status;
     }
-    return wait_for_terminal_response(session, on_line, context, NULL, NULL, out_error);
+    return wait_for_terminal_response(session, on_line, context, NULL, NULL, control, out_error);
+}
+
+printerctl_printer_status_t printerctl_printer_execute(
+    printerctl_printer_session_t *session, const char *command,
+    printerctl_printer_line_fn on_line, void *context, printerctl_printer_error_t *out_error)
+{
+    return execute_command(session, command, on_line, context, NULL, out_error);
+}
+
+printerctl_printer_status_t printerctl_printer_execute_controlled(
+    printerctl_printer_session_t *session, const char *command,
+    printerctl_printer_control_fn on_control, void *context,
+    printerctl_printer_error_t *out_error)
+{
+    exchange_control_t control = {on_control, context, PRINTERCTL_PRINTER_OK};
+    return execute_command(session, command, NULL, NULL, &control, out_error);
 }
 
 /* Shared shape of the three typed queries: probe every response line with a marlin parser. */
@@ -546,7 +594,7 @@ printerctl_printer_status_t printerctl_printer_print_file_controlled(
     printerctl_gcode_reader_t reader;
     printerctl_gcode_error_t gcode_error;
     printerctl_gcode_status_t gcode_status =
-        printerctl_gcode_reader_open(&reader, path, false, &gcode_error);
+        printerctl_gcode_reader_open(&reader, path, true, &gcode_error);
     if (gcode_status != PRINTERCTL_GCODE_OK) {
         printerctl_printer_status_t status = gcode_failure_status(gcode_status);
         set_error(out_error, status, "%s", gcode_error.message);
@@ -650,7 +698,7 @@ printerctl_printer_status_t printerctl_printer_print_file_controlled(
         }
 
         exchange_status = wait_for_terminal_response(
-            session, NULL, NULL, (printerctl_serial_wait_hook_fn)on_ack_wait, tx_context,
+            session, NULL, NULL, (printerctl_serial_wait_hook_fn)on_ack_wait, tx_context, NULL,
             out_error);
         if (exchange_status != PRINTERCTL_PRINTER_OK) {
             status = exchange_status;

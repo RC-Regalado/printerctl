@@ -1,5 +1,7 @@
 # Phase 2 Roadmap — CLI Client Migration
 
+**Phase status:** DONE
+
 ## Phase objective
 
 Convert `printerctl` from a direct Marlin/serial controller into a client of `printerctld` over PLP/1, preserving the current CLI behavior where practical and preserving all safety guarantees.
@@ -315,7 +317,7 @@ Implementation notes:
 
 ## M26 — Compatibility & Fault Validation
 
-**Status:** PROPOSED
+**Status:** DONE
 
 Required matrix includes:
 

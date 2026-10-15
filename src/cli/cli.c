@@ -488,11 +488,9 @@ static void print_help(FILE *out)
         "  Min end-stops are enabled on all three axes, so 'home' (and 'home\n"
         "  X'/'home Y'/'home Z') needs no confirmation flag. It remains a\n"
         "  daemon-owned command during Phase 2 migration.\n"
-        "  G28 remains disabled everywhere else: daemon-owned print execution\n"
-        "  rejects G28 from sliced files with no confirmation flag, and\n"
-        "  'send' refuses G28 the same way, with no bypass -- homing is\n"
-        "  only ever available through the dedicated 'home' command,\n"
-        "  never an unexpected side effect of a raw command or a sliced file.\n"
+        "  G28 is allowed in files explicitly selected with 'print FILE'.\n"
+        "  Review the file before printing: its G28 commands will home.\n"
+        "  'send' still refuses G28; use 'home' for standalone homing.\n"
         "  Every other command passes through 'send', including the\n"
         "  operator's explicit emergency stop (M112).\n"
         "\n"
@@ -500,7 +498,7 @@ static void print_help(FILE *out)
         "  0  success (including --help/--version and a clean dry run)\n"
         "  2  usage error\n"
         "  3  configuration error\n"
-        "  4  safety policy rejection (G28 in a G-code file or via send)\n"
+        "  4  safety policy rejection (G28 via send)\n"
         "  5  parsed successfully but not yet available in this build\n"
         "  6  G-code file error (unreadable, malformed, oversized line, ...)\n"
         "  7  communication error (cannot open port, I/O failure, timeout)\n"
@@ -575,10 +573,8 @@ static void close_dry_run_reader(printerctl_gcode_reader_t *reader, FILE *err)
  * Milestone 3 dry-run execution of `print FILE`: parses and normalizes the
  * G-code file via printerctl_gcode without ever opening a serial device,
  * writing each command that would be transmitted to `out` with its source
- * line number and whole-percent progress. The reader is always opened with
- * allow_g28 = false: `print` has no confirmation flag in this milestone,
- * so a file containing G28 always fails the dry run with the safety exit
- * code.
+ * line number and whole-percent progress. The reader permits G28, matching
+ * the operator-selected file's real streaming policy.
  *
  * Logging follows the Milestone 2 privacy rules: the file path and the
  * G-code command text appear only in human-readable output, never in the
@@ -601,7 +597,7 @@ static int run_dry_run_print(const char *path, printerctl_logger_t *logger,
     }
 
     printerctl_gcode_status_t status =
-        printerctl_gcode_reader_open(&reader, path, false, &gcode_error);
+        printerctl_gcode_reader_open(&reader, path, true, &gcode_error);
 
     uint64_t commands = 0;
     uint64_t lines = 0;
@@ -1042,7 +1038,7 @@ static int run_physical_command(const printerctl_command_args_t *args,
         printerctl_plp1_raw_send_response_t response;
         fprintf(out, "> %s\n", args->send_command);
         status = printerctl_client_raw_send(&client, args->send_command,
-                                            PRINTERCTL_CLI_PLP_TIMEOUT_MS, &response, &error);
+                                            PRINTERCTL_CLI_PLP_WAIT_FOREVER_MS, &response, &error);
         if (status == PRINTERCTL_CLIENT_OK) {
             render_transcript(out, response.transcript);
         }
@@ -1337,7 +1333,7 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
 
         /* The safety policy holds even when nothing would be sent: a
          * G28 through `send` is rejected in dry-run mode too. `home`'s
-         * own G28 is not rejected here -- it is the one command G28 is
+         * own G28 is not rejected here -- it is the standalone command G28 is
          * always available through. */
         if (request.command_args.command == PRINTERCTL_COMMAND_SEND &&
             printerctl_gcode_command_is_unsafe_g28(tx_line)) {

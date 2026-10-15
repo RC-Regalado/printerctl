@@ -765,7 +765,7 @@ static void test_print_file_stops_on_resend_and_timeout(void)
     }
 }
 
-static void test_print_file_blocks_g28_and_file_errors(void)
+static void test_print_file_allows_g28_and_rejects_file_errors(void)
 {
     {
         mock_printer_t mock;
@@ -779,20 +779,21 @@ static void test_print_file_blocks_g28_and_file_errors(void)
 
         char path[64];
         write_temp_gcode("G21\nG28\nG90\n", path, sizeof(path));
-        mock_reply(&mock, "ok\n");
+        mock_reply(&mock, "ok\nok\nok\n");
 
         printerctl_print_summary_t summary;
         printerctl_printer_status_t status =
             printerctl_printer_print_file(&session, path, NULL, NULL, NULL, NULL, &summary, &error);
 
-        check(status == PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND,
-              "a G28 in the file stops the print as an unsafe command");
-        check(strstr(error.message, "line 2") != NULL, "the G28 rejection names its line");
-        check(summary.commands_sent == 1, "the G28 line itself was never transmitted");
+        check(status == PRINTERCTL_PRINTER_OK && summary.state == PRINTERCTL_PRINT_COMPLETED,
+              "a G28 in the operator-selected file is allowed");
+        check(summary.commands_sent == 3 && summary.commands_acknowledged == 3,
+              "homing and commands after homing are acknowledged");
 
         char transmitted[64];
         mock_received(&mock, transmitted, sizeof(transmitted));
-        check(strcmp(transmitted, "G21\n") == 0, "only the command before the G28 went out");
+        check(strcmp(transmitted, "G21\nG28\nG90\n") == 0,
+              "the file is transmitted in order including homing");
 
         printerctl_printer_disconnect(&session, &error);
         mock_close(&mock);
@@ -1411,7 +1412,7 @@ int main(void)
     test_print_file_never_floods_the_serial_buffer();
     test_print_file_stops_on_error();
     test_print_file_stops_on_resend_and_timeout();
-    test_print_file_blocks_g28_and_file_errors();
+    test_print_file_allows_g28_and_rejects_file_errors();
     test_print_file_waits_out_busy_and_handles_empty_file();
     test_print_file_pause_transmits_nothing_and_resume_continues();
     test_print_file_cancel_stops_after_current_acknowledgement();

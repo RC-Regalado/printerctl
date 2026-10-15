@@ -47,6 +47,20 @@ typedef struct {
     int timeout_ms;
     bool dry_run;
     bool verbose;
+    bool has_calibration_min_x;
+    bool has_calibration_max_x;
+    bool has_calibration_min_y;
+    bool has_calibration_max_y;
+    bool has_calibration_safe_z;
+    bool has_calibration_xy_feedrate;
+    bool has_calibration_z_feedrate;
+    double calibration_min_x;
+    double calibration_max_x;
+    double calibration_min_y;
+    double calibration_max_y;
+    double calibration_safe_z;
+    double calibration_xy_feedrate;
+    double calibration_z_feedrate;
 } printerctl_config_t;
 
 /*
@@ -72,6 +86,21 @@ typedef struct {
 
     bool has_verbose;
     bool verbose;
+
+    bool has_calibration_min_x;
+    bool has_calibration_max_x;
+    bool has_calibration_min_y;
+    bool has_calibration_max_y;
+    bool has_calibration_safe_z;
+    bool has_calibration_xy_feedrate;
+    bool has_calibration_z_feedrate;
+    double calibration_min_x;
+    double calibration_max_x;
+    double calibration_min_y;
+    double calibration_max_y;
+    double calibration_safe_z;
+    double calibration_xy_feedrate;
+    double calibration_z_feedrate;
 
     bool has_config_path;
     char config_path[PRINTERCTL_CONFIG_PATH_MAX];
@@ -116,6 +145,7 @@ void printerctl_config_set_defaults(printerctl_config_t *config);
 bool printerctl_config_parse_baud(const char *value, int *out_baud);
 bool printerctl_config_parse_timeout(const char *value, int *out_timeout_ms);
 bool printerctl_config_parse_bool(const char *value, bool *out_value);
+bool printerctl_config_parse_double(const char *value, double *out_value);
 
 /*
  * Reads a Milestone 1 config file: root-level "key=value" lines, blank

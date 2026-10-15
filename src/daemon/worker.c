@@ -4,9 +4,11 @@
 
 #include "printerctl/core/print_engine.h"
 #include "printerctl/daemon/ipc.h"
+#include "printerctl/macro.h"
 #include "printerctl/protocol/plp1.h"
 
 #include <errno.h>
+#include <math.h>
 #include <poll.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -21,6 +23,10 @@ typedef struct {
     printerctl_config_t config;
     printerctl_print_engine_t engine;
     bool print_active;
+    bool macro_active;
+    printerctl_print_control_t macro_cancel;
+    bool shutdown_after_macro;
+    uint32_t macro_shutdown_token;
     bool shutdown_after_print;
     uint32_t shutdown_token;
     printerctl_print_summary_t last_progress; /* most recent PROGRESS snapshot; reused for
@@ -52,7 +58,7 @@ static void emit_raw(int event_write_fd, printerctl_daemon_event_type_t type, ui
                      uint8_t execution_state, uint8_t progress_percent,
                      uint32_t commands_sent, uint32_t commands_acknowledged,
                      uint32_t commands_total, uint32_t source_position,
-                     uint16_t failure_reason, uint16_t wire_status)
+    uint16_t failure_reason, uint16_t wire_status)
 {
     printerctl_daemon_event_t event;
     memset(&event, 0, sizeof(event));
@@ -60,6 +66,9 @@ static void emit_raw(int event_write_fd, printerctl_daemon_event_type_t type, ui
     event.type = type;
     event.token = token;
     event.result = result;
+    event.execution_kind = type == PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE
+        ? PRINTERCTL_DAEMON_EXECUTION_KIND_PRINT
+        : PRINTERCTL_DAEMON_EXECUTION_KIND_NONE;
     event.execution_state = execution_state;
     event.progress_percent = progress_percent;
     event.commands_sent = commands_sent;
@@ -282,6 +291,30 @@ static void emit_print_update(worker_context_t *ctx, uint8_t execution_state,
              total, source_position, failure_reason, 0);
 }
 
+static void emit_macro_update(worker_context_t *ctx, uint8_t execution_state, const char *id,
+                              uint32_t current_step, uint32_t total_steps,
+                              uint16_t terminal_result, const char *detail)
+{
+    printerctl_daemon_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.wire_size = sizeof(event);
+    event.type = PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE;
+    event.result = PRINTERCTL_DAEMON_RESULT_OK;
+    event.execution_kind = PRINTERCTL_DAEMON_EXECUTION_KIND_MACRO;
+    event.execution_state = execution_state;
+    event.progress_percent =
+        total_steps == 0 ? 0 : (uint8_t)((current_step * 100u) / total_steps);
+    snprintf(event.macro_id, sizeof(event.macro_id), "%s", id != NULL ? id : "");
+    event.macro_current_step = current_step;
+    event.macro_total_steps = total_steps;
+    event.macro_terminal_result = terminal_result;
+    event.failure_reason = terminal_result;
+    if (detail != NULL) {
+        snprintf(event.detail, sizeof(event.detail), "%s", detail);
+    }
+    (void)printerctl_daemon_ipc_write_event(ctx->event_write_fd, &event);
+}
+
 static uint16_t validate_print_source(const char *path)
 {
     struct stat st;
@@ -397,6 +430,7 @@ static void poll_control_commands(printerctl_print_engine_t *engine, void *conte
                                 PRINTERCTL_PLP1_SUCCESS, NULL);
             break;
         case PRINTERCTL_DAEMON_CMD_PRINT_START:
+        case PRINTERCTL_DAEMON_CMD_MACRO_EXECUTE:
             emit_command_result(ctx, cmd.token, PRINTERCTL_DAEMON_RESULT_ERROR,
                                 PRINTERCTL_PLP1_BUSY, "print already active");
             break;
@@ -433,6 +467,218 @@ static void poll_control_commands(printerctl_print_engine_t *engine, void *conte
     }
 }
 
+static printerctl_macro_calibration_config_t macro_config_from_runtime(
+    const printerctl_config_t *config)
+{
+    printerctl_macro_calibration_config_t macro_config;
+    memset(&macro_config, 0, sizeof(macro_config));
+    macro_config.has_min_x = config->has_calibration_min_x;
+    macro_config.has_max_x = config->has_calibration_max_x;
+    macro_config.has_min_y = config->has_calibration_min_y;
+    macro_config.has_max_y = config->has_calibration_max_y;
+    macro_config.has_safe_z = config->has_calibration_safe_z;
+    macro_config.has_xy_feedrate = config->has_calibration_xy_feedrate;
+    macro_config.has_z_feedrate = config->has_calibration_z_feedrate;
+    macro_config.min_x = config->calibration_min_x;
+    macro_config.max_x = config->calibration_max_x;
+    macro_config.min_y = config->calibration_min_y;
+    macro_config.max_y = config->calibration_max_y;
+    macro_config.safe_z = config->calibration_safe_z;
+    macro_config.xy_feedrate = config->calibration_xy_feedrate;
+    macro_config.z_feedrate = config->calibration_z_feedrate;
+    return macro_config;
+}
+
+static printerctl_print_control_t poll_macro_control_commands(void *context)
+{
+    worker_context_t *ctx = context;
+    if (atomic_exchange_explicit(&g_signal_power_failure_requested, 0, memory_order_relaxed)) {
+        ctx->macro_cancel = PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE;
+    } else if (atomic_exchange_explicit(&g_signal_cancel_requested, 0, memory_order_relaxed) &&
+               ctx->macro_cancel == PRINTERCTL_PRINT_CONTROL_CONTINUE) {
+        ctx->macro_cancel = PRINTERCTL_PRINT_CONTROL_CANCEL;
+    }
+    while (command_available(ctx->cmd_read_fd)) {
+        printerctl_daemon_command_t cmd;
+        printerctl_daemon_ipc_status_t status =
+            printerctl_daemon_ipc_read_command(ctx->cmd_read_fd, &cmd);
+        if (status != PRINTERCTL_DAEMON_IPC_OK) {
+            ctx->macro_cancel = PRINTERCTL_PRINT_CONTROL_CANCEL;
+            return ctx->macro_cancel;
+        }
+
+        switch (cmd.type) {
+        case PRINTERCTL_DAEMON_CMD_SHUTDOWN:
+            ctx->shutdown_after_macro = true;
+            ctx->macro_shutdown_token = cmd.token;
+            emit(ctx->event_write_fd, PRINTERCTL_DAEMON_EVENT_STOPPING, cmd.token,
+                 PRINTERCTL_DAEMON_RESULT_OK, NULL);
+            if (ctx->macro_cancel == PRINTERCTL_PRINT_CONTROL_CONTINUE)
+                ctx->macro_cancel = PRINTERCTL_PRINT_CONTROL_CANCEL;
+            break;
+        case PRINTERCTL_DAEMON_CMD_PRINT_START:
+        case PRINTERCTL_DAEMON_CMD_MACRO_EXECUTE:
+        case PRINTERCTL_DAEMON_CMD_QUERY_TEMP:
+        case PRINTERCTL_DAEMON_CMD_QUERY_POSITION:
+        case PRINTERCTL_DAEMON_CMD_QUERY_INFO:
+        case PRINTERCTL_DAEMON_CMD_RAW_SEND:
+        case PRINTERCTL_DAEMON_CMD_HOME:
+        case PRINTERCTL_DAEMON_CMD_SD_PAUSE:
+        case PRINTERCTL_DAEMON_CMD_SD_RESUME:
+        case PRINTERCTL_DAEMON_CMD_SD_CANCEL:
+            emit_command_result(ctx, cmd.token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                                PRINTERCTL_PLP1_BUSY, "macro already active");
+            break;
+        case PRINTERCTL_DAEMON_CMD_PRINT_PAUSE:
+        case PRINTERCTL_DAEMON_CMD_PRINT_RESUME:
+        case PRINTERCTL_DAEMON_CMD_PRINT_CANCEL:
+            emit_command_result(ctx, cmd.token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                                PRINTERCTL_PLP1_NOT_PRINTING, "no active print");
+            break;
+        case PRINTERCTL_DAEMON_CMD_PRINT_CANCEL_POWER_FAILURE:
+            ctx->macro_cancel = PRINTERCTL_PRINT_CONTROL_CANCEL_POWER_FAILURE;
+            emit_command_result(ctx, cmd.token, PRINTERCTL_DAEMON_RESULT_OK,
+                                PRINTERCTL_PLP1_SUCCESS, NULL);
+            break;
+        case PRINTERCTL_DAEMON_CMD_NOP:
+            emit_command_result(ctx, cmd.token, PRINTERCTL_DAEMON_RESULT_OK,
+                                PRINTERCTL_PLP1_SUCCESS, NULL);
+            break;
+        }
+    }
+    return ctx->macro_cancel;
+}
+
+static bool format_move_command(const printerctl_macro_step_t *step, char *out, size_t out_size)
+{
+    if (out_size < 3 || step->feedrate_mm_min < 0.001) return false;
+    memcpy(out, "G1", 3);
+    size_t used = 2;
+    const char axes[] = "XYZ";
+    const double values[] = {step->x, step->y, step->z};
+    for (size_t i = 0; i < 3; ++i) {
+        if ((step->axes & (1u << i)) == 0) continue;
+        if (values[i] != 0 && fabs(values[i]) < 0.001) return false;
+        int n = snprintf(out + used, out_size - used, " %c%.3f", axes[i], values[i]);
+        if (n < 0 || (size_t)n >= out_size - used) return false;
+        used += (size_t)n;
+    }
+    int n = snprintf(out + used, out_size - used, " F%.3f", step->feedrate_mm_min);
+    return n >= 0 && (size_t)n < out_size - used;
+}
+
+static printerctl_printer_status_t execute_macro_command(worker_context_t *ctx,
+                                                         printerctl_printer_session_t *session,
+                                                         const char *command,
+                                                         printerctl_printer_error_t *error)
+{
+    return printerctl_printer_execute_controlled(session, command,
+                                                  poll_macro_control_commands, ctx, error);
+}
+
+static void run_macro(worker_context_t *ctx, const printerctl_daemon_command_t *cmd)
+{
+    if (ctx->print_active || ctx->macro_active) {
+        emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                            PRINTERCTL_PLP1_BUSY, "execution already active");
+        return;
+    }
+
+    printerctl_macro_step_t steps[PRINTERCTL_MACRO_STEPS_MAX];
+    printerctl_macro_definition_t definition;
+    printerctl_macro_error_t macro_error;
+    printerctl_macro_calibration_config_t macro_config = macro_config_from_runtime(&ctx->config);
+    printerctl_macro_status_t macro_status =
+        printerctl_macro_resolve_builtin(cmd->macro_id, &macro_config, &definition, steps,
+                                         sizeof(steps) / sizeof(steps[0]), &macro_error);
+    if (macro_status != PRINTERCTL_MACRO_OK) {
+        uint16_t wire_status = macro_status == PRINTERCTL_MACRO_NOT_FOUND
+            ? PRINTERCTL_PLP1_INVALID_ARGUMENT
+            : PRINTERCTL_PLP1_INVALID_STATE;
+        emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_ERROR, wire_status,
+                            macro_error.message);
+        return;
+    }
+
+    char moves[PRINTERCTL_MACRO_STEPS_MAX][128];
+    for (size_t i = 0; i < definition.step_count; ++i) {
+        if (!format_move_command(&definition.steps[i], moves[i], sizeof(moves[i]))) {
+            emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                                PRINTERCTL_PLP1_INVALID_ARGUMENT, "macro command is not representable");
+            return;
+        }
+    }
+    printerctl_printer_session_t session;
+    printerctl_printer_error_t error;
+    printerctl_printer_status_t status =
+        printerctl_printer_connect(&session, &ctx->config, NULL, &error);
+    if (status != PRINTERCTL_PRINTER_OK) {
+        emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_ERROR,
+                            map_printer_status(status), error.message);
+        return;
+    }
+
+    ctx->macro_active = true;
+    ctx->macro_cancel = PRINTERCTL_PRINT_CONTROL_CONTINUE;
+    emit_macro_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING, definition.id, 0,
+                      (uint32_t)definition.step_count, 0, NULL);
+    emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_OK, PRINTERCTL_PLP1_SUCCESS,
+                        NULL);
+
+    uint32_t completed = 0;
+    uint16_t terminal = PRINTERCTL_PLP1_SUCCESS;
+    status = execute_macro_command(ctx, &session, "G21", &error);
+    for (size_t i = 0; status == PRINTERCTL_PRINTER_OK && i < definition.step_count; ++i) {
+        const printerctl_macro_step_t *step = &definition.steps[i];
+        const char *mode = step->type == PRINTERCTL_MACRO_STEP_MOVE_ABSOLUTE ? "G90" : "G91";
+        status = execute_macro_command(ctx, &session, mode, &error);
+        if (status != PRINTERCTL_PRINTER_OK) {
+            terminal = status == PRINTERCTL_PRINTER_CANCELLED ? PRINTERCTL_PLP1_SUCCESS
+                                                              : map_printer_status(status);
+            break;
+        }
+        status = execute_macro_command(ctx, &session, moves[i], &error);
+        if (status != PRINTERCTL_PRINTER_OK) {
+            terminal = map_printer_status(status);
+            break;
+        }
+        completed++;
+        emit_macro_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING, definition.id, completed,
+                          (uint32_t)definition.step_count, 0, NULL);
+    }
+
+    if (status == PRINTERCTL_PRINTER_OK) {
+        status = execute_macro_command(ctx, &session, "G90", &error);
+        if (status != PRINTERCTL_PRINTER_OK) {
+            terminal = map_printer_status(status);
+        }
+    }
+
+    printerctl_printer_error_t disconnect_error;
+    printerctl_printer_disconnect(&session, &disconnect_error);
+    ctx->macro_active = false;
+
+    if (status == PRINTERCTL_PRINTER_OK) {
+        emit_macro_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED, definition.id, completed,
+                          (uint32_t)definition.step_count, PRINTERCTL_PLP1_SUCCESS, NULL);
+    } else if (status == PRINTERCTL_PRINTER_CANCELLED ||
+               status == PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE) {
+        terminal = status == PRINTERCTL_PRINTER_CANCELLED_POWER_FAILURE
+            ? PRINTERCTL_PLP1_SHUTTING_DOWN : PRINTERCTL_PLP1_SUCCESS;
+        emit_macro_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED, definition.id, completed,
+                          (uint32_t)definition.step_count, terminal, error.message);
+    } else {
+        terminal = map_printer_status(status);
+        emit_macro_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_FAILED, definition.id, completed,
+                          (uint32_t)definition.step_count, terminal, error.message);
+    }
+
+    if (ctx->shutdown_after_macro) {
+        emit(ctx->event_write_fd, PRINTERCTL_DAEMON_EVENT_STOPPED, ctx->macro_shutdown_token,
+             PRINTERCTL_DAEMON_RESULT_OK, NULL);
+    }
+}
+
 static void run_print(worker_context_t *ctx, const printerctl_daemon_command_t *cmd)
 {
     printerctl_printer_error_t error;
@@ -457,6 +703,8 @@ static void run_print(worker_context_t *ctx, const printerctl_daemon_command_t *
 
     ctx->print_active = true;
     printerctl_print_engine_set_control_poll(&ctx->engine, poll_control_commands, ctx);
+    memset(&ctx->last_progress, 0, sizeof(ctx->last_progress));
+    emit_print_update(ctx, PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING, NULL, NULL, 0);
     emit_command_result(ctx, cmd->token, PRINTERCTL_DAEMON_RESULT_OK, PRINTERCTL_PLP1_SUCCESS,
                         NULL);
 
@@ -584,6 +832,12 @@ void *printerctl_daemon_worker_main(void *arg)
         case PRINTERCTL_DAEMON_CMD_SD_RESUME:
         case PRINTERCTL_DAEMON_CMD_SD_CANCEL:
             run_physical(&ctx, &cmd);
+            break;
+        case PRINTERCTL_DAEMON_CMD_MACRO_EXECUTE:
+            run_macro(&ctx, &cmd);
+            if (ctx.shutdown_after_macro) {
+                return NULL;
+            }
             break;
         case PRINTERCTL_DAEMON_CMD_PRINT_PAUSE:
         case PRINTERCTL_DAEMON_CMD_PRINT_RESUME:

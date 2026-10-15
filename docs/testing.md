@@ -20,7 +20,7 @@ primary verification method.
 
 ## Test binaries
 
-Nineteen independent CMake/ctest targets, one per module plus integration
+Twenty independent CMake/ctest targets, one per module plus integration
 suites:
 
 | Binary | Covers |
@@ -28,6 +28,7 @@ suites:
 | `printerctl_tests` | CLI grammar, configuration precedence, logging integration, and end-to-end command execution against forked mock printers (`tests/test_cli.c`) |
 | `printerctl_config_tests` | Configuration resolution: defaults, `--config` file, CLI overrides, owner-aware views, precedence, validation |
 | `printerctl_gcode_tests` | G-code file reading: normalization, comment/blank-line stripping, progress, malformed/oversized lines, `G28` detection |
+| `printerctl_macro_tests` | M27/M28 macro domain: typed definitions, validation, config-backed built-in resolution, duplicate IDs and deterministic iteration without serial/daemon execution |
 | `printerctl_marlin_tests` | Marlin response classification and parsing: `ok`, `Error:`, `busy:`, `echo:`, `Resend:`, temperature/position/firmware-info reports |
 | `printerctl_serial_tests` | Serial transport over pseudo-terminals: open/configure/read/write, timeout, exclusive access (`TIOCEXCL`) |
 | `printerctl_printer_tests` | Printer session orchestration against scripted mock printers: connect, single-command exchange, streaming, pause/resume/cancel (operator and power-failure), descriptor-leak checks on failure paths |
@@ -42,7 +43,7 @@ suites:
 | `printerctl_client_tests` | PLP client library: Unix socket connect, request IDs, write-all, incremental response parsing, correlation, timeout, remote errors and PING/VERSION/STATUS/M20 query/M21 physical-command wrappers |
 | `printerctl_daemon_socket_tests` | Milestone 15 Unix socket transport: real `AF_UNIX`, fragmented/coalesced requests, stale/live socket paths, sequential clients and malformed-client containment |
 | `printerctld_tests` | Daemon executable smoke/config/CLI-migration test: fork `printerctld`, connect through PLP/1, validate `PING`, terminate with `SIGTERM`, load valid daemon config, reject invalid daemon config, and cover M20/M21 CLI-to-daemon commands over PTY |
-| `printerctl_daemon_print_tests` | Milestone 16 daemon print integration: worker-owned print engine, pseudo-terminal Marlin, pause/resume/cancel and second-start rejection |
+| `printerctl_daemon_print_tests` | Milestone 16 daemon print integration and M28 macro execution: worker-owned print engine, worker-owned typed MOVE macro execution, pseudo-terminal Marlin, PRINT/MACRO exclusion, error/timeout behavior and liveness |
 | `printerctl_build_boundary_tests` | Milestone 25 build/dependency gate: runs `nm` on the real, linked `printerctl` executable and fails if any `printerctl_serial`/`printerctl_printer`/`printerctl_marlin`/`printerctl_core` (print_engine) symbol appears in it |
 
 Run all of them:
@@ -56,6 +57,24 @@ ctest --test-dir build --output-on-failure
 Substitute `-DCMAKE_C_COMPILER=clang` (and a different build directory)
 to run the same suite under Clang; both must be warning-free with
 `-Wall -Wextra -Wpedantic` per the global Definition of Done.
+
+The CLI and executable tests use `/tmp/printerctl.sock`; some expect
+no daemon there and others create their own mock daemon. Isolate `/tmp`
+when a real daemon is running, so tests cannot reach hardware or unlink
+its socket. On hosts with Bubblewrap:
+
+```bash
+bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp \
+  --bind "$PWD" "$PWD" ctest --test-dir build --output-on-failure
+```
+
+The 2026-10-12 G28 file-policy tests cover dry-run rendering, printer
+streaming, and CLI -> daemon -> PTY execution of G28 and X/Y/Z variants.
+The process test holds each homing ACK, checks that no next command is
+sent, and verifies that the final source command count includes homing.
+Existing raw-send rejection remains. PRINT_CANCEL, SIGTERM and SIGPWR
+ACK-window tests now place G28 next in the source and verify that
+cancellation prevents it from being transmitted.
 
 ## Test patterns
 
@@ -110,10 +129,11 @@ to run the same suite under Clang; both must be warning-free with
   targeting, ACK-window cancellation for `SIGTERM`, `SIGPWR` and
   `PRINT_CANCEL`, no post-commit host transmission, and both directions
   of legacy CLI / daemon serial exclusivity.
-- **Daemon print integration**: M16 tests drive the daemon runtime
+- **Daemon print/macro integration**: M16/M28 tests drive the daemon runtime
   directly against a pseudo-terminal mock Marlin printer, proving
-  `PRINT_START`, pause/resume/cancel and active-print rejection without
-  real hardware.
+  `PRINT_START`, pause/resume/cancel, active-print rejection, typed macro
+  movement translation, PRINT/MACRO mutual exclusion, failure barriers and
+  macro liveness without real hardware.
 
 ## Hardware validation
 

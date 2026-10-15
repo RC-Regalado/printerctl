@@ -92,6 +92,7 @@ typedef enum {
 typedef struct {
     printerctl_daemon_state_t daemon_state;
     printerctl_daemon_worker_state_t worker_state;
+    printerctl_daemon_execution_kind_t execution_kind;
     uint8_t execution_state;
     uint8_t progress_percent;
     uint32_t commands_sent;
@@ -99,6 +100,10 @@ typedef struct {
     uint32_t commands_total; /* best-effort; 0 = unknown, see print_engine.h */
     uint32_t source_position;
     uint16_t failure_reason;
+    char macro_id[PRINTERCTL_MACRO_ID_MAX];
+    uint32_t macro_current_step;
+    uint32_t macro_total_steps;
+    uint16_t macro_terminal_result;
     char last_runtime_error[PRINTERCTL_DAEMON_ERROR_MAX]; /* empty when none recorded */
 } printerctl_daemon_snapshot_t;
 
@@ -257,6 +262,12 @@ printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_resume(
 
 printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_cancel(
     printerctl_daemon_runtime_t *runtime,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error);
+
+printerctl_daemon_status_t printerctl_daemon_runtime_send_macro_execute(
+    printerctl_daemon_runtime_t *runtime,
+    const char *id,
     uint32_t *out_token,
     printerctl_daemon_error_t *out_error);
 

@@ -274,6 +274,13 @@ typedef printerctl_print_control_t (*printerctl_printer_tx_begin_fn)(void *conte
 typedef void (*printerctl_printer_tx_end_fn)(void *context);
 typedef void (*printerctl_printer_ack_wait_fn)(void *context);
 
+/* Worker-owned control: check before TX and during ACK wait. Cancellation
+ * interrupts the exchange; the caller closes it without physical cleanup. */
+printerctl_printer_status_t printerctl_printer_execute_controlled(
+    printerctl_printer_session_t *session, const char *command,
+    printerctl_printer_control_fn on_control, void *context,
+    printerctl_printer_error_t *out_error);
+
 /*
  * Streams the G-code file at `path`, one normalized command at a time,
  * over the connected session: each command is transmitted and the next
@@ -281,8 +288,7 @@ typedef void (*printerctl_printer_ack_wait_fn)(void *context);
  * acknowledges with `ok`, so the serial buffer is never flooded.
  * `busy:`/`echo:`/informational lines are waited out exactly as in
  * printerctl_printer_execute(). The file is opened with allow_g28 =
- * false: a G28 anywhere in the file stops the print with
- * PRINTERCTL_PRINTER_ERR_UNSAFE_COMMAND before that line is sent.
+ * true: operator-selected files may home with G28, including axis variants.
  *
  * Stops gracefully — no further commands are transmitted, the file is
  * closed, *out_summary is filled and the failure is logged — on

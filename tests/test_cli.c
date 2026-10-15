@@ -1023,10 +1023,10 @@ static void test_dry_run_print_empty_file(void)
     free(err);
 }
 
-static void test_dry_run_print_unsafe_g28(void)
+static void test_dry_run_print_allows_g28(void)
 {
     char path[64];
-    write_temp_gcode("G21\nG28\nG90\n", path, sizeof(path));
+    write_temp_gcode("G21\nG28\nG28 X\nG28 Y\nG28 Z\nG90\n", path, sizeof(path));
 
     char *argv[] = {(char *)"printerctl", (char *)"--dry-run", (char *)"print", path};
     char *out = NULL;
@@ -1034,17 +1034,17 @@ static void test_dry_run_print_unsafe_g28(void)
 
     int status = run_cli(4, argv, &out, &err);
 
-    check(status == PRINTERCTL_EXIT_SAFETY_ERROR, "a G-code file containing G28 exits with the safety error code");
-    check(err != NULL && strstr(err, "G28") != NULL, "the G28 rejection message names the command");
-    check(err != NULL && strstr(err, "line 2") != NULL, "the G28 rejection message names the source line");
-    check(err != NULL && count_occurrences(err, "\tERROR\terror\t") == 1,
-          "the G28 rejection adds exactly one ERROR log line");
-    check(err != NULL && strstr(err, "status=unsafe_g28") != NULL,
-          "the structured ERROR record carries the unsafe_g28 status");
-    check(err != NULL && strstr(err, "state=dry_run_print_failed") != NULL,
-          "the failed dry run logs its state transition");
+    check(status == PRINTERCTL_EXIT_OK, "a G-code file containing G28 passes dry run");
+    check(out != NULL && strstr(out, "line 2: G28\n") != NULL &&
+              strstr(out, "line 3: G28 X\n") != NULL &&
+              strstr(out, "line 4: G28 Y\n") != NULL &&
+              strstr(out, "line 5: G28 Z\n") != NULL,
+          "dry run renders homing commands from the source");
+    check(out != NULL && strstr(out, "6 command(s)") != NULL && strstr(out, "G90") != NULL,
+          "dry run processes the entire file including commands after homing");
+    check(err != NULL && count_occurrences(err, "\tERROR\terror\t") == 0,
+          "G28 in a file produces no safety error log");
     check(err != NULL && strstr(err, path) == NULL, "logs never contain the G-code file path");
-    check(out != NULL && strstr(out, "G21") != NULL, "commands before the G28 line were still reported");
 
     remove(path);
     free(out);
@@ -1589,7 +1589,7 @@ int main(void)
     test_dry_run_print_verbose_logs_per_command_progress();
     test_dry_run_print_non_verbose_omits_per_command_progress();
     test_dry_run_print_empty_file();
-    test_dry_run_print_unsafe_g28();
+    test_dry_run_print_allows_g28();
     test_dry_run_print_missing_file();
     test_dry_run_print_malformed_file();
     test_print_without_port_does_not_touch_the_file();

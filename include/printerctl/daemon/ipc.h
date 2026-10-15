@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "printerctl/macro.h"
+
 /*
  * Milestone 13 internal IPC envelopes: the messages exchanged over
  * `cmd_pipe` (control -> worker) and `event_pipe` (worker -> control)
@@ -57,7 +59,8 @@ typedef enum {
     PRINTERCTL_DAEMON_CMD_HOME,
     PRINTERCTL_DAEMON_CMD_SD_PAUSE,
     PRINTERCTL_DAEMON_CMD_SD_RESUME,
-    PRINTERCTL_DAEMON_CMD_SD_CANCEL
+    PRINTERCTL_DAEMON_CMD_SD_CANCEL,
+    PRINTERCTL_DAEMON_CMD_MACRO_EXECUTE
 } printerctl_daemon_command_type_t;
 
 typedef struct {
@@ -68,7 +71,14 @@ typedef struct {
     char path[PRINTERCTL_DAEMON_COMMAND_PATH_MAX]; /* PRINT_START only */
     char text[PRINTERCTL_DAEMON_COMMAND_TEXT_MAX]; /* RAW_SEND only */
     uint8_t axis; /* HOME only: PRINTERCTL_PLP1_HOME_* value without including protocol/ here */
+    char macro_id[PRINTERCTL_MACRO_ID_MAX]; /* MACRO_EXECUTE only */
 } printerctl_daemon_command_t;
+
+typedef enum {
+    PRINTERCTL_DAEMON_EXECUTION_KIND_NONE = 0,
+    PRINTERCTL_DAEMON_EXECUTION_KIND_PRINT,
+    PRINTERCTL_DAEMON_EXECUTION_KIND_MACRO
+} printerctl_daemon_execution_kind_t;
 
 typedef enum {
     PRINTERCTL_DAEMON_EVENT_READY = 0,
@@ -93,6 +103,7 @@ typedef struct {
                           * READY/STOPPING/STOPPED and for a FAULT not tied to
                           * one specific command */
     printerctl_daemon_result_t result;
+    printerctl_daemon_execution_kind_t execution_kind;
     uint8_t execution_state;
     uint8_t progress_percent;
     uint32_t commands_sent;
@@ -101,6 +112,10 @@ typedef struct {
     uint32_t source_position;
     uint16_t failure_reason;
     uint16_t wire_status; /* COMMAND_COMPLETED error status; 0 on success/unused */
+    char macro_id[PRINTERCTL_MACRO_ID_MAX];
+    uint32_t macro_current_step;
+    uint32_t macro_total_steps;
+    uint16_t macro_terminal_result;
     bool query_has_hotend;
     double query_hotend_actual;
     double query_hotend_target;

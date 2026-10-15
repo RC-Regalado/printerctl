@@ -238,12 +238,15 @@ static printerctl_daemon_status_t send_command_payload(
         snprintf(cmd.path, sizeof(cmd.path), "%s", path);
     }
     if (text != NULL) {
-        if (strlen(text) >= sizeof(cmd.text)) {
+        char *target = type == PRINTERCTL_DAEMON_CMD_MACRO_EXECUTE ? cmd.macro_id : cmd.text;
+        size_t target_size =
+            type == PRINTERCTL_DAEMON_CMD_MACRO_EXECUTE ? sizeof(cmd.macro_id) : sizeof(cmd.text);
+        if (strlen(text) >= target_size) {
             set_error(out_error, PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT,
-                      "command text exceeds %zu bytes", sizeof(cmd.text) - 1u);
+                      "command text exceeds %zu bytes", target_size - 1u);
             return out_error->status;
         }
-        snprintf(cmd.text, sizeof(cmd.text), "%s", text);
+        snprintf(target, target_size, "%s", text);
     }
     cmd.axis = axis;
 
@@ -391,6 +394,24 @@ printerctl_daemon_status_t printerctl_daemon_runtime_send_sd_cancel(
     return send_command(runtime, PRINTERCTL_DAEMON_CMD_SD_CANCEL, NULL, out_token, out_error);
 }
 
+printerctl_daemon_status_t printerctl_daemon_runtime_send_macro_execute(
+    printerctl_daemon_runtime_t *runtime,
+    const char *id,
+    uint32_t *out_token,
+    printerctl_daemon_error_t *out_error)
+{
+    if (id == NULL || id[0] == '\0' || strlen(id) >= PRINTERCTL_MACRO_ID_MAX) {
+        if (out_error != NULL) {
+            memset(out_error, 0, sizeof(*out_error));
+            set_error(out_error, PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT,
+                      "macro id must be non-empty and bounded");
+        }
+        return PRINTERCTL_DAEMON_ERR_INVALID_ARGUMENT;
+    }
+    return send_command_payload(runtime, PRINTERCTL_DAEMON_CMD_MACRO_EXECUTE, NULL, id, 0,
+                                out_token, out_error);
+}
+
 printerctl_daemon_status_t printerctl_daemon_runtime_wait_event(
     printerctl_daemon_runtime_t *runtime,
     printerctl_daemon_event_t *out_event,
@@ -447,6 +468,7 @@ printerctl_daemon_status_t printerctl_daemon_runtime_wait_event(
     case PRINTERCTL_DAEMON_EVENT_COMMAND_COMPLETED:
         break; /* caller correlates the token itself */
     case PRINTERCTL_DAEMON_EVENT_PRINT_UPDATE:
+        runtime->snapshot.execution_kind = out_event->execution_kind;
         runtime->snapshot.execution_state = out_event->execution_state;
         runtime->snapshot.progress_percent = out_event->progress_percent;
         runtime->snapshot.commands_sent = out_event->commands_sent;
@@ -454,6 +476,11 @@ printerctl_daemon_status_t printerctl_daemon_runtime_wait_event(
         runtime->snapshot.commands_total = out_event->commands_total;
         runtime->snapshot.source_position = out_event->source_position;
         runtime->snapshot.failure_reason = out_event->failure_reason;
+        snprintf(runtime->snapshot.macro_id, sizeof(runtime->snapshot.macro_id), "%s",
+                 out_event->macro_id);
+        runtime->snapshot.macro_current_step = out_event->macro_current_step;
+        runtime->snapshot.macro_total_steps = out_event->macro_total_steps;
+        runtime->snapshot.macro_terminal_result = out_event->macro_terminal_result;
         if (out_event->detail[0] != '\0') {
             record_runtime_error(runtime, out_event->detail);
         }

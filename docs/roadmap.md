@@ -2,10 +2,14 @@
 title: printerctl Phase 1 Roadmap
 tags: [printerctl, roadmap, phase-1, daemon, ipc]
 status: active
-updated: 2026-08-21
+updated: 2026-09-07
 ---
 
 # printerctl — Phase 1 Roadmap
+
+> Current status: Phase 2 is complete. Phase 3 — Safe Macros is active, with
+> M27 complete and M28 — Built-in Macro Execution in progress. See
+> [[phase-3-roadmap|docs/phase-3-roadmap.md]].
 
 ## 1. Purpose
 
@@ -729,7 +733,9 @@ Preserve all existing behavior:
 - no automatic extrusion;
 - no automatic emergency stop;
 - no automatic resume;
-- embedded/disallowed G28 behavior remains unchanged;
+- embedded/disallowed G28 behavior remained unchanged in Phase 1;
+  the operator-approved 2026-10-12 amendment (`Agents.md` §8) now permits
+  G28 in explicitly selected print files, while raw send still rejects it;
 - cancellation stops transmission without adding physical cleanup commands;
 - `Error:`, `Resend:`, timeout and disconnect retain their current terminal semantics.
 
@@ -882,12 +888,12 @@ After M17 is accepted, Phase 1 is complete. M17 is implemented as of
 The project then proceeds independently through:
 
 ```text
-Phase 2 — CLI Migration
+Phase 2 — CLI Migration [DONE]
 printerctl → Unix socket → printerctld
 printerctld becomes the normal exclusive serial authority
 
-Phase 3 — Job Management
-persistent job model + queue + history
+Phase 3 — Safe Macros [ACTIVE]
+daemon-owned typed macros without arbitrary G-code bypass
 
 Phase 4 — TUI
 second full client of the daemon API

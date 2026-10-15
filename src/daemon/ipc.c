@@ -76,6 +76,7 @@ static bool command_type_valid(printerctl_daemon_command_type_t type)
     case PRINTERCTL_DAEMON_CMD_SD_PAUSE:
     case PRINTERCTL_DAEMON_CMD_SD_RESUME:
     case PRINTERCTL_DAEMON_CMD_SD_CANCEL:
+    case PRINTERCTL_DAEMON_CMD_MACRO_EXECUTE:
         return true;
     }
     return false;
@@ -127,6 +128,9 @@ printerctl_daemon_ipc_status_t printerctl_daemon_ipc_read_command(
         memset(out_cmd, 0, sizeof(*out_cmd));
         return PRINTERCTL_DAEMON_IPC_ERR_MALFORMED;
     }
+    out_cmd->path[PRINTERCTL_DAEMON_COMMAND_PATH_MAX - 1] = '\0';
+    out_cmd->text[PRINTERCTL_DAEMON_COMMAND_TEXT_MAX - 1] = '\0';
+    out_cmd->macro_id[PRINTERCTL_MACRO_ID_MAX - 1] = '\0';
 
     return PRINTERCTL_DAEMON_IPC_OK;
 }
@@ -151,6 +155,7 @@ printerctl_daemon_ipc_status_t printerctl_daemon_ipc_read_event(
      * malformed-message tests below; guarantee NUL-termination within
      * bounds regardless of what was written. */
     out_event->detail[PRINTERCTL_DAEMON_EVENT_DETAIL_MAX - 1] = '\0';
+    out_event->macro_id[PRINTERCTL_MACRO_ID_MAX - 1] = '\0';
 
     return PRINTERCTL_DAEMON_IPC_OK;
 }

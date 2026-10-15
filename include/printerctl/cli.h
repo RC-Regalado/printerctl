@@ -119,9 +119,8 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * G-code file is parsed and normalized via printerctl_gcode, each command
  * that would be sent is written to `out` with its source line number and
  * progress, and no serial device is ever opened. A clean dry run exits
- * PRINTERCTL_EXIT_OK; a file containing G28 exits
- * PRINTERCTL_EXIT_SAFETY_ERROR (never confirmable from `print` in this
- * milestone); any other G-code file problem (unreadable, not a regular
+ * PRINTERCTL_EXIT_OK, including files containing G28; a G-code file
+ * problem (unreadable, not a regular
  * file, oversized line, malformed line, I/O error, file changed while
  * being read) exits PRINTERCTL_EXIT_GCODE_ERROR.
  *
@@ -140,8 +139,7 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * every whole-percent change and a session summary (final state, file,
  * commands sent/acknowledged, last acknowledged line) on every outcome.
  * Exit codes follow the same mapping as the single commands, plus
- * PRINTERCTL_EXIT_GCODE_ERROR for a file that fails mid-stream and
- * PRINTERCTL_EXIT_SAFETY_ERROR for a G28 found in the file.
+ * PRINTERCTL_EXIT_GCODE_ERROR for a file that fails mid-stream.
  *
  * As of Milestone 8, a streaming `print` is an operator-controllable
  * session: SIGUSR1 pauses after the current command's acknowledgement,
@@ -168,10 +166,10 @@ bool printerctl_cli_parse(int argc, char *const argv[],
  * so `home` executes for real as an explicit daemon-owned command
  * sending `G28`.
  * `home X`/`home Y`/`home Z` send `G28 X`/`G28 Y`/`G28 Z` to home a
- * single axis. `G28` remains refused everywhere else (`send`, and
- * inside a `print` G-code file) with PRINTERCTL_EXIT_SAFETY_ERROR, no
- * bypass: homing is only ever available through the dedicated `home`
- * command. With `home` now fully implemented, no command reaches
+ * single axis. Revised 2026-10-12: G28 is also allowed in files explicitly
+ * selected with `print FILE`, after operator verification of minimum
+ * end-stops. `send G28` remains refused with PRINTERCTL_EXIT_SAFETY_ERROR.
+ * With `home` now fully implemented, no command reaches
  * PRINTERCTL_EXIT_UNAVAILABLE in ordinary use; the fallback path
  * remains only as a defensive default.
  *

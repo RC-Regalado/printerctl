@@ -4,3 +4,11 @@
 
 *.gcode
 *.old
+
+# CAD / artefactos locales
+*.FCStd
+*.FCBak
+*.step
+*.stl
+__pycache__/
+*.pyc

@@ -17,35 +17,34 @@ operator's own command.
 
 ## 1. Homing (`G28`)
 
-Min end-stops are installed and enabled on all three axes (X, Y, Z), as
-of 2026-07-21 — see `Agents.md`'s Home amendment. This changes what is
-*safe*, but not the underlying principle (explicit action only):
+Min end-stops are installed and enabled on all three axes (X, Y, Z).
+On 2026-10-12 the operator confirmed testing them and authorized homing
+commands in explicitly selected print files (see `Agents.md` §8).
 
 - `home` sends `G28` (all axes). It requires no confirmation flag,
-  only a configured `--port` — homing is an ordinary, expected
+  only a configured daemon — homing is an ordinary, expected
   operation once end-stops exist.
 - `home X` / `home Y` / `home Z` send `G28 X` / `G28 Y` / `G28 Z` to
   home a single axis.
-- `G28` remains refused everywhere else, unconditionally, with no
-  bypass:
-  - `send "G28"` (or any command containing `G28`) exits `4`
-    (`PRINTERCTL_EXIT_SAFETY_ERROR`).
-  - A `print` G-code file containing `G28` fails before that line is
-    ever transmitted, also exit `4`.
+- `print FILE` permits `G28` and axis variants present in that file.
+  They use the same ACK-driven streaming and cancellation barrier as
+  every other source command. `--dry-run print FILE` renders them without
+  opening serial or contacting the daemon.
+- `send "G28"` remains refused with exit `4`
+  (`PRINTERCTL_EXIT_SAFETY_ERROR`); use `home` for standalone homing.
 
-The reason `G28` stays blocked in `send` and `print` even though
-homing itself is now safe: homing must always be an explicit, direct
-request through the dedicated `home` command, never an unexpected side
-effect of a raw command typed for another purpose, or of a line buried
-in a sliced file. A file that happens to contain `G28` (e.g. a start
-G-code snippet copied from another printer's profile) should fail loud
-and early, not home the printer as a surprise mid-stream.
+Review the file before selecting it for printing: a slicer's start
+G-code containing `G28` will now home the printer. This is an explicit
+file-execution policy change, not permission to generate homing at
+startup, reconnect, shutdown or power failure. The original restriction
+on G28 in print files is superseded by this operator-approved amendment.
 
 ```bash
-printerctl --port /dev/ttyUSB0 home       # G28 -- allowed
-printerctl --port /dev/ttyUSB0 home X     # G28 X -- allowed
-printerctl --port /dev/ttyUSB0 send "G28" # refused, exit 4
-printerctl --port /dev/ttyUSB0 print with-g28.gcode # refused, exit 4
+printerctl home                         # G28 -- allowed through daemon
+printerctl home X                       # G28 X -- allowed through daemon
+printerctl send "G28"                    # refused, exit 4
+printerctl --dry-run print with-g28.gcode # accepted, no hardware access
+printerctl print with-g28.gcode          # executes source G28 through daemon
 ```
 
 ## 2. Emergency stop (`M112`)
@@ -114,7 +113,7 @@ unknown, cold printer state anyway (see
 
 | Code | Meaning | Safety relevance |
 |---|---|---|
-| `4` | Safety policy rejection | `G28` via `send`/`print` (never `home`); the only code a safety gate itself produces |
+| `4` | Safety policy rejection | `G28` via `send`; G28 in selected print files is allowed |
 | `7` | Communication error | Includes a serial disconnect mid-print — always a graceful stop, never a silent one |
 | `9` | Cancelled by the operator | `SIGINT`/`SIGTERM` during `print`; nothing sent to the printer |
 | `10` | Cancelled by a power-failure signal | `SIGPWR` during `print`; nothing sent to the printer beyond stopping |

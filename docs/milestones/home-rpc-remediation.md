@@ -37,9 +37,10 @@ connection, and remains available.
 
 - `timeout_ms == 0` in the PLP client means no client-side response
   deadline.
-- Only HOME uses the no-deadline policy because Phase 2 HOME completion
-  is intentionally synchronous and bounded by daemon/Marlin terminal
-  response semantics.
+- HOME and RAW_SEND use the no-deadline policy because their completion
+  is synchronous and bounded by daemon/Marlin terminal response
+  semantics. RAW_SEND also permits slow explicit commands such as PID
+  autotuning (`M303 E0 S200 C6`).
 - Existing short RPCs keep their bounded timeout behavior.
 - `EPIPE` and `ECONNRESET` while returning a response are not daemon
   service failures when runtime/worker remain healthy.
@@ -57,7 +58,9 @@ PTY/mock tests cover:
 
 - quick HOME completion;
 - HOME duration greater than 5 seconds;
+- RAW_SEND PID autotune duration greater than 5 seconds;
 - daemon-authoritative Marlin timeout;
+- daemon-authoritative RAW_SEND Marlin timeout;
 - terminal `Error:` propagation;
 - client close/reset after `G28` transmission;
 - daemon availability after undeliverable response.

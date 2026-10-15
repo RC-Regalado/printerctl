@@ -304,9 +304,9 @@ static void write_session_record(printerctl_print_engine_t *engine, const char *
  * Best-effort total-command pre-scan (PRINT-OBS-001): a second,
  * throw-away reader pass over the same source, opened with the same
  * allow_g28 policy the real streaming pass uses (printer.c's
- * print_file_controlled() opens with allow_g28 = false), so the count
+ * print_file_controlled() opens with allow_g28 = true), so the count
  * reflects what will actually be streamed. Any non-EOF terminal status
- * (open failure, unsafe G28, malformed line, file changed mid-scan,
+ * (open failure, malformed line, file changed mid-scan,
  * ...) yields 0/unknown rather than failing the print here -- the real
  * streaming pass independently re-validates the file and is the only
  * one authorized to fail the print.
@@ -315,7 +315,7 @@ static uint64_t count_source_commands(const char *path)
 {
     printerctl_gcode_reader_t reader;
     printerctl_gcode_error_t error;
-    if (printerctl_gcode_reader_open(&reader, path, false, &error) != PRINTERCTL_GCODE_OK) {
+    if (printerctl_gcode_reader_open(&reader, path, true, &error) != PRINTERCTL_GCODE_OK) {
         return 0;
     }
 

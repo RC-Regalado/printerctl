@@ -1,6 +1,7 @@
 #include "printerctl/config.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -84,6 +85,23 @@ bool printerctl_config_parse_bool(const char *value, bool *out_value)
     return false;
 }
 
+bool printerctl_config_parse_double(const char *value, double *out_value)
+{
+    if (value[0] == '\0') {
+        return false;
+    }
+
+    errno = 0;
+    char *end_ptr = NULL;
+    double parsed = strtod(value, &end_ptr);
+    if (errno != 0 || end_ptr == value || *end_ptr != '\0' || !isfinite(parsed)) {
+        return false;
+    }
+
+    *out_value = parsed;
+    return true;
+}
+
 void printerctl_config_overrides_init(printerctl_config_overrides_t *overrides)
 {
     memset(overrides, 0, sizeof(*overrides));
@@ -97,6 +115,17 @@ void printerctl_config_set_defaults(printerctl_config_t *config)
     config->timeout_ms = PRINTERCTL_CONFIG_DEFAULT_TIMEOUT_MS;
     config->dry_run = false;
     config->verbose = false;
+}
+
+static bool parse_calibration_key(const char *key, char *field, size_t field_size)
+{
+    const char *prefix = "calibration.";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(key, prefix, prefix_len) != 0 || key[prefix_len] == '\0') {
+        return false;
+    }
+    snprintf(field, field_size, "%s", key + prefix_len);
+    return true;
 }
 
 printerctl_config_status_t printerctl_config_load_file(
@@ -119,6 +148,13 @@ printerctl_config_status_t printerctl_config_load_file(
     bool seen_timeout = false;
     bool seen_dry_run = false;
     bool seen_verbose = false;
+    bool seen_calibration_min_x = false;
+    bool seen_calibration_max_x = false;
+    bool seen_calibration_min_y = false;
+    bool seen_calibration_max_y = false;
+    bool seen_calibration_safe_z = false;
+    bool seen_calibration_xy_feedrate = false;
+    bool seen_calibration_z_feedrate = false;
 
     char line[PRINTERCTL_CONFIG_LINE_MAX];
     int line_number = 0;
@@ -242,9 +278,62 @@ printerctl_config_status_t printerctl_config_load_file(
             overrides->has_verbose = true;
             seen_verbose = true;
         } else {
-            set_error(out_error, PRINTERCTL_CONFIG_ERR_UNKNOWN_KEY, line_number,
-                       "line %d: unknown configuration key '%s'", line_number, key);
-            break;
+            char field[64];
+            double parsed;
+            bool *seen = NULL;
+            bool *has = NULL;
+            double *target = NULL;
+            if (parse_calibration_key(key, field, sizeof(field))) {
+                if (strcmp(field, "min_x") == 0) {
+                    seen = &seen_calibration_min_x;
+                    has = &overrides->has_calibration_min_x;
+                    target = &overrides->calibration_min_x;
+                } else if (strcmp(field, "max_x") == 0) {
+                    seen = &seen_calibration_max_x;
+                    has = &overrides->has_calibration_max_x;
+                    target = &overrides->calibration_max_x;
+                } else if (strcmp(field, "min_y") == 0) {
+                    seen = &seen_calibration_min_y;
+                    has = &overrides->has_calibration_min_y;
+                    target = &overrides->calibration_min_y;
+                } else if (strcmp(field, "max_y") == 0) {
+                    seen = &seen_calibration_max_y;
+                    has = &overrides->has_calibration_max_y;
+                    target = &overrides->calibration_max_y;
+                } else if (strcmp(field, "safe_z") == 0) {
+                    seen = &seen_calibration_safe_z;
+                    has = &overrides->has_calibration_safe_z;
+                    target = &overrides->calibration_safe_z;
+                } else if (strcmp(field, "xy_feedrate") == 0) {
+                    seen = &seen_calibration_xy_feedrate;
+                    has = &overrides->has_calibration_xy_feedrate;
+                    target = &overrides->calibration_xy_feedrate;
+                } else if (strcmp(field, "z_feedrate") == 0) {
+                    seen = &seen_calibration_z_feedrate;
+                    has = &overrides->has_calibration_z_feedrate;
+                    target = &overrides->calibration_z_feedrate;
+                }
+            }
+            if (target != NULL) {
+                if (*seen) {
+                    set_error(out_error, PRINTERCTL_CONFIG_ERR_DUPLICATE_KEY, line_number,
+                               "line %d: key '%s' is duplicated", line_number, key);
+                    break;
+                }
+                if (!printerctl_config_parse_double(value, &parsed)) {
+                    set_error(out_error, PRINTERCTL_CONFIG_ERR_INVALID_VALUE, line_number,
+                               "line %d: invalid numeric value '%s' for '%s'",
+                               line_number, value, key);
+                    break;
+                }
+                *target = parsed;
+                *has = true;
+                *seen = true;
+            } else {
+                set_error(out_error, PRINTERCTL_CONFIG_ERR_UNKNOWN_KEY, line_number,
+                           "line %d: unknown configuration key '%s'", line_number, key);
+                break;
+            }
         }
     }
 
@@ -292,6 +381,34 @@ void printerctl_config_apply_overrides_for_view(
     }
     if (apply_client && overrides->has_verbose) {
         config->verbose = overrides->verbose;
+    }
+    if (apply_hardware && overrides->has_calibration_min_x) {
+        config->calibration_min_x = overrides->calibration_min_x;
+        config->has_calibration_min_x = true;
+    }
+    if (apply_hardware && overrides->has_calibration_max_x) {
+        config->calibration_max_x = overrides->calibration_max_x;
+        config->has_calibration_max_x = true;
+    }
+    if (apply_hardware && overrides->has_calibration_min_y) {
+        config->calibration_min_y = overrides->calibration_min_y;
+        config->has_calibration_min_y = true;
+    }
+    if (apply_hardware && overrides->has_calibration_max_y) {
+        config->calibration_max_y = overrides->calibration_max_y;
+        config->has_calibration_max_y = true;
+    }
+    if (apply_hardware && overrides->has_calibration_safe_z) {
+        config->calibration_safe_z = overrides->calibration_safe_z;
+        config->has_calibration_safe_z = true;
+    }
+    if (apply_hardware && overrides->has_calibration_xy_feedrate) {
+        config->calibration_xy_feedrate = overrides->calibration_xy_feedrate;
+        config->has_calibration_xy_feedrate = true;
+    }
+    if (apply_hardware && overrides->has_calibration_z_feedrate) {
+        config->calibration_z_feedrate = overrides->calibration_z_feedrate;
+        config->has_calibration_z_feedrate = true;
     }
 }
 

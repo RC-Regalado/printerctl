@@ -49,7 +49,8 @@ typedef enum {
     PRINTERCTL_SERIAL_ERR_TIMEOUT,
     PRINTERCTL_SERIAL_ERR_IO,
     PRINTERCTL_SERIAL_ERR_DISCONNECTED,
-    PRINTERCTL_SERIAL_ERR_LINE_TOO_LONG
+    PRINTERCTL_SERIAL_ERR_LINE_TOO_LONG,
+    PRINTERCTL_SERIAL_INTERRUPTED
 } printerctl_serial_status_t;
 
 /*
@@ -71,6 +72,7 @@ typedef struct {
 } printerctl_serial_error_t;
 
 typedef void (*printerctl_serial_wait_hook_fn)(void *context);
+typedef bool (*printerctl_serial_interrupt_fn)(void *context);
 
 /*
  * Opens the terminal device at `path` and configures it for Marlin
@@ -166,6 +168,16 @@ printerctl_serial_status_t printerctl_serial_read_line_with_hook(
     size_t buffer_size,
     printerctl_serial_wait_hook_fn on_wait,
     void *wait_context,
+    printerctl_serial_error_t *out_error);
+
+/* Checks should_interrupt during input and bounded poll waits. An interrupted
+ * partial line is not a response; the caller must close the session. */
+printerctl_serial_status_t printerctl_serial_read_line_interruptible(
+    printerctl_serial_port_t *port,
+    char *buffer,
+    size_t buffer_size,
+    printerctl_serial_interrupt_fn should_interrupt,
+    void *context,
     printerctl_serial_error_t *out_error);
 
 /*

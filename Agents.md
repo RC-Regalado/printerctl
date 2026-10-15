@@ -198,10 +198,17 @@ X/Y/Z minimum end-stops are currently installed and dedicated `home` operations 
 
 This does not authorize implicit homing.
 
-Existing rules remain:
+Confirmed amendment (2026-10-12): the operator has tested the X/Y/Z
+minimum end-stops and authorizes G28 in explicitly selected print files.
+`print FILE` and its dry run permit G28 and axis variants. Selecting a
+file authorizes its homing commands; printerctl must not insert any.
+This supersedes the original Phase 1 restriction on sliced files.
+
+Rules that remain:
 
 - raw `send` must not gain an automatic/bypass G28 path;
-- sliced G-code print paths must retain their existing G28 restriction;
+- sliced G-code print paths must preserve ACK ordering and cancellation
+  barriers for G28 just as for other source commands;
 - daemon startup must never home;
 - reconnect/restart must never home.
 

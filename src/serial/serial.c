@@ -101,16 +101,22 @@ static printerctl_serial_status_t wait_ready_with_hook(
     short events,
     uint64_t deadline_ms,
     printerctl_serial_wait_hook_fn on_wait,
-    void *wait_context)
+    void *wait_context,
+    printerctl_serial_interrupt_fn should_interrupt,
+    void *interrupt_context)
 {
     for (;;) {
+        if (should_interrupt != NULL && should_interrupt(interrupt_context)) {
+            return PRINTERCTL_SERIAL_INTERRUPTED;
+        }
         struct pollfd pfd = {.fd = fd, .events = events, .revents = 0};
 
         int timeout = remaining_ms(deadline_ms);
         if (timeout == 0) {
             return PRINTERCTL_SERIAL_ERR_TIMEOUT;
         }
-        if (on_wait != NULL && timeout > PRINTERCTL_SERIAL_WAIT_HOOK_POLL_MS) {
+        if ((on_wait != NULL || should_interrupt != NULL) &&
+            timeout > PRINTERCTL_SERIAL_WAIT_HOOK_POLL_MS) {
             timeout = PRINTERCTL_SERIAL_WAIT_HOOK_POLL_MS;
         }
 
@@ -126,6 +132,7 @@ static printerctl_serial_status_t wait_ready_with_hook(
                 on_wait(wait_context);
                 continue;
             }
+            if (should_interrupt != NULL) continue;
             return PRINTERCTL_SERIAL_ERR_TIMEOUT;
         }
 
@@ -142,7 +149,7 @@ static printerctl_serial_status_t wait_ready_with_hook(
 
 static printerctl_serial_status_t wait_ready(int fd, short events, uint64_t deadline_ms)
 {
-    return wait_ready_with_hook(fd, events, deadline_ms, NULL, NULL);
+    return wait_ready_with_hook(fd, events, deadline_ms, NULL, NULL, NULL, NULL);
 }
 
 printerctl_serial_status_t printerctl_serial_open(
@@ -361,12 +368,14 @@ printerctl_serial_status_t printerctl_serial_read_line(
                                                 out_error);
 }
 
-printerctl_serial_status_t printerctl_serial_read_line_with_hook(
+static printerctl_serial_status_t read_line_controlled(
     printerctl_serial_port_t *port,
     char *buffer,
     size_t buffer_size,
     printerctl_serial_wait_hook_fn on_wait,
     void *wait_context,
+    printerctl_serial_interrupt_fn should_interrupt,
+    void *interrupt_context,
     printerctl_serial_error_t *out_error)
 {
     if (out_error == NULL) {
@@ -393,7 +402,13 @@ printerctl_serial_status_t printerctl_serial_read_line_with_hook(
 
     for (;;) {
         printerctl_serial_status_t ready =
-            wait_ready_with_hook(port->fd, POLLIN, deadline, on_wait, wait_context);
+            wait_ready_with_hook(port->fd, POLLIN, deadline, on_wait, wait_context,
+                                 should_interrupt, interrupt_context);
+        if (ready == PRINTERCTL_SERIAL_INTERRUPTED) {
+            buffer[length] = '\0';
+            set_error(out_error, ready, "read interrupted by caller");
+            return ready;
+        }
         if (ready == PRINTERCTL_SERIAL_ERR_TIMEOUT) {
             buffer[length] = '\0';
             set_error(out_error, ready,
@@ -456,6 +471,24 @@ printerctl_serial_status_t printerctl_serial_read_line_with_hook(
 
         buffer[length++] = c;
     }
+}
+
+printerctl_serial_status_t printerctl_serial_read_line_with_hook(
+    printerctl_serial_port_t *port, char *buffer, size_t buffer_size,
+    printerctl_serial_wait_hook_fn on_wait, void *context,
+    printerctl_serial_error_t *out_error)
+{
+    return read_line_controlled(port, buffer, buffer_size, on_wait, context,
+                                NULL, NULL, out_error);
+}
+
+printerctl_serial_status_t printerctl_serial_read_line_interruptible(
+    printerctl_serial_port_t *port, char *buffer, size_t buffer_size,
+    printerctl_serial_interrupt_fn should_interrupt, void *context,
+    printerctl_serial_error_t *out_error)
+{
+    return read_line_controlled(port, buffer, buffer_size, NULL, NULL,
+                                should_interrupt, context, out_error);
 }
 
 printerctl_serial_status_t printerctl_serial_close(

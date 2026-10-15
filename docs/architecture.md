@@ -80,7 +80,7 @@ This separation is a core architectural invariant of Phase 1.
 
 - safe file reading/normalization;
 - source/progress tracking;
-- current safety filtering such as G28 restrictions.
+- file validation and caller-selected G28 policy.
 
 ### Marlin
 
@@ -676,7 +676,12 @@ Safety takes precedence over UX, automation and recovery.
 
 Explicit commands may request actions already permitted by the existing application contract, but Phase 1 must not widen those permissions silently.
 
-In particular, existing G28 restrictions in raw send/print paths remain unchanged.
+The original Phase 1 G28 restriction on print files is superseded by
+the operator-approved 2026-10-12 amendment in `Agents.md` §8: selected
+files may contain G28, while raw send still rejects it. The dry run,
+source command pre-scan and actual streaming all permit source G28.
+The worker retains execution ownership, ACK ordering and the existing
+cancellation barrier; no implicit homing is added.
 
 ## 18. Test architecture
 

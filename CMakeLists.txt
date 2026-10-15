@@ -50,6 +50,17 @@ target_include_directories(printerctl_gcode
 
 target_link_libraries(printerctl_gcode PUBLIC m)
 
+add_library(printerctl_macro STATIC
+    src/macro/macro.c
+)
+
+target_include_directories(printerctl_macro
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_macro PUBLIC m)
+
 add_library(printerctl_marlin STATIC
     src/marlin/marlin.c
 )
@@ -124,7 +135,7 @@ target_include_directories(printerctl_daemon_worker
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
-target_link_libraries(printerctl_daemon_worker PUBLIC printerctl_daemon_ipc printerctl_core)
+target_link_libraries(printerctl_daemon_worker PUBLIC printerctl_daemon_ipc printerctl_core printerctl_macro)
 
 add_library(printerctl_daemon_runtime STATIC
     src/daemon/runtime.c
