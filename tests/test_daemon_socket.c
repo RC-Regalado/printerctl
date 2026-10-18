@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "printerctl/daemon/socket.h"
+#include "printerctl/macro.h"
 #include "printerctl/protocol/plp1.h"
 
 #include <assert.h>
@@ -428,8 +429,9 @@ static void test_version_and_status_coalesced(void)
           "decode VERSION payload");
     check(version.protocol_version == PRINTERCTL_PLP1_VERSION_1, "VERSION protocol");
     check(version.capability_bitmap ==
-              (PRINTERCTL_PLP1_CAP_PRINTER_STATUS | PRINTERCTL_PLP1_CAP_PRINT_CONTROL),
-          "VERSION exposes M16 status and print-control capabilities");
+              (PRINTERCTL_PLP1_CAP_PRINTER_STATUS | PRINTERCTL_PLP1_CAP_PRINT_CONTROL |
+               PRINTERCTL_PLP1_CAP_MACROS),
+          "VERSION exposes status, print-control and M29 macro capabilities");
 
     response_length = read_frame(client, response, sizeof(response));
     decode_response(response, response_length, &decoded);
@@ -850,6 +852,204 @@ static void test_second_print_start_maps_to_busy_over_socket(void)
     cleanup_temp_socket(socket_path, dir);
 }
 
+static void configure_calibration(printerctl_config_t *config)
+{
+    config->has_calibration_min_x = true;
+    config->has_calibration_max_x = true;
+    config->has_calibration_min_y = true;
+    config->has_calibration_max_y = true;
+    config->has_calibration_safe_z = true;
+    config->has_calibration_xy_feedrate = true;
+    config->has_calibration_z_feedrate = true;
+    config->calibration_min_x = 10.0;
+    config->calibration_max_x = 90.0;
+    config->calibration_min_y = 20.0;
+    config->calibration_max_y = 120.0;
+    config->calibration_safe_z = 5.0;
+    config->calibration_xy_feedrate = 1500.0;
+    config->calibration_z_feedrate = 300.0;
+}
+
+static printerctl_plp1_macro_list_response_t request_macro_list(int client, uint32_t request_id)
+{
+    send_empty_request(client, PRINTERCTL_PLP1_MSG_MACRO_LIST, request_id);
+    printerctl_plp1_frame_t response =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_MACRO_LIST, request_id);
+    check(response.status == PRINTERCTL_PLP1_SUCCESS, "MACRO_LIST succeeds");
+    printerctl_plp1_macro_list_response_t list;
+    printerctl_plp1_error_t plp_error;
+    check(printerctl_plp1_decode_macro_list_response(response.payload, response.payload_length,
+                                                     &list, &plp_error) == PRINTERCTL_PLP1_OK,
+          "decode MACRO_LIST response");
+    return list;
+}
+
+static const printerctl_plp1_macro_entry_t *find_macro(
+    const printerctl_plp1_macro_list_response_t *list, const char *id)
+{
+    for (uint16_t i = 0; i < list->count; i++) {
+        if (strcmp(list->entries[i].id, id) == 0) {
+            return &list->entries[i];
+        }
+    }
+    return NULL;
+}
+
+static void send_macro_run(int client, uint32_t request_id, const char *id)
+{
+    uint8_t payload[PRINTERCTL_PLP1_MACRO_ID_MAX + 2];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    check(printerctl_plp1_encode_macro_run_request(id, payload, sizeof(payload), &payload_length,
+                                                   &plp_error) == PRINTERCTL_PLP1_OK,
+          "encode MACRO_RUN payload");
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_MACRO_RUN, request_id, payload,
+                                           (uint16_t)payload_length, request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+/* M29: MACRO_LIST is answered by the control context from the registry and
+ * the daemon's start-time configuration -- zero serial I/O -- and reports
+ * executability per macro. */
+static void test_macro_list_reports_executability_without_serial(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+
+    /* Without calibration keys: registry visible, nothing executable. */
+    printerctl_daemon_runtime_t runtime;
+    printerctl_daemon_socket_server_t server;
+    start_runtime_and_socket(&runtime, &server, socket_path);
+    serve_thread_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.server = &server;
+    pthread_t thread;
+    check(pthread_create(&thread, NULL, serve_one_thread, &ctx) == 0, "serve thread starts");
+    int client = connect_client(socket_path);
+    printerctl_plp1_macro_list_response_t list = request_macro_list(client, 70);
+    check(list.count == printerctl_macro_builtin_count(), "MACRO_LIST returns every built-in");
+    for (uint16_t i = 0; i < list.count; i++) {
+        check((list.entries[i].flags & PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE) == 0 &&
+                  list.entries[i].step_count == 0,
+              "no macro is executable without calibration configuration");
+        check(list.entries[i].display_name[0] != '\0', "entries carry display names");
+    }
+    shutdown(client, SHUT_WR);
+    check(pthread_join(thread, NULL) == 0, "serve thread joins");
+    close(client);
+    stop_runtime_and_socket(&runtime, &server);
+
+    /* With calibration keys: MOVE macros executable, park still not. No
+     * serial port is configured, proving the list never opens one. */
+    printerctl_config_t config;
+    printerctl_config_set_defaults(&config);
+    configure_calibration(&config);
+    start_runtime_and_socket_with_config(&runtime, &server, socket_path, &config);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.server = &server;
+    check(pthread_create(&thread, NULL, serve_one_thread, &ctx) == 0, "serve thread starts");
+    client = connect_client(socket_path);
+    list = request_macro_list(client, 71);
+    const printerctl_plp1_macro_entry_t *lift = find_macro(&list, "maintenance-z-lift");
+    const printerctl_plp1_macro_entry_t *center = find_macro(&list, "calibrate-center");
+    const printerctl_plp1_macro_entry_t *park = find_macro(&list, "park");
+    check(lift != NULL && (lift->flags & PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE) != 0 &&
+              lift->step_count == 1,
+          "maintenance-z-lift is executable with one step");
+    check(center != NULL && (center->flags & PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE) != 0 &&
+              center->step_count == 3,
+          "calibrate-center is executable with three steps");
+    check(park != NULL && (park->flags & PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE) == 0,
+          "park remains registry metadata only");
+
+    /* MACRO_RUN rejections, all before any serial access. */
+    send_macro_run(client, 72, "no-such-macro");
+    printerctl_plp1_frame_t unknown = read_response_frame(client, PRINTERCTL_PLP1_MSG_MACRO_RUN, 72);
+    check(unknown.status == PRINTERCTL_PLP1_INVALID_ARGUMENT, "unknown macro maps to INVALID_ARGUMENT");
+    send_macro_run(client, 73, "park");
+    printerctl_plp1_frame_t park_run = read_response_frame(client, PRINTERCTL_PLP1_MSG_MACRO_RUN, 73);
+    check(park_run.status == PRINTERCTL_PLP1_INVALID_STATE,
+          "non-executable macro maps to INVALID_STATE");
+    send_macro_run(client, 74, "calibrate-center");
+    printerctl_plp1_frame_t no_port = read_response_frame(client, PRINTERCTL_PLP1_MSG_MACRO_RUN, 74);
+    check(no_port.status != PRINTERCTL_PLP1_SUCCESS && (no_port.flags & PRINTERCTL_PLP1_FLAG_ERROR),
+          "executable macro without a serial port is rejected, not accepted");
+    uint8_t bad_payload[] = {0x00, 0x00};
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_MACRO_RUN, 75, bad_payload,
+                                           sizeof(bad_payload), request, sizeof(request));
+    write_full(client, request, request_length);
+    printerctl_plp1_frame_t empty = read_response_frame(client, PRINTERCTL_PLP1_MSG_MACRO_RUN, 75);
+    check(empty.status == PRINTERCTL_PLP1_INVALID_PAYLOAD, "empty macro id maps to INVALID_PAYLOAD");
+
+    shutdown(client, SHUT_WR);
+    check(pthread_join(thread, NULL) == 0, "serve thread joins");
+    close(client);
+    stop_runtime_and_socket(&runtime, &server);
+    cleanup_temp_socket(socket_path, dir);
+}
+
+/* M29: MACRO_RUN over the socket executes through the worker; STATUS shows
+ * RUNNING immediately after acceptance and COMPLETED after the last ACK; a
+ * PRINT_START during the macro is BUSY with zero print serial writes. */
+static void test_macro_run_over_socket_executes_and_reports_status(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    char gcode_path[128];
+    write_gcode_file(gcode_path, sizeof(gcode_path), "M105\n");
+
+    mock_printer_t mock;
+    mock_open(&mock);
+    configure_calibration(&mock.config);
+
+    printerctl_daemon_runtime_t runtime;
+    printerctl_daemon_socket_server_t server;
+    start_runtime_and_socket_with_config(&runtime, &server, socket_path, &mock.config);
+    serve_thread_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.server = &server;
+    pthread_t thread;
+    check(pthread_create(&thread, NULL, serve_one_thread, &ctx) == 0, "serve thread starts");
+
+    int client = connect_client(socket_path);
+    send_macro_run(client, 80, "maintenance-z-lift");
+    printerctl_plp1_frame_t accepted =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_MACRO_RUN, 80);
+    check(accepted.status == PRINTERCTL_PLP1_SUCCESS && accepted.payload_length == 0,
+          "MACRO_RUN accepted with an empty payload");
+
+    send_status_request(client, 81, PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE);
+    printerctl_plp1_status_response_t running = read_status_response(client, 81);
+    check(running.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING,
+          "STATUS reports the accepted macro as RUNNING");
+
+    mock_expect_command(&mock, "G21\n");
+    send_print_start(client, 82, gcode_path);
+    printerctl_plp1_frame_t busy = read_response_frame(client, PRINTERCTL_PLP1_MSG_PRINT_START, 82);
+    check(busy.status == PRINTERCTL_PLP1_BUSY, "PRINT_START during a macro maps to BUSY");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G91\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 Z5.000 F300.000\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G90\n");
+    mock_reply_ok(&mock);
+
+    shutdown(client, SHUT_WR);
+    check(pthread_join(thread, NULL) == 0, "serve thread joins");
+    close(client);
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
+
+    stop_runtime_and_socket(&runtime, &server);
+    mock_close(&mock);
+    unlink(gcode_path);
+    cleanup_temp_socket(socket_path, dir);
+}
+
 int main(void)
 {
     test_ping_fragmented();
@@ -863,5 +1063,7 @@ int main(void)
     test_print_start_error_mapping_over_socket();
     test_worker_unavailable_maps_to_plp_status();
     test_second_print_start_maps_to_busy_over_socket();
+    test_macro_list_reports_executability_without_serial();
+    test_macro_run_over_socket_executes_and_reports_status();
     return 0;
 }

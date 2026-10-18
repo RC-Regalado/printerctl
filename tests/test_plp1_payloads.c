@@ -652,6 +652,139 @@ static void test_physical_command_payloads(void)
           "invalid HOME axis is rejected");
 }
 
+/* ---- M29 macro payloads ---- */
+
+static void test_macro_list_round_trip(void)
+{
+    printerctl_plp1_macro_list_response_t value;
+    memset(&value, 0, sizeof(value));
+    value.count = 2;
+    snprintf(value.entries[0].id, sizeof(value.entries[0].id), "maintenance-z-lift");
+    snprintf(value.entries[0].display_name, sizeof(value.entries[0].display_name), "Z lift");
+    snprintf(value.entries[0].description, sizeof(value.entries[0].description), "Lifts Z.");
+    value.entries[0].category = 2;
+    value.entries[0].flags = PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE;
+    value.entries[0].step_count = 1;
+    snprintf(value.entries[1].id, sizeof(value.entries[1].id), "park");
+    value.entries[1].category = 3;
+
+    uint8_t payload[2048];
+    size_t length = 0;
+    printerctl_plp1_error_t error;
+    check(printerctl_plp1_encode_macro_list_response(&value, payload, sizeof(payload), &length,
+                                                     &error) == PRINTERCTL_PLP1_OK,
+          "MACRO_LIST encodes");
+    /* count + (2+18 + 2+6 + 2+8 + 4) + (2+4 + 2 + 2 + 4) */
+    check(length == 2 + 42 + 14, "MACRO_LIST wire length is exact");
+
+    printerctl_plp1_macro_list_response_t decoded;
+    check(printerctl_plp1_decode_macro_list_response(payload, length, &decoded, &error) ==
+              PRINTERCTL_PLP1_OK,
+          "MACRO_LIST decodes");
+    check(decoded.count == 2 && strcmp(decoded.entries[0].id, "maintenance-z-lift") == 0 &&
+              strcmp(decoded.entries[0].display_name, "Z lift") == 0 &&
+              strcmp(decoded.entries[0].description, "Lifts Z.") == 0 &&
+              decoded.entries[0].category == 2 &&
+              decoded.entries[0].flags == PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE &&
+              decoded.entries[0].step_count == 1,
+          "MACRO_LIST first entry round-trips");
+    check(strcmp(decoded.entries[1].id, "park") == 0 && decoded.entries[1].display_name[0] == '\0' &&
+              decoded.entries[1].flags == 0 && decoded.entries[1].step_count == 0,
+          "MACRO_LIST second entry round-trips");
+
+    check(printerctl_plp1_decode_macro_list_response(payload, length - 1, &decoded, &error) ==
+                  PRINTERCTL_PLP1_ERR_MALFORMED &&
+              error.wire_status == PRINTERCTL_PLP1_INVALID_PAYLOAD && decoded.count == 0,
+          "truncated MACRO_LIST is INVALID_PAYLOAD and zeroes the output");
+    payload[length] = 0;
+    check(printerctl_plp1_decode_macro_list_response(payload, length + 1, &decoded, &error) ==
+              PRINTERCTL_PLP1_ERR_MALFORMED,
+          "MACRO_LIST with trailing bytes is rejected");
+
+    uint8_t too_many[2] = {0x00, (uint8_t)(PRINTERCTL_PLP1_MACRO_LIST_MAX + 1u)};
+    check(printerctl_plp1_decode_macro_list_response(too_many, sizeof(too_many), &decoded,
+                                                     &error) == PRINTERCTL_PLP1_ERR_MALFORMED,
+          "MACRO_LIST count above the maximum is rejected");
+    check(printerctl_plp1_decode_macro_list_response(NULL, 0, &decoded, &error) ==
+              PRINTERCTL_PLP1_ERR_MALFORMED,
+          "MACRO_LIST without a count is rejected");
+
+    uint8_t empty_list[2] = {0x00, 0x00};
+    check(printerctl_plp1_decode_macro_list_response(empty_list, sizeof(empty_list), &decoded,
+                                                     &error) == PRINTERCTL_PLP1_OK &&
+              decoded.count == 0,
+          "an empty MACRO_LIST is valid");
+
+    /* Reserved flag bit on the wire. */
+    uint8_t reserved[] = {0x00, 0x01, 0x00, 0x01, 'a', 0x00, 0x00, 0x00, 0x00,
+                          0x01, 0x02, 0x00, 0x00};
+    check(printerctl_plp1_decode_macro_list_response(reserved, sizeof(reserved), &decoded,
+                                                     &error) == PRINTERCTL_PLP1_ERR_MALFORMED,
+          "MACRO_LIST entry with reserved flags is rejected");
+    uint8_t empty_id[] = {0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                          0x01, 0x00, 0x00, 0x00};
+    check(printerctl_plp1_decode_macro_list_response(empty_id, sizeof(empty_id), &decoded,
+                                                     &error) == PRINTERCTL_PLP1_ERR_MALFORMED,
+          "MACRO_LIST entry with an empty id is rejected");
+
+    value.entries[1].flags = 0x80;
+    check(printerctl_plp1_encode_macro_list_response(&value, payload, sizeof(payload), &length,
+                                                     &error) == PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT,
+          "encoding reserved flags is refused");
+    value.entries[1].flags = 0;
+    value.count = PRINTERCTL_PLP1_MACRO_LIST_MAX + 1u;
+    check(printerctl_plp1_encode_macro_list_response(&value, payload, sizeof(payload), &length,
+                                                     &error) == PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT,
+          "encoding more than the maximum entries is refused");
+    value.count = 2;
+    check(printerctl_plp1_encode_macro_list_response(&value, payload, 10, &length, &error) ==
+              PRINTERCTL_PLP1_ERR_BUFFER_TOO_SMALL,
+          "MACRO_LIST encode reports a too-small buffer");
+}
+
+static void test_macro_run_request(void)
+{
+    uint8_t payload[PRINTERCTL_PLP1_MACRO_ID_MAX + 2];
+    size_t length = 0;
+    printerctl_plp1_error_t error;
+    check(printerctl_plp1_encode_macro_run_request("calibrate-center", payload, sizeof(payload),
+                                                   &length, &error) == PRINTERCTL_PLP1_OK &&
+              length == 2 + 16 && payload[0] == 0x00 && payload[1] == 16,
+          "MACRO_RUN encodes a length-prefixed id");
+    printerctl_plp1_macro_run_request_t decoded;
+    check(printerctl_plp1_decode_macro_run_request(payload, length, &decoded, &error) ==
+                  PRINTERCTL_PLP1_OK &&
+              strcmp(decoded.id, "calibrate-center") == 0,
+          "MACRO_RUN decodes");
+    check(printerctl_plp1_decode_macro_run_request(payload, length + 1, &decoded, &error) ==
+              PRINTERCTL_PLP1_ERR_MALFORMED,
+          "MACRO_RUN with trailing bytes is rejected");
+
+    uint8_t empty[] = {0x00, 0x00};
+    check(printerctl_plp1_decode_macro_run_request(empty, sizeof(empty), &decoded, &error) ==
+                  PRINTERCTL_PLP1_ERR_MALFORMED &&
+              error.wire_status == PRINTERCTL_PLP1_INVALID_PAYLOAD,
+          "MACRO_RUN with an empty id is INVALID_PAYLOAD");
+
+    char long_id[PRINTERCTL_PLP1_MACRO_ID_MAX + 1];
+    memset(long_id, 'a', sizeof(long_id) - 1);
+    long_id[sizeof(long_id) - 1] = '\0';
+    check(printerctl_plp1_encode_macro_run_request(long_id, payload, sizeof(payload), &length,
+                                                   &error) == PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT,
+          "MACRO_RUN refuses an over-length id");
+    check(printerctl_plp1_encode_macro_run_request("", payload, sizeof(payload), &length,
+                                                   &error) == PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT,
+          "MACRO_RUN refuses an empty id");
+
+    uint8_t wire_long[2 + PRINTERCTL_PLP1_MACRO_ID_MAX];
+    wire_long[0] = 0x00;
+    wire_long[1] = (uint8_t)PRINTERCTL_PLP1_MACRO_ID_MAX;
+    memset(wire_long + 2, 'b', PRINTERCTL_PLP1_MACRO_ID_MAX);
+    check(printerctl_plp1_decode_macro_run_request(wire_long, sizeof(wire_long), &decoded,
+                                                   &error) == PRINTERCTL_PLP1_ERR_MALFORMED,
+          "MACRO_RUN decode refuses an id that does not fit");
+}
+
 int main(void)
 {
     test_version_response();
@@ -674,6 +807,8 @@ int main(void)
     test_error_payload_truncating_decode();
     test_query_payloads();
     test_physical_command_payloads();
+    test_macro_list_round_trip();
+    test_macro_run_request();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

@@ -988,6 +988,68 @@ static void test_unknown_message_type(void)
           "decoding an unknown message type is rejected as UNKNOWN_MESSAGE_TYPE");
 }
 
+/* M29: MACRO_LIST/MACRO_RUN are known request/response types with
+ * structural payload rules enforced by decode_frame(). */
+static void test_macro_message_payload_rules(void)
+{
+    uint8_t buffer[64];
+    size_t length = 0;
+    printerctl_plp1_error_t error;
+    printerctl_plp1_frame_t decoded;
+    uint8_t payload[2] = {0x00, 0x00};
+
+    struct {
+        uint8_t type;
+        uint16_t flags;
+        bool with_payload;
+        bool valid;
+        const char *description;
+    } cases[] = {
+        {PRINTERCTL_PLP1_MSG_MACRO_LIST, PRINTERCTL_PLP1_FLAG_REQUEST, false, true,
+         "MACRO_LIST request without payload is valid"},
+        {PRINTERCTL_PLP1_MSG_MACRO_LIST, PRINTERCTL_PLP1_FLAG_REQUEST, true, false,
+         "MACRO_LIST request with payload is rejected"},
+        {PRINTERCTL_PLP1_MSG_MACRO_LIST, PRINTERCTL_PLP1_FLAG_RESPONSE, true, true,
+         "MACRO_LIST response with payload is valid"},
+        {PRINTERCTL_PLP1_MSG_MACRO_LIST, PRINTERCTL_PLP1_FLAG_RESPONSE, false, false,
+         "MACRO_LIST response without payload is rejected"},
+        {PRINTERCTL_PLP1_MSG_MACRO_RUN, PRINTERCTL_PLP1_FLAG_REQUEST, true, true,
+         "MACRO_RUN request with payload is valid"},
+        {PRINTERCTL_PLP1_MSG_MACRO_RUN, PRINTERCTL_PLP1_FLAG_REQUEST, false, false,
+         "MACRO_RUN request without payload is rejected"},
+        {PRINTERCTL_PLP1_MSG_MACRO_RUN, PRINTERCTL_PLP1_FLAG_RESPONSE, false, true,
+         "MACRO_RUN success response without payload is valid"},
+        {PRINTERCTL_PLP1_MSG_MACRO_RUN, PRINTERCTL_PLP1_FLAG_RESPONSE, true, false,
+         "MACRO_RUN success response with payload is rejected"},
+        {PRINTERCTL_PLP1_MSG_MACRO_RUN, PRINTERCTL_PLP1_FLAG_EVENT, false, false,
+         "MACRO_RUN as an EVENT is rejected"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        printerctl_plp1_frame_t frame;
+        memset(&frame, 0, sizeof(frame));
+        frame.version = PRINTERCTL_PLP1_VERSION_1;
+        frame.message_type = cases[i].type;
+        frame.flags = cases[i].flags;
+        frame.request_id = 9;
+        frame.status = PRINTERCTL_PLP1_SUCCESS;
+        if (cases[i].with_payload) {
+            frame.payload = payload;
+            frame.payload_length = sizeof(payload);
+        }
+        printerctl_plp1_result_t encoded =
+            printerctl_plp1_encode_frame(&frame, buffer, sizeof(buffer), &length, &error);
+        if (cases[i].valid) {
+            check(encoded == PRINTERCTL_PLP1_OK &&
+                      printerctl_plp1_decode_frame(buffer, length, &decoded, &error) ==
+                          PRINTERCTL_PLP1_OK &&
+                      decoded.message_type == cases[i].type,
+                  cases[i].description);
+        } else {
+            check(encoded != PRINTERCTL_PLP1_OK, cases[i].description);
+        }
+    }
+}
+
 /* ---- expect_no_payload ---- */
 
 static void test_expect_no_payload(void)
@@ -1030,6 +1092,7 @@ static void test_buffer_length_mismatch(void)
 
 int main(void)
 {
+    test_macro_message_payload_rules();
     test_golden_ping_request();
     test_golden_ping_response();
     test_golden_query_temp_request();

@@ -467,7 +467,7 @@ static void poll_control_commands(printerctl_print_engine_t *engine, void *conte
     }
 }
 
-static printerctl_macro_calibration_config_t macro_config_from_runtime(
+printerctl_macro_calibration_config_t printerctl_daemon_macro_calibration_config(
     const printerctl_config_t *config)
 {
     printerctl_macro_calibration_config_t macro_config;
@@ -549,22 +549,44 @@ static printerctl_print_control_t poll_macro_control_commands(void *context)
     return ctx->macro_cancel;
 }
 
+/*
+ * M28-001 / RR-002: a macro command is sent only if Marlin can parse it
+ * without loss. Coordinates are limited to |v| <= 9999.999 mm and feedrates
+ * to [0.001, 99999.999] mm/min: the longest line ("G1 X-9999.999 Y-9999.999
+ * Z-9999.999 F99999.999", 48 bytes) stays far below Marlin's default
+ * MAX_CMD_SIZE (96), and the firmware's 32-bit float keeps coordinates
+ * within one printed millimetre-thousandth (ulp < 0.001 below 16384).
+ * Non-zero values smaller than 0.001 are rejected (they would print as
+ * 0.000 or round up); -0.0 is normalized to 0. These are wire
+ * representability limits, not machine-travel limits.
+ */
+#define PRINTERCTL_MACRO_COORD_ABS_MAX 9999.999
+#define PRINTERCTL_MACRO_FEEDRATE_MAX 99999.999
+#define PRINTERCTL_MACRO_LINE_MAX 95u /* MAX_CMD_SIZE 96 minus terminator */
+
 static bool format_move_command(const printerctl_macro_step_t *step, char *out, size_t out_size)
 {
-    if (out_size < 3 || step->feedrate_mm_min < 0.001) return false;
+    if (out_size < 3 || !(step->feedrate_mm_min >= 0.001) ||
+        step->feedrate_mm_min > PRINTERCTL_MACRO_FEEDRATE_MAX)
+        return false;
     memcpy(out, "G1", 3);
     size_t used = 2;
     const char axes[] = "XYZ";
     const double values[] = {step->x, step->y, step->z};
     for (size_t i = 0; i < 3; ++i) {
         if ((step->axes & (1u << i)) == 0) continue;
-        if (values[i] != 0 && fabs(values[i]) < 0.001) return false;
-        int n = snprintf(out + used, out_size - used, " %c%.3f", axes[i], values[i]);
+        double value = values[i];
+        if (!(fabs(value) <= PRINTERCTL_MACRO_COORD_ABS_MAX)) return false;
+        if (value != 0 && fabs(value) < 0.001) return false;
+        if (value == 0) value = 0.0; /* normalizes -0.0 */
+        int n = snprintf(out + used, out_size - used, " %c%.3f", axes[i], value);
         if (n < 0 || (size_t)n >= out_size - used) return false;
         used += (size_t)n;
     }
     int n = snprintf(out + used, out_size - used, " F%.3f", step->feedrate_mm_min);
-    return n >= 0 && (size_t)n < out_size - used;
+    if (n < 0 || (size_t)n >= out_size - used) return false;
+    used += (size_t)n;
+    return used <= PRINTERCTL_MACRO_LINE_MAX;
 }
 
 static printerctl_printer_status_t execute_macro_command(worker_context_t *ctx,
@@ -587,7 +609,7 @@ static void run_macro(worker_context_t *ctx, const printerctl_daemon_command_t *
     printerctl_macro_step_t steps[PRINTERCTL_MACRO_STEPS_MAX];
     printerctl_macro_definition_t definition;
     printerctl_macro_error_t macro_error;
-    printerctl_macro_calibration_config_t macro_config = macro_config_from_runtime(&ctx->config);
+    printerctl_macro_calibration_config_t macro_config = printerctl_daemon_macro_calibration_config(&ctx->config);
     printerctl_macro_status_t macro_status =
         printerctl_macro_resolve_builtin(cmd->macro_id, &macro_config, &definition, steps,
                                          sizeof(steps) / sizeof(steps[0]), &macro_error);

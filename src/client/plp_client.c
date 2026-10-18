@@ -608,3 +608,58 @@ printerctl_client_status_t printerctl_client_print_cancel(
     return control_no_payload(client, PRINTERCTL_PLP1_MSG_PRINT_CANCEL, "PRINT_CANCEL", timeout_ms,
                               out_error);
 }
+
+printerctl_client_status_t printerctl_client_macro_list(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_plp1_macro_list_response_t *out_list,
+    printerctl_client_error_t *out_error)
+{
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, PRINTERCTL_PLP1_MSG_MACRO_LIST, NULL, 0, timeout_ms, &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_decode_macro_list_response(response.payload, response.payload_length,
+                                                   out_list, &plp_error) != PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "MACRO_LIST response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}
+
+printerctl_client_status_t printerctl_client_macro_run(
+    printerctl_client_t *client,
+    const char *id,
+    int timeout_ms,
+    printerctl_client_error_t *out_error)
+{
+    uint8_t payload[PRINTERCTL_PLP1_MACRO_ID_MAX + 2];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_encode_macro_run_request(id, payload, sizeof(payload), &payload_length,
+                                                 &plp_error) != PRINTERCTL_PLP1_OK) {
+        if (out_error != NULL) {
+            set_error(out_error, PRINTERCTL_CLIENT_ERR_INVALID_ARGUMENT, 0,
+                      "MACRO_RUN request: %s", plp_error.message);
+        }
+        return PRINTERCTL_CLIENT_ERR_INVALID_ARGUMENT;
+    }
+
+    printerctl_plp1_frame_t response;
+    printerctl_client_status_t status = printerctl_client_request(
+        client, PRINTERCTL_PLP1_MSG_MACRO_RUN, payload, (uint16_t)payload_length, timeout_ms,
+        &response, out_error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        return status;
+    }
+    if (printerctl_plp1_expect_no_payload(&response, &plp_error) != PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_CLIENT_ERR_PROTOCOL, plp_error.wire_status,
+                  "MACRO_RUN response: %s", plp_error.message);
+        return out_error->status;
+    }
+    return PRINTERCTL_CLIENT_OK;
+}

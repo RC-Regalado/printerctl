@@ -67,6 +67,9 @@
 #define PRINTERCTL_PLP1_MSG_SD_PAUSE 0x35u
 #define PRINTERCTL_PLP1_MSG_SD_RESUME 0x36u
 #define PRINTERCTL_PLP1_MSG_SD_CANCEL 0x37u
+/* M29: daemon-owned built-in macros (0x60-0x7F "future" range). */
+#define PRINTERCTL_PLP1_MSG_MACRO_LIST 0x60u
+#define PRINTERCTL_PLP1_MSG_MACRO_RUN 0x61u
 
 /* Flags (uint16 bitmap). Exactly one of REQUEST/RESPONSE/EVENT must be
  * set on any valid frame; bits 6-15 are reserved and must be 0. */
@@ -255,6 +258,7 @@ printerctl_plp1_result_t printerctl_plp1_decode_string(
 #define PRINTERCTL_PLP1_CAP_JOB_QUEUE 0x00000008u     /* reserved/future */
 #define PRINTERCTL_PLP1_CAP_HISTORY 0x00000010u       /* reserved/future */
 #define PRINTERCTL_PLP1_CAP_MULTI_PRINTER 0x00000020u /* reserved/future */
+#define PRINTERCTL_PLP1_CAP_MACROS 0x00000040u        /* M29: MACRO_LIST/MACRO_RUN */
 
 typedef struct {
     uint8_t protocol_version;
@@ -518,6 +522,70 @@ printerctl_plp1_result_t printerctl_plp1_encode_home_request(
 printerctl_plp1_result_t printerctl_plp1_decode_home_request(
     const uint8_t *payload, size_t payload_length,
     printerctl_plp1_home_request_t *out_value,
+    printerctl_plp1_error_t *out_error);
+
+/*
+ * M29 macros. MACRO_LIST request: no payload. Response payload:
+ *
+ *   uint16 count                     (0..PRINTERCTL_PLP1_MACRO_LIST_MAX)
+ *   count x {
+ *     string id                      (non-empty, < PRINTERCTL_PLP1_MACRO_ID_MAX)
+ *     string display_name            (< PRINTERCTL_PLP1_MACRO_NAME_MAX)
+ *     string description             (< PRINTERCTL_PLP1_MACRO_DESCRIPTION_MAX)
+ *     uint8  category                (macro.h category value, informative)
+ *     uint8  flags                   (PRINTERCTL_PLP1_MACRO_FLAG_*; others reserved = 0)
+ *     uint16 step_count              (0 unless EXECUTABLE)
+ *   }
+ *
+ * MACRO_RUN request payload: string id (non-empty). Success response: no
+ * payload; acceptance means the worker owns the execution -- clients observe
+ * its progress and terminal result through STATUS, exactly like a print.
+ */
+#define PRINTERCTL_PLP1_MACRO_ID_MAX 64u
+#define PRINTERCTL_PLP1_MACRO_NAME_MAX 96u
+#define PRINTERCTL_PLP1_MACRO_DESCRIPTION_MAX 256u
+#define PRINTERCTL_PLP1_MACRO_LIST_MAX 32u
+
+/* The daemon's configuration resolves and validates the complete definition. */
+#define PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE 0x01u
+#define PRINTERCTL_PLP1_MACRO_FLAG_KNOWN_MASK 0x01u
+
+typedef struct {
+    char id[PRINTERCTL_PLP1_MACRO_ID_MAX];
+    char display_name[PRINTERCTL_PLP1_MACRO_NAME_MAX];
+    char description[PRINTERCTL_PLP1_MACRO_DESCRIPTION_MAX];
+    uint8_t category;
+    uint8_t flags;
+    uint16_t step_count;
+} printerctl_plp1_macro_entry_t;
+
+typedef struct {
+    uint16_t count;
+    printerctl_plp1_macro_entry_t entries[PRINTERCTL_PLP1_MACRO_LIST_MAX];
+} printerctl_plp1_macro_list_response_t;
+
+typedef struct {
+    char id[PRINTERCTL_PLP1_MACRO_ID_MAX];
+} printerctl_plp1_macro_run_request_t;
+
+printerctl_plp1_result_t printerctl_plp1_encode_macro_list_response(
+    const printerctl_plp1_macro_list_response_t *value,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_decode_macro_list_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_macro_list_response_t *out_value,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_encode_macro_run_request(
+    const char *id,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error);
+
+printerctl_plp1_result_t printerctl_plp1_decode_macro_run_request(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_macro_run_request_t *out_value,
     printerctl_plp1_error_t *out_error);
 
 /*

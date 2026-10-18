@@ -2,6 +2,9 @@
 
 #include "printerctl/daemon/socket.h"
 
+#include "printerctl/daemon/worker.h"
+#include "printerctl/macro.h"
+
 #include "printerctl/protocol/plp1.h"
 #include "printerctl/protocol/plp1_parser.h"
 
@@ -414,6 +417,117 @@ static printerctl_daemon_socket_status_t send_physical_success(
                       (uint16_t)payload_length, out_error);
 }
 
+_Static_assert(PRINTERCTL_PLP1_MACRO_ID_MAX == PRINTERCTL_MACRO_ID_MAX,
+               "PLP/1 macro id bound must match the macro domain");
+_Static_assert(PRINTERCTL_PLP1_MACRO_NAME_MAX == PRINTERCTL_MACRO_DISPLAY_NAME_MAX,
+               "PLP/1 macro name bound must match the macro domain");
+_Static_assert(PRINTERCTL_PLP1_MACRO_DESCRIPTION_MAX == PRINTERCTL_MACRO_DESCRIPTION_MAX,
+               "PLP/1 macro description bound must match the macro domain");
+
+/*
+ * M29 MACRO_LIST: answered entirely by the control context from the
+ * immutable built-in registry and the daemon's start-time configuration.
+ * Resolution is a pure function (no worker command, no serial I/O), so
+ * listing never contends with an active print or macro.
+ */
+static printerctl_daemon_socket_status_t send_macro_list(
+    printerctl_daemon_socket_server_t *server, int client_fd,
+    const printerctl_plp1_frame_t *request, printerctl_daemon_socket_error_t *out_error)
+{
+    size_t count = printerctl_macro_builtin_count();
+    if (count > PRINTERCTL_PLP1_MACRO_LIST_MAX) {
+        return send_error_response(client_fd, request, PRINTERCTL_PLP1_INTERNAL_ERROR, out_error);
+    }
+
+    const printerctl_config_t *config = printerctl_daemon_runtime_config(server->runtime);
+    printerctl_macro_calibration_config_t calibration =
+        printerctl_daemon_macro_calibration_config(config);
+
+    printerctl_plp1_macro_list_response_t value;
+    memset(&value, 0, sizeof(value));
+    for (size_t i = 0; i < count; i++) {
+        const printerctl_macro_definition_t *definition = printerctl_macro_builtin_at(i);
+        if (definition == NULL) {
+            return send_error_response(client_fd, request, PRINTERCTL_PLP1_INTERNAL_ERROR,
+                                       out_error);
+        }
+        printerctl_plp1_macro_entry_t *entry = &value.entries[value.count++];
+        snprintf(entry->id, sizeof(entry->id), "%s", definition->id);
+        snprintf(entry->display_name, sizeof(entry->display_name), "%s",
+                 definition->display_name);
+        snprintf(entry->description, sizeof(entry->description), "%s",
+                 definition->description);
+        entry->category = (uint8_t)definition->category;
+
+        printerctl_macro_step_t steps[PRINTERCTL_MACRO_STEPS_MAX];
+        printerctl_macro_definition_t resolved;
+        printerctl_macro_error_t macro_error;
+        if (printerctl_macro_resolve_builtin(definition->id, &calibration, &resolved, steps,
+                                             sizeof(steps) / sizeof(steps[0]),
+                                             &macro_error) == PRINTERCTL_MACRO_OK) {
+            entry->flags |= PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE;
+            entry->step_count = resolved.step_count > UINT16_MAX ? UINT16_MAX
+                                                                 : (uint16_t)resolved.step_count;
+        }
+    }
+
+    uint8_t payload[2 + PRINTERCTL_PLP1_MACRO_LIST_MAX *
+                            (6 + PRINTERCTL_PLP1_MACRO_ID_MAX + PRINTERCTL_PLP1_MACRO_NAME_MAX +
+                             PRINTERCTL_PLP1_MACRO_DESCRIPTION_MAX + 4)];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_encode_macro_list_response(&value, payload, sizeof(payload),
+                                                   &payload_length, &plp_error) !=
+        PRINTERCTL_PLP1_OK) {
+        set_error(out_error, PRINTERCTL_DAEMON_SOCKET_ERR_PROTOCOL, "encode MACRO_LIST payload: %s",
+                  plp_error.message);
+        return out_error->status;
+    }
+    return send_frame(client_fd, PRINTERCTL_PLP1_MSG_MACRO_LIST, PRINTERCTL_PLP1_FLAG_RESPONSE,
+                      request->request_id, PRINTERCTL_PLP1_SUCCESS, payload,
+                      (uint16_t)payload_length, out_error);
+}
+
+/*
+ * M29 MACRO_RUN: the control context only forwards the stable id to the
+ * worker, which resolves, validates, formats every command and checks
+ * execution ownership before the first serial write (M28). Success means
+ * the worker accepted and owns the execution; progress and the terminal
+ * result are published through the snapshot (STATUS).
+ */
+static printerctl_daemon_socket_status_t handle_macro_run(
+    printerctl_daemon_socket_server_t *server, int client_fd,
+    const printerctl_plp1_frame_t *request, printerctl_daemon_socket_error_t *out_error)
+{
+    printerctl_plp1_macro_run_request_t run;
+    printerctl_plp1_error_t plp_error;
+    if (printerctl_plp1_decode_macro_run_request(request->payload, request->payload_length, &run,
+                                                 &plp_error) != PRINTERCTL_PLP1_OK) {
+        return send_error_response(client_fd, request, PRINTERCTL_PLP1_INVALID_PAYLOAD, out_error);
+    }
+
+    uint32_t token = 0;
+    printerctl_daemon_error_t runtime_error;
+    if (printerctl_daemon_runtime_send_macro_execute(server->runtime, run.id, &token,
+                                                     &runtime_error) != PRINTERCTL_DAEMON_OK) {
+        return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                   out_error);
+    }
+    printerctl_daemon_event_t event;
+    if (printerctl_daemon_runtime_wait_command(server->runtime, token, &event, &runtime_error) !=
+        PRINTERCTL_DAEMON_OK) {
+        return send_error_response(client_fd, request, PRINTERCTL_PLP1_WORKER_UNAVAILABLE,
+                                   out_error);
+    }
+    if (event.result != PRINTERCTL_DAEMON_RESULT_OK) {
+        uint16_t status =
+            event.wire_status != 0 ? event.wire_status : PRINTERCTL_PLP1_INTERNAL_ERROR;
+        return send_error_response(client_fd, request, status, out_error);
+    }
+    return send_frame(client_fd, PRINTERCTL_PLP1_MSG_MACRO_RUN, PRINTERCTL_PLP1_FLAG_RESPONSE,
+                      request->request_id, PRINTERCTL_PLP1_SUCCESS, NULL, 0, out_error);
+}
+
 static printerctl_daemon_socket_status_t handle_frame(
     printerctl_daemon_socket_server_t *server, int client_fd,
     const printerctl_plp1_frame_t *request, printerctl_daemon_socket_error_t *out_error)
@@ -434,8 +548,8 @@ static printerctl_daemon_socket_status_t handle_frame(
         size_t payload_length = 0;
         printerctl_plp1_version_response_t value;
         value.protocol_version = PRINTERCTL_PLP1_VERSION_1;
-        value.capability_bitmap =
-            PRINTERCTL_PLP1_CAP_PRINTER_STATUS | PRINTERCTL_PLP1_CAP_PRINT_CONTROL;
+        value.capability_bitmap = PRINTERCTL_PLP1_CAP_PRINTER_STATUS |
+                                  PRINTERCTL_PLP1_CAP_PRINT_CONTROL | PRINTERCTL_PLP1_CAP_MACROS;
 
         printerctl_plp1_error_t plp_error;
         if (printerctl_plp1_encode_version_response(&value, payload, sizeof(payload),
@@ -643,6 +757,14 @@ static printerctl_daemon_socket_status_t handle_frame(
             return send_error_response(client_fd, request, status, out_error);
         }
         return send_physical_success(client_fd, request, &event, out_error);
+    }
+
+    if (request->message_type == PRINTERCTL_PLP1_MSG_MACRO_LIST) {
+        return send_macro_list(server, client_fd, request, out_error);
+    }
+
+    if (request->message_type == PRINTERCTL_PLP1_MSG_MACRO_RUN) {
+        return handle_macro_run(server, client_fd, request, out_error);
     }
 
     return send_error_response(client_fd, request, PRINTERCTL_PLP1_INVALID_STATE, out_error);

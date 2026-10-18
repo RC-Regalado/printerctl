@@ -576,6 +576,12 @@ printerctl_daemon_status_t printerctl_daemon_runtime_drain_events(
     }
 }
 
+const printerctl_config_t *printerctl_daemon_runtime_config(
+    const printerctl_daemon_runtime_t *runtime)
+{
+    return runtime != NULL ? &runtime->worker_args.config : NULL;
+}
+
 int printerctl_daemon_runtime_event_fd(const printerctl_daemon_runtime_t *runtime)
 {
     return runtime != NULL ? runtime->event_pipe[0] : -1;

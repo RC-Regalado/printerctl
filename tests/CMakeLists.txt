@@ -14,6 +14,14 @@ target_link_libraries(printerctl_config_tests PRIVATE printerctl_config)
 
 add_test(NAME printerctl_config_tests COMMAND printerctl_config_tests)
 
+add_executable(printerctl_prusa_import_tests
+    test_prusa_import.c
+)
+
+target_link_libraries(printerctl_prusa_import_tests PRIVATE printerctl_prusa_import printerctl_config m)
+
+add_test(NAME printerctl_prusa_import_tests COMMAND printerctl_prusa_import_tests)
+
 add_executable(printerctl_gcode_tests
     test_gcode.c
 )
@@ -175,3 +183,19 @@ target_compile_definitions(printerctl_build_boundary_tests
 add_dependencies(printerctl_build_boundary_tests printerctl)
 
 add_test(NAME printerctl_build_boundary_tests COMMAND printerctl_build_boundary_tests)
+
+add_library(printerctl_test_prescan_hold SHARED prescan_hold.c)
+target_link_libraries(printerctl_test_prescan_hold PRIVATE ${CMAKE_DL_LIBS})
+# This loader shim must run before the instrumented daemon initializes ASan.
+target_compile_options(printerctl_test_prescan_hold PRIVATE -fno-sanitize=all)
+target_link_options(printerctl_test_prescan_hold PRIVATE -fno-sanitize=all)
+
+add_executable(printerctl_print_observer_tests test_print_observer.c)
+target_compile_definitions(printerctl_print_observer_tests PRIVATE
+    TEST_PRINTERCTLD_PATH="$<TARGET_FILE:printerctld>"
+    TEST_PRINTERCTL_PATH="$<TARGET_FILE:printerctl>")
+target_link_libraries(printerctl_print_observer_tests PRIVATE printerctl_protocol_plp1 ${CMAKE_DL_LIBS})
+add_dependencies(printerctl_print_observer_tests printerctld printerctl printerctl_test_prescan_hold)
+add_test(NAME printerctl_print_observer_tests COMMAND printerctl_print_observer_tests
+    $<TARGET_FILE:printerctl_test_prescan_hold>)
+set_tests_properties(printerctl_print_observer_tests PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)

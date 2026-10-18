@@ -20,13 +20,14 @@ primary verification method.
 
 ## Test binaries
 
-Twenty independent CMake/ctest targets, one per module plus integration
+Independent CMake/ctest targets, one per module plus integration
 suites:
 
 | Binary | Covers |
 |---|---|
 | `printerctl_tests` | CLI grammar, configuration precedence, logging integration, and end-to-end command execution against forked mock printers (`tests/test_cli.c`) |
 | `printerctl_config_tests` | Configuration resolution: defaults, `--config` file, CLI overrides, owner-aware views, precedence, validation |
+| `printerctl_prusa_import_tests` | M29 PrusaSlicer import: printer profile and sliced G-code configuration block, inset/safe_z options, slowest-speed rule, rejections (bundles, binary G-code, missing/zero values), round trip through the config loader |
 | `printerctl_gcode_tests` | G-code file reading: normalization, comment/blank-line stripping, progress, malformed/oversized lines, `G28` detection |
 | `printerctl_macro_tests` | M27/M28 macro domain: typed definitions, validation, config-backed built-in resolution, duplicate IDs and deterministic iteration without serial/daemon execution |
 | `printerctl_marlin_tests` | Marlin response classification and parsing: `ok`, `Error:`, `busy:`, `echo:`, `Resend:`, temperature/position/firmware-info reports |
@@ -45,6 +46,7 @@ suites:
 | `printerctld_tests` | Daemon executable smoke/config/CLI-migration test: fork `printerctld`, connect through PLP/1, validate `PING`, terminate with `SIGTERM`, load valid daemon config, reject invalid daemon config, and cover M20/M21 CLI-to-daemon commands over PTY |
 | `printerctl_daemon_print_tests` | Milestone 16 daemon print integration and M28 macro execution: worker-owned print engine, worker-owned typed MOVE macro execution, pseudo-terminal Marlin, PRINT/MACRO exclusion, error/timeout behavior and liveness |
 | `printerctl_build_boundary_tests` | Milestone 25 build/dependency gate: runs `nm` on the real, linked `printerctl` executable and fails if any `printerctl_serial`/`printerctl_printer`/`printerctl_marlin`/`printerctl_core` (print_engine) symbol appears in it |
+| `printerctl_print_observer_tests` | UX-001 process regression: delayed source pre-scan after previous COMPLETED/FAILED/CANCELLED; observer remains attached through the first ACK and reports only the current execution's completion |
 
 Run all of them:
 
@@ -75,6 +77,17 @@ sent, and verifies that the final source command count includes homing.
 Existing raw-send rejection remains. PRINT_CANCEL, SIGTERM and SIGPWR
 ACK-window tests now place G28 next in the source and verify that
 cancellation prevents it from being transmitted.
+
+`printerctl_print_observer_tests` uses a test-only loader shim
+(`tests/prescan_hold.c`) to hold a regular source file at its first pre-scan
+open. Two pipes synchronize entry and release; production code has no test
+hooks. The shim is not sanitizer-instrumented because it interposes loader
+I/O; the daemon and test executable remain instrumented. For ASan the test
+prepends the already loaded shared ASan runtime before the shim, preserving
+normal runtime checks. This test requires Linux/POSIX dynamic loading and a
+shared ASan runtime for ASan builds; static ASan linkage is not supported by
+this particular harness. CTest runs it serially, and a failed assertion
+kills its child processes so they cannot hold CTest output open.
 
 ## Test patterns
 
@@ -178,3 +191,17 @@ setup beyond a C17 compiler, CMake >= 3.16, and the standard POSIX/
 binutils tools the test suites use (`posix_openpt` and friends, already
 part of glibc on the project's Linux target, plus `nm` for the M25
 build-boundary gate).
+
+## Running the suite locally
+
+Run CTest with a short `TMPDIR` (for example `TMPDIR=/tmp`): socket tests
+create `AF_UNIX` paths under it and a long temporary directory exceeds the
+108-byte `sun_path` limit, which makes them hang. Several process tests use
+the default socket `/tmp/printerctl.sock`; stop any real `printerctld` first,
+or isolate `/tmp`:
+
+```bash
+bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs /tmp \
+  --bind "$PWD" "$PWD" --unshare-pid --die-with-parent \
+  env TMPDIR=/tmp ctest --test-dir build --timeout 180
+```

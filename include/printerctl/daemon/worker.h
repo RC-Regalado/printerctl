@@ -3,6 +3,7 @@
 
 #include "printerctl/daemon/ipc.h"
 #include "printerctl/config.h"
+#include "printerctl/macro.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -60,6 +61,15 @@ typedef struct {
 } printerctl_daemon_worker_args_t;
 
 void printerctl_daemon_worker_reset_signal_requests(void);
+
+/*
+ * Pure projection of the daemon configuration's optional calibration.*
+ * keys onto the macro domain's calibration view (M28). Used by the
+ * worker before executing a macro and, read-only, by the control
+ * context to report MACRO_LIST executability (M29).
+ */
+printerctl_macro_calibration_config_t printerctl_daemon_macro_calibration_config(
+    const printerctl_config_t *config);
 void printerctl_daemon_worker_request_cancel_from_signal(void);
 void printerctl_daemon_worker_request_power_failure_from_signal(void);
 

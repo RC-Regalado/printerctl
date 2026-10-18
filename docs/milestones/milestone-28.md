@@ -2,7 +2,14 @@
 
 ## Status
 
-IN PROGRESS
+ACCEPTED — operator approval of the remediation on 2026-10-18. Findings of `docs/audit/m28-review.md` closed
+in `docs/audit/m28-remediation.md`; the re-review (`docs/audit/m28-re-review.md`)
+returned APPROVE WITH REQUIRED FIXES, addressed in the remediation addendum.
+The 2026-10-15 completion validation in `docs/audit/m28-remediation.md`
+records passing regression gates, including five consecutive sanitizer daemon
+runs and the controlled UX-001 process regression. The operator approval is
+recorded in that report; it is not a new independent technical review and
+does not accept the separate M29 work.
 
 ## Summary
 
@@ -41,9 +48,8 @@ operations or CLI macro UX.
 
 - Absolute XY calibration movement assumes the operator has established valid
   coordinates. M28 does not add homed-state tracking.
-- Macro control is internal only until M29/M30 add protocol and CLI surfaces.
+- Macro control was internal only in M28; M29 adds the protocol and CLI surfaces.
 
 ## Next steps
 
-- Review M28.
-- Do not start M29 until M28 is accepted.
+- M29: public macro surface (see `docs/milestones/milestone-29.md`).

@@ -1,7 +1,9 @@
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE
+#define _GNU_SOURCE
 
 #include "printerctl/daemon/runtime.h"
+#include "printerctl/daemon/worker.h"
 #include "printerctl/printer.h"
 #include "printerctl/protocol/plp1.h"
 
@@ -9,6 +11,8 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <poll.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -206,6 +210,7 @@ static void test_macro_z_lift_executes_typed_relative_move(void)
     printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "maintenance-z-lift");
     check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted");
 
+    expect_ack(&mock, "G21\n");
     expect_ack(&mock, "G91\n");
     expect_ack(&mock, "G1 Z5.000 F300.000\n");
     expect_ack(&mock, "G90\n");
@@ -228,6 +233,7 @@ static void test_macro_front_left_calibration_sequence(void)
     printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "calibrate-front-left");
     check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "calibration macro accepted");
 
+    expect_ack(&mock, "G21\n");
     expect_ack(&mock, "G91\n");
     expect_ack(&mock, "G1 Z5.000 F300.000\n");
     expect_ack(&mock, "G90\n");
@@ -254,6 +260,7 @@ static void run_calibration_point_case(const char *id, const char *expected_xy)
     printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, id);
     check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "calibration macro accepted");
 
+    expect_ack(&mock, "G21\n");
     expect_ack(&mock, "G91\n");
     expect_ack(&mock, "G1 Z5.000 F300.000\n");
     expect_ack(&mock, "G90\n");
@@ -317,6 +324,7 @@ static void test_macro_excludes_print_without_print_serial_side_effects(void)
     start_runtime(&runtime, &mock.config);
     printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "maintenance-z-lift");
     check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted");
+    expect_ack(&mock, "G21\n");
     mock_expect_command(&mock, "G91\n");
 
     uint32_t token = 0;
@@ -352,6 +360,7 @@ static void test_macro_error_stops_future_steps_without_cleanup(void)
     printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "calibrate-front-left");
     check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted");
 
+    expect_ack(&mock, "G21\n");
     expect_ack(&mock, "G91\n");
     expect_ack(&mock, "G1 Z5.000 F300.000\n");
     expect_ack(&mock, "G90\n");
@@ -383,6 +392,7 @@ static void test_macro_timeout_stops_future_steps_and_daemon_survives(void)
     printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "calibrate-front-left");
     check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted");
 
+    expect_ack(&mock, "G21\n");
     expect_ack(&mock, "G91\n");
     expect_ack(&mock, "G1 Z5.000 F300.000\n");
     mock_expect_command(&mock, "G90\n");
@@ -675,6 +685,356 @@ static void test_printer_faults_surface_failed_state(void)
     run_fault_case(NULL, PRINTERCTL_PLP1_PRINTER_TIMEOUT);
 }
 
+/* M28-003 regression: a prior explicit G20 must not leave a macro moving
+ * in inches -- the worker establishes G21 and gets its terminal response
+ * before the first coordinate-mode or motion command. */
+static void test_macro_establishes_millimeters_after_inch_mode(void)
+{
+    mock_printer_t mock;
+    mock_open(&mock);
+    configure_calibration(&mock.config);
+
+    printerctl_daemon_runtime_t runtime;
+    start_runtime(&runtime, &mock.config);
+
+    uint32_t token = 0;
+    printerctl_daemon_error_t error;
+    check(printerctl_daemon_runtime_send_raw_send(&runtime, "G20", &token, &error) ==
+              PRINTERCTL_DAEMON_OK,
+          "send RAW_SEND G20");
+    expect_ack(&mock, "G20\n");
+    printerctl_daemon_event_t raw;
+    check(printerctl_daemon_runtime_wait_command(&runtime, token, &raw, &error) ==
+              PRINTERCTL_DAEMON_OK && raw.result == PRINTERCTL_DAEMON_RESULT_OK,
+          "G20 precondition acknowledged");
+
+    printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "maintenance-z-lift");
+    check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted after G20");
+    expect_ack(&mock, "G21\n");
+    expect_ack(&mock, "G91\n");
+    expect_ack(&mock, "G1 Z5.000 F300.000\n");
+    expect_ack(&mock, "G90\n");
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
+    mock_expect_no_command(&mock, "macro after G20");
+
+    printerctl_daemon_runtime_shutdown(&runtime, &error);
+    mock_close(&mock);
+}
+
+/* M28-003: a G21 failure must prevent every subsequent move. */
+static void test_macro_unit_mode_failure_prevents_motion(void)
+{
+    mock_printer_t mock;
+    mock_open(&mock);
+    configure_calibration(&mock.config);
+
+    printerctl_daemon_runtime_t runtime;
+    start_runtime(&runtime, &mock.config);
+    printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "calibrate-front-left");
+    check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted");
+
+    mock_expect_command(&mock, "G21\n");
+    mock_reply(&mock, "Error: unknown command\n");
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_FAILED);
+    mock_expect_no_command(&mock, "G21 failure");
+
+    printerctl_daemon_snapshot_t snapshot;
+    printerctl_daemon_runtime_snapshot(&runtime, &snapshot);
+    check(snapshot.macro_current_step == 0, "no macro step completed after G21 failure");
+    check(snapshot.failure_reason == PRINTERCTL_PLP1_PRINTER_ERROR,
+          "G21 failure maps to printer error");
+
+    printerctl_daemon_error_t error;
+    printerctl_daemon_runtime_shutdown(&runtime, &error);
+    mock_close(&mock);
+}
+
+/* M28-001 regression: finite but unrepresentable values (and positive
+ * feedrates that would round to F0.000) are rejected while formatting the
+ * complete command list, before the serial port is opened -- zero TX. */
+static void run_unrepresentable_macro_case(double min_xy, double max_xy, double xy_feedrate,
+                                           const char *context)
+{
+    mock_printer_t mock;
+    mock_open(&mock);
+    configure_calibration(&mock.config);
+    mock.config.calibration_min_x = min_xy;
+    mock.config.calibration_min_y = min_xy;
+    mock.config.calibration_max_x = max_xy;
+    mock.config.calibration_max_y = max_xy;
+    mock.config.calibration_xy_feedrate = xy_feedrate;
+
+    printerctl_daemon_runtime_t runtime;
+    start_runtime(&runtime, &mock.config);
+    printerctl_daemon_event_t result = send_and_wait_macro(&runtime, "calibrate-front-left");
+    check(result.result == PRINTERCTL_DAEMON_RESULT_ERROR, context);
+    check(result.wire_status == PRINTERCTL_PLP1_INVALID_ARGUMENT,
+          "unrepresentable macro maps to INVALID_ARGUMENT");
+    mock_expect_no_command(&mock, context);
+
+    printerctl_daemon_snapshot_t snapshot;
+    printerctl_daemon_runtime_snapshot(&runtime, &snapshot);
+    check(snapshot.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_IDLE,
+          "rejected macro never becomes the active execution");
+
+    printerctl_daemon_error_t error;
+    printerctl_daemon_runtime_shutdown(&runtime, &error);
+    mock_close(&mock);
+}
+
+static void test_macro_unrepresentable_values_have_zero_serial_side_effects(void)
+{
+    run_unrepresentable_macro_case(1e200, 2e200, 1500.0, "extreme coordinates rejected");
+    run_unrepresentable_macro_case(-2e200, -1e200, 1500.0, "extreme negative coordinates rejected");
+    run_unrepresentable_macro_case(10.0, 90.0, 0.0004, "feedrate rounding to F0.000 rejected");
+    /* RR-002: finite values that would exceed Marlin's command buffer or
+     * lose precision in its 32-bit float are rejected too. */
+    run_unrepresentable_macro_case(-1e100, 10.0, 1500.0, "huge coordinate rejected");
+    run_unrepresentable_macro_case(-10000.0, 10.0, 1500.0, "coordinate beyond 9999.999 rejected");
+    run_unrepresentable_macro_case(10.0, 90.0, 100000.0, "feedrate above 99999.999 rejected");
+    run_unrepresentable_macro_case(0.0004, 90.0, 1500.0,
+                                   "non-zero coordinate rounding to 0.000 rejected");
+}
+
+/* RR-002: the representability limits are inclusive and -0.0 is sent as 0. */
+static void test_macro_boundary_values_are_sent_exactly(void)
+{
+    mock_printer_t mock;
+    mock_open(&mock);
+    configure_calibration(&mock.config);
+    mock.config.calibration_min_x = -0.0;
+    mock.config.calibration_min_y = -9999.999;
+    mock.config.calibration_max_x = 9999.999;
+    mock.config.calibration_xy_feedrate = 99999.999;
+
+    printerctl_daemon_runtime_t runtime;
+    start_runtime(&runtime, &mock.config);
+    printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "calibrate-front-left");
+    check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "boundary macro accepted");
+    expect_ack(&mock, "G21\n");
+    expect_ack(&mock, "G91\n");
+    expect_ack(&mock, "G1 Z5.000 F300.000\n");
+    expect_ack(&mock, "G90\n");
+    expect_ack(&mock, "G1 X0.000 Y-9999.999 F99999.999\n");
+    expect_ack(&mock, "G91\n");
+    expect_ack(&mock, "G1 Z-5.000 F300.000\n");
+    expect_ack(&mock, "G90\n");
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
+
+    printerctl_daemon_error_t error;
+    printerctl_daemon_runtime_shutdown(&runtime, &error);
+    mock_close(&mock);
+}
+
+/* RR-003: each async-signal-safe cancellation flag (set by printerctld's
+ * signal handlers) is observed by a macro during its ACK wait even when no
+ * internal command accompanies it. */
+static void test_macro_signal_flag_during_ack_wait(bool power_failure)
+{
+    mock_printer_t mock;
+    mock_open(&mock);
+    configure_calibration(&mock.config);
+
+    printerctl_daemon_runtime_t runtime;
+    start_runtime(&runtime, &mock.config);
+    printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "calibrate-front-left");
+    check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted");
+    expect_ack(&mock, "G21\n");
+    mock_expect_command(&mock, "G91\n"); /* ACK held */
+
+    if (power_failure)
+        printerctl_daemon_worker_request_power_failure_from_signal();
+    else
+        printerctl_daemon_worker_request_cancel_from_signal();
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED);
+    mock_reply_ok(&mock);
+    mock_expect_no_command(&mock, "macro signal flag");
+
+    printerctl_daemon_snapshot_t snapshot;
+    printerctl_daemon_runtime_snapshot(&runtime, &snapshot);
+    check(snapshot.failure_reason == (power_failure ? PRINTERCTL_PLP1_SHUTTING_DOWN : 0),
+          "signal-flag cancellation distinguishes power failure and normal stop");
+
+    printerctl_daemon_error_t error;
+    printerctl_daemon_runtime_shutdown(&runtime, &error);
+    mock_close(&mock);
+}
+
+/* M28-002 regression: a power-failure intent delivered while the worker
+ * waits for a macro command's ACK stops the macro inside that ACK window:
+ * no further command is transmitted, even after the held ACK arrives. */
+static void test_macro_power_failure_during_ack_wait_stops_future_steps(void)
+{
+    mock_printer_t mock;
+    mock_open(&mock);
+    configure_calibration(&mock.config);
+
+    printerctl_daemon_runtime_t runtime;
+    start_runtime(&runtime, &mock.config);
+    printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "calibrate-front-left");
+    check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted");
+
+    expect_ack(&mock, "G21\n");
+    mock_expect_command(&mock, "G91\n"); /* ACK deliberately held */
+
+    uint32_t token = 0;
+    printerctl_daemon_error_t error;
+    check(printerctl_daemon_runtime_send_print_cancel_power_failure(&runtime, &token, &error) ==
+              PRINTERCTL_DAEMON_OK,
+          "send power-failure cancel during macro ACK wait");
+    printerctl_daemon_event_t cancel_event;
+    check(printerctl_daemon_runtime_wait_command(&runtime, token, &cancel_event, &error) ==
+              PRINTERCTL_DAEMON_OK,
+          "wait power-failure cancel result");
+    check(cancel_event.result == PRINTERCTL_DAEMON_RESULT_OK,
+          "power-failure cancel accepted while a macro is active");
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED);
+
+    mock_reply_ok(&mock); /* late ACK for the held G91 */
+    mock_expect_no_command(&mock, "macro power failure");
+
+    printerctl_daemon_snapshot_t snapshot;
+    printerctl_daemon_runtime_snapshot(&runtime, &snapshot);
+    check(snapshot.failure_reason == PRINTERCTL_PLP1_SHUTTING_DOWN,
+          "macro power-failure cancellation is distinguishable");
+    check(snapshot.macro_current_step == 0, "no macro step completed after power failure");
+
+    printerctl_daemon_runtime_shutdown(&runtime, &error);
+    mock_close(&mock);
+}
+
+typedef struct {
+    int master;
+    atomic_int stop;
+} chatter_thread_t;
+
+static void *chatter_thread_main(void *arg)
+{
+    chatter_thread_t *ctx = (chatter_thread_t *)arg;
+    while (!atomic_load(&ctx->stop)) {
+        if (write(ctx->master, "busy: processing\n", 17) != 17) {
+            break;
+        }
+        poll(NULL, 0, 20);
+    }
+    return NULL;
+}
+
+/* M28-002 regression: daemon shutdown requested while a macro waits for an
+ * ACK completes even though the firmware keeps emitting nonterminal
+ * `busy:` chatter that would otherwise reset the silence timeout forever. */
+static void test_macro_shutdown_during_busy_chatter_completes(void)
+{
+    mock_printer_t mock;
+    mock_open(&mock);
+    configure_calibration(&mock.config);
+
+    printerctl_daemon_runtime_t runtime;
+    start_runtime(&runtime, &mock.config);
+    printerctl_daemon_event_t accepted = send_and_wait_macro(&runtime, "calibrate-front-left");
+    check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "macro accepted");
+
+    expect_ack(&mock, "G21\n");
+    mock_expect_command(&mock, "G91\n"); /* never acknowledged */
+
+    chatter_thread_t chatter;
+    chatter.master = mock.master;
+    atomic_init(&chatter.stop, 0);
+    pthread_t chatter_thread;
+    check(pthread_create(&chatter_thread, NULL, chatter_thread_main, &chatter) == 0,
+          "chatter thread starts");
+
+    shutdown_thread_t shutdown_ctx;
+    shutdown_ctx.runtime = &runtime;
+    shutdown_ctx.status = PRINTERCTL_DAEMON_ERR_IO;
+    pthread_t thread;
+    check(pthread_create(&thread, NULL, shutdown_thread_main, &shutdown_ctx) == 0,
+          "shutdown thread starts");
+
+    /* The silence timeout is 1000 ms and chatter arrives every 20 ms, so
+     * only an ACK-wait-aware shutdown can finish inside this window. */
+    bool finished = false;
+    for (int i = 0; i < 150; ++i) {
+        if (pthread_tryjoin_np(thread, NULL) == 0) {
+            finished = true;
+            break;
+        }
+        poll(NULL, 0, 10);
+    }
+    atomic_store(&chatter.stop, 1);
+    check(pthread_join(chatter_thread, NULL) == 0, "chatter thread joins");
+    if (!finished) {
+        mock_reply_ok(&mock);
+        check(pthread_join(thread, NULL) == 0, "shutdown thread joins after ACK");
+    }
+    check(finished, "shutdown completes during continuous busy chatter");
+    check(shutdown_ctx.status == PRINTERCTL_DAEMON_OK, "shutdown succeeds");
+
+    printerctl_daemon_snapshot_t snapshot;
+    printerctl_daemon_runtime_snapshot(&runtime, &snapshot);
+    check(snapshot.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED,
+          "macro interrupted by shutdown ends cancelled");
+
+    /* RR-003: nothing beyond the held G91 was transmitted. */
+    mock_expect_no_command(&mock, "macro shutdown during chatter");
+    mock_close(&mock);
+}
+
+/* UX-001 regression: after a previous terminal execution, a newly accepted
+ * PRINT_START must publish its own nonterminal state with reset counters
+ * before acceptance reaches the client, so observers never mistake the
+ * previous job's terminal snapshot for the new job. */
+static void run_sequential_print_case(const char *first_reply, uint8_t first_terminal)
+{
+    mock_printer_t mock;
+    mock_open(&mock);
+    mock.config.timeout_ms = 200;
+    char first[128];
+    char second[128];
+    write_file(first, sizeof(first), "M105\n");
+    write_file(second, sizeof(second), "M105\nM114\n");
+
+    printerctl_daemon_runtime_t runtime;
+    start_runtime(&runtime, &mock.config);
+    printerctl_daemon_event_t accepted = send_and_wait_start(&runtime, first);
+    check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "first PRINT_START accepted");
+    mock_expect_command(&mock, "M105\n");
+    if (first_reply != NULL) {
+        mock_reply(&mock, first_reply);
+    }
+    wait_until_execution(&runtime, first_terminal);
+
+    accepted = send_and_wait_start(&runtime, second);
+    check(accepted.result == PRINTERCTL_DAEMON_RESULT_OK, "second PRINT_START accepted");
+    printerctl_daemon_snapshot_t snapshot;
+    printerctl_daemon_runtime_snapshot(&runtime, &snapshot);
+    check(snapshot.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING,
+          "accepted print is RUNNING at acceptance, not the previous terminal state");
+    check(snapshot.commands_acknowledged == 0 && snapshot.commands_sent == 0 &&
+              snapshot.progress_percent == 0 && snapshot.failure_reason == 0,
+          "accepted print starts with reset counters and no stale failure reason");
+
+    mock_expect_command(&mock, "M105\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "M114\n");
+    mock_reply_ok(&mock);
+    wait_until_execution(&runtime, PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
+    printerctl_daemon_runtime_snapshot(&runtime, &snapshot);
+    check(snapshot.commands_acknowledged == 2, "terminal counters belong to the new print");
+
+    printerctl_daemon_error_t error;
+    printerctl_daemon_runtime_shutdown(&runtime, &error);
+    unlink(first);
+    unlink(second);
+    mock_close(&mock);
+}
+
+static void test_sequential_print_start_publishes_new_execution(void)
+{
+    run_sequential_print_case("ok\n", PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
+    run_sequential_print_case("Error: simulated\n", PRINTERCTL_PLP1_EXECUTION_STATE_FAILED);
+}
+
 int main(void)
 {
     test_macro_z_lift_executes_typed_relative_move();
@@ -692,5 +1052,14 @@ int main(void)
     test_legacy_serial_open_rejected_while_daemon_prints();
     test_shutdown_during_active_print_is_cooperative();
     test_printer_faults_surface_failed_state();
+    test_macro_establishes_millimeters_after_inch_mode();
+    test_macro_unit_mode_failure_prevents_motion();
+    test_macro_unrepresentable_values_have_zero_serial_side_effects();
+    test_macro_boundary_values_are_sent_exactly();
+    test_macro_signal_flag_during_ack_wait(true);
+    test_macro_signal_flag_during_ack_wait(false);
+    test_macro_power_failure_during_ack_wait_stops_future_steps();
+    test_macro_shutdown_during_busy_chatter_completes();
+    test_sequential_print_start_publishes_new_execution();
     return 0;
 }

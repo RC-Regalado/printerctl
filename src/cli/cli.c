@@ -4,6 +4,8 @@
 #include "printerctl/cli.h"
 #include "printerctl/gcode.h"
 #include "printerctl/logging.h"
+#include "printerctl/macro.h"
+#include "printerctl/prusa_import.h"
 #include "printerctl/record.h"
 #include "printerctl/version.h"
 
@@ -79,6 +81,9 @@ static const char *command_name(printerctl_command_t command)
     case PRINTERCTL_COMMAND_SD_RESUME: return "sd resume";
     case PRINTERCTL_COMMAND_SD_CANCEL: return "sd cancel";
     case PRINTERCTL_COMMAND_POWER_LOW_BATTERY: return "power";
+    case PRINTERCTL_COMMAND_MACRO_LIST: return "macro list";
+    case PRINTERCTL_COMMAND_MACRO_RUN: return "macro run";
+    case PRINTERCTL_COMMAND_CONFIG_FROM_PRUSA: return "config from-prusa";
     }
     return "unknown";
 }
@@ -99,9 +104,14 @@ static bool is_migrated_physical_command(printerctl_command_t command)
            command == PRINTERCTL_COMMAND_SD_CANCEL;
 }
 
+static bool is_macro_command(printerctl_command_t command)
+{
+    return command == PRINTERCTL_COMMAND_MACRO_LIST || command == PRINTERCTL_COMMAND_MACRO_RUN;
+}
+
 static bool is_migrated_daemon_command(printerctl_command_t command)
 {
-    return command == PRINTERCTL_COMMAND_PRINT ||
+    return command == PRINTERCTL_COMMAND_PRINT || is_macro_command(command) ||
            is_migrated_query_command(command) ||
            is_migrated_physical_command(command);
 }
@@ -302,6 +312,33 @@ bool printerctl_cli_parse(int argc, char *const argv[],
         i++;
     } else if (strcmp(requested_command, "power") == 0) {
         command = PRINTERCTL_COMMAND_POWER_LOW_BATTERY;
+    } else if (strcmp(requested_command, "macro") == 0) {
+        if (i >= argc) {
+            set_error(out_error, "command 'macro' requires a subcommand (expected 'list' or 'run')");
+            return false;
+        }
+        if (strcmp(argv[i], "list") == 0) {
+            command = PRINTERCTL_COMMAND_MACRO_LIST;
+        } else if (strcmp(argv[i], "run") == 0) {
+            command = PRINTERCTL_COMMAND_MACRO_RUN;
+        } else {
+            set_error(out_error, "unrecognized subcommand '%s' for 'macro' (expected 'list' or 'run')",
+                       argv[i]);
+            return false;
+        }
+        i++;
+    } else if (strcmp(requested_command, "config") == 0) {
+        if (i >= argc) {
+            set_error(out_error, "command 'config' requires a subcommand (expected 'from-prusa')");
+            return false;
+        }
+        if (strcmp(argv[i], "from-prusa") != 0) {
+            set_error(out_error, "unrecognized subcommand '%s' for 'config' (expected 'from-prusa')",
+                       argv[i]);
+            return false;
+        }
+        command = PRINTERCTL_COMMAND_CONFIG_FROM_PRUSA;
+        i++;
     } else {
         set_error(out_error, "unrecognized command '%s'", requested_command);
         return false;
@@ -381,6 +418,76 @@ bool printerctl_cli_parse(int argc, char *const argv[],
         }
         break;
 
+    case PRINTERCTL_COMMAND_MACRO_LIST:
+        if (i < argc) {
+            set_error(out_error, "too many arguments");
+            return false;
+        }
+        break;
+
+    case PRINTERCTL_COMMAND_MACRO_RUN:
+        if (i >= argc) {
+            set_error(out_error, "command 'macro run' requires a macro ID argument");
+            return false;
+        }
+        if (argv[i][0] == '\0') {
+            set_error(out_error, "command 'macro run' requires a non-empty macro ID argument");
+            return false;
+        }
+        if (strlen(argv[i]) >= PRINTERCTL_PLP1_MACRO_ID_MAX) {
+            set_error(out_error, "macro ID exceeds the maximum length of %u characters",
+                       PRINTERCTL_PLP1_MACRO_ID_MAX - 1u);
+            return false;
+        }
+        out_request->command_args.macro_id = argv[i];
+        i++;
+        if (i < argc) {
+            set_error(out_error, "too many arguments");
+            return false;
+        }
+        break;
+
+    case PRINTERCTL_COMMAND_CONFIG_FROM_PRUSA:
+        if (i >= argc) {
+            set_error(out_error, "command 'config from-prusa' requires a FILE argument");
+            return false;
+        }
+        if (argv[i][0] == '\0') {
+            set_error(out_error, "command 'config from-prusa' requires a non-empty FILE argument");
+            return false;
+        }
+        out_request->command_args.prusa_file = argv[i];
+        i++;
+        if (i < argc) {
+            double inset = 0.0;
+            if (!printerctl_config_parse_double(argv[i], &inset) || inset < 0.0) {
+                set_error(out_error,
+                           "invalid INSET_MM '%s' for 'config from-prusa' (expected a number >= 0)",
+                           argv[i]);
+                return false;
+            }
+            out_request->command_args.has_prusa_inset = true;
+            out_request->command_args.prusa_inset_mm = inset;
+            i++;
+        }
+        if (i < argc) {
+            double safe_z = 0.0;
+            if (!printerctl_config_parse_double(argv[i], &safe_z) || safe_z <= 0.0) {
+                set_error(out_error,
+                           "invalid SAFE_Z_MM '%s' for 'config from-prusa' (expected a number > 0)",
+                           argv[i]);
+                return false;
+            }
+            out_request->command_args.has_prusa_safe_z = true;
+            out_request->command_args.prusa_safe_z_mm = safe_z;
+            i++;
+        }
+        if (i < argc) {
+            set_error(out_error, "too many arguments");
+            return false;
+        }
+        break;
+
     case PRINTERCTL_COMMAND_POWER_LOW_BATTERY:
         if (i >= argc) {
             set_error(out_error, "command 'power' requires a subcommand (expected 'low-battery')");
@@ -448,6 +555,13 @@ static void print_help(FILE *out)
         "  position                             Query current position\n"
         "  info                                 Query printer information\n"
         "  power low-battery                    Notify a running print of a power event\n"
+        "  macro list                           List printerctld's built-in macros\n"
+        "  macro run ID                         Run one built-in macro through printerctld\n"
+        "  config from-prusa FILE [INSET_MM [SAFE_Z_MM]]\n"
+        "                                       Print printerctld calibration settings\n"
+        "                                       derived from a PrusaSlicer printer profile\n"
+        "                                       (.ini) or sliced .gcode (default inset\n"
+        "                                       30 mm, safe_z 5 mm); no daemon or serial\n"
         "\n"
         "Print session control:\n"
         "  'print FILE' starts daemon-owned host streaming and returns after\n"
@@ -471,6 +585,13 @@ static void print_help(FILE *out)
         PRINTERCTL_CONFIG_MIN_TIMEOUT_MS, PRINTERCTL_CONFIG_MAX_TIMEOUT_MS, PRINTERCTL_CONFIG_DEFAULT_TIMEOUT_MS);
 
     fprintf(out,
+        "Macros:\n"
+        "  Macros are typed, daemon-owned definitions (no arbitrary G-code).\n"
+        "  Calibration macros need the calibration.* keys in the printerctld\n"
+        "  config (see 'config from-prusa'); 'macro list' marks the ones that\n"
+        "  are ready. Macros never home: run 'home' first. 'macro run' stays\n"
+        "  attached until the macro ends; Ctrl+C detaches without stopping it.\n"
+        "\n"
         "Power events:\n"
         "  'power low-battery' is meant to be run by an APCUPSD script (see\n"
         "  scripts/apcupsd/printerctl-low-battery.sh) when the UPS reports a\n"
@@ -794,11 +915,19 @@ static void sleep_ms(long milliseconds)
     }
 }
 
-static const char *execution_state_label(uint8_t state)
+/* What the observer is attached to: the label for RUNNING and the command
+ * name used in failure reports differ; the lifecycle does not. */
+typedef enum {
+    OBSERVED_PRINT = 0,
+    OBSERVED_MACRO
+} observed_execution_t;
+
+static const char *execution_state_label(uint8_t state, observed_execution_t kind)
 {
     switch (state) {
     case PRINTERCTL_PLP1_EXECUTION_STATE_IDLE: return "Idle";
-    case PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING: return "Printing";
+    case PRINTERCTL_PLP1_EXECUTION_STATE_RUNNING:
+        return kind == OBSERVED_MACRO ? "Running macro" : "Printing";
     case PRINTERCTL_PLP1_EXECUTION_STATE_PAUSED: return "Paused";
     case PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLING: return "Cancelling";
     case PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED: return "Completed";
@@ -818,11 +947,15 @@ static bool execution_state_is_terminal(uint8_t state)
 /* "Printing: 47% (583/1240)" when commands_total is known, otherwise
  * "Printing: 47% (583 acknowledged)" -- commands_total is best-effort
  * (see docs/design/protocol-v1.md STATUS §16) and may be unavailable. */
-static void render_print_progress(FILE *out, const printerctl_plp1_status_response_t *status)
+static void render_print_progress(FILE *out, const printerctl_plp1_status_response_t *status,
+                                  observed_execution_t kind)
 {
-    fprintf(out, "printerctl: %s: %u%%", execution_state_label(status->execution_state),
+    fprintf(out, "printerctl: %s: %u%%", execution_state_label(status->execution_state, kind),
             (unsigned)status->progress);
-    if ((status->present_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL) != 0) {
+    if (kind == OBSERVED_MACRO) {
+        /* Macro progress is step-based; source command counters belong
+         * to host prints only. */
+    } else if ((status->present_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_TOTAL) != 0) {
         fprintf(out, " (%u/%u)", (unsigned)status->commands_acknowledged,
                 (unsigned)status->commands_total);
     } else if ((status->present_fields & PRINTERCTL_PLP1_STATUS_FIELD_COMMANDS_ACKNOWLEDGED) !=
@@ -840,8 +973,10 @@ static void render_print_progress(FILE *out, const printerctl_plp1_status_respon
  * `client` is left open; the caller closes it.
  */
 static int run_print_progress_observer(printerctl_client_t *client, FILE *out, FILE *err,
-                                       printerctl_logger_t *logger, bool logger_ready)
+                                       printerctl_logger_t *logger, bool logger_ready,
+                                       observed_execution_t kind)
 {
+    const char *name = kind == OBSERVED_MACRO ? "macro run" : "print";
     bool have_previous = false;
     uint8_t previous_state = 0;
     uint8_t previous_progress = 0;
@@ -854,14 +989,14 @@ static int run_print_progress_observer(printerctl_client_t *client, FILE *out, F
             client, PRINTERCTL_CLI_PRINT_STATUS_FIELDS, PRINTERCTL_CLI_PLP_TIMEOUT_MS,
             &status_response, &error);
         if (status != PRINTERCTL_CLIENT_OK) {
-            report_client_failure(err, logger, logger_ready, "print", status, &error);
+            report_client_failure(err, logger, logger_ready, name, status, &error);
             return client_status_to_exit_code(status, error.wire_status);
         }
 
         if (!have_previous || status_response.execution_state != previous_state ||
             status_response.progress != previous_progress ||
             status_response.commands_acknowledged != previous_acknowledged) {
-            render_print_progress(out, &status_response);
+            render_print_progress(out, &status_response, kind);
             have_previous = true;
             previous_state = status_response.execution_state;
             previous_progress = status_response.progress;
@@ -875,7 +1010,8 @@ static int run_print_progress_observer(printerctl_client_t *client, FILE *out, F
                      PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON) != 0
                         ? status_response.failure_reason
                         : PRINTERCTL_PLP1_INTERNAL_ERROR;
-                fprintf(err, "printerctl: print failed\n");
+                fprintf(err, "printerctl: %s failed\n",
+                        kind == OBSERVED_MACRO ? "macro" : "print");
                 return wire_status_to_exit_code(reason);
             }
             if (status_response.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED) {
@@ -924,9 +1060,158 @@ static int run_print_start_command(const printerctl_command_args_t *args,
 
     fprintf(out, "printerctl: print accepted by printerctld: '%s'\n", args->print_file);
 
-    int exit_code = run_print_progress_observer(&client, out, err, logger, logger_ready);
+    int exit_code =
+        run_print_progress_observer(&client, out, err, logger, logger_ready, OBSERVED_PRINT);
     printerctl_client_close(&client);
     return exit_code;
+}
+
+static const char *macro_category_name(uint8_t category)
+{
+    switch (category) {
+    case PRINTERCTL_MACRO_CATEGORY_CALIBRATION: return "calibration";
+    case PRINTERCTL_MACRO_CATEGORY_MAINTENANCE: return "maintenance";
+    case PRINTERCTL_MACRO_CATEGORY_MOTION: return "motion";
+    case PRINTERCTL_MACRO_CATEGORY_THERMAL: return "thermal";
+    case PRINTERCTL_MACRO_CATEGORY_FILAMENT: return "filament";
+    case PRINTERCTL_MACRO_CATEGORY_DIAGNOSTIC: return "diagnostic";
+    default: return "other";
+    }
+}
+
+/* M29: `macro list` -- registry metadata plus per-macro executability as
+ * resolved by printerctld against its own configuration. */
+static int run_macro_list_command(printerctl_logger_t *logger, bool logger_ready, FILE *out,
+                                  FILE *err)
+{
+    printerctl_client_t client;
+    printerctl_client_error_t error;
+    printerctl_client_status_t status =
+        printerctl_client_connect(&client, PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, &error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, "macro list", status, &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    printerctl_plp1_macro_list_response_t list;
+    status = printerctl_client_macro_list(&client, PRINTERCTL_CLI_PLP_TIMEOUT_MS, &list, &error);
+    printerctl_client_close(&client);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, "macro list", status, &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    fprintf(out, "printerctl: %u built-in macro(s) in printerctld:\n", (unsigned)list.count);
+    bool any_unavailable = false;
+    for (uint16_t i = 0; i < list.count; i++) {
+        const printerctl_plp1_macro_entry_t *entry = &list.entries[i];
+        bool ready = (entry->flags & PRINTERCTL_PLP1_MACRO_FLAG_EXECUTABLE) != 0;
+        char state[32];
+        if (ready) {
+            snprintf(state, sizeof(state), "ready (%u steps)", (unsigned)entry->step_count);
+        } else {
+            snprintf(state, sizeof(state), "unavailable");
+            any_unavailable = true;
+        }
+        fprintf(out, "  %-24s %-12s %-17s %s\n", entry->id, macro_category_name(entry->category),
+                state, entry->display_name);
+        if (entry->description[0] != '\0') {
+            fprintf(out, "  %-24s %s\n", "", entry->description);
+        }
+    }
+    if (any_unavailable) {
+        fprintf(out,
+                "printerctl: 'unavailable' macros lack a complete, valid calibration.* "
+                "configuration in printerctld (see 'printerctl config from-prusa'), or have no "
+                "executable definition yet.\n");
+    }
+    return PRINTERCTL_EXIT_OK;
+}
+
+/* M29: `macro run ID` -- MACRO_RUN, then stay attached as a STATUS observer
+ * until the daemon reports the macro's terminal state, exactly like
+ * `print FILE`. Interrupting the CLI detaches the observer only. */
+static int run_macro_run_command(const printerctl_command_args_t *args,
+                                 printerctl_logger_t *logger, bool logger_ready, FILE *out,
+                                 FILE *err)
+{
+    printerctl_client_t client;
+    printerctl_client_error_t error;
+    printerctl_client_status_t status =
+        printerctl_client_connect(&client, PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, &error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        report_client_failure(err, logger, logger_ready, "macro run", status, &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    status = printerctl_client_macro_run(&client, args->macro_id, PRINTERCTL_CLI_PLP_TIMEOUT_MS,
+                                         &error);
+    if (status != PRINTERCTL_CLIENT_OK) {
+        printerctl_client_close(&client);
+        if (status == PRINTERCTL_CLIENT_ERR_REMOTE &&
+            error.wire_status == PRINTERCTL_PLP1_INVALID_STATE) {
+            fprintf(err,
+                    "printerctl: macro '%s' is not executable with printerctld's current "
+                    "configuration (missing or invalid calibration.* keys?)\n",
+                    args->macro_id);
+        } else if (status == PRINTERCTL_CLIENT_ERR_REMOTE &&
+                   error.wire_status == PRINTERCTL_PLP1_INVALID_ARGUMENT) {
+            fprintf(err, "printerctl: macro '%s' is unknown or not representable "
+                         "(see 'printerctl macro list')\n",
+                    args->macro_id);
+        } else if (status == PRINTERCTL_CLIENT_ERR_REMOTE &&
+                   error.wire_status == PRINTERCTL_PLP1_BUSY) {
+            fprintf(err, "printerctl: printerctld is busy with another print or macro\n");
+        }
+        report_client_failure(err, logger, logger_ready, "macro run", status, &error);
+        return client_status_to_exit_code(status, error.wire_status);
+    }
+
+    fprintf(out, "printerctl: macro '%s' accepted by printerctld\n", args->macro_id);
+    int exit_code =
+        run_print_progress_observer(&client, out, err, logger, logger_ready, OBSERVED_MACRO);
+    printerctl_client_close(&client);
+    return exit_code;
+}
+
+/* M29: `config from-prusa FILE [INSET_MM [SAFE_Z_MM]]` -- a purely local
+ * transformation: no daemon, no serial device. The generated
+ * configuration goes to `out`; diagnostics go to `err`. */
+static int run_config_from_prusa_command(const printerctl_command_args_t *args,
+                                         printerctl_logger_t *logger, bool logger_ready,
+                                         FILE *out, FILE *err)
+{
+    printerctl_prusa_import_options_t options;
+    printerctl_prusa_import_options_init(&options);
+    if (args->has_prusa_inset) {
+        options.inset_mm = args->prusa_inset_mm;
+    }
+    if (args->has_prusa_safe_z) {
+        options.safe_z_mm = args->prusa_safe_z_mm;
+    }
+
+    printerctl_prusa_import_result_t result;
+    printerctl_prusa_import_error_t error;
+    printerctl_prusa_import_status_t status =
+        printerctl_prusa_import_file(args->prusa_file, &options, &result, &error);
+    if (status != PRINTERCTL_PRUSA_IMPORT_OK) {
+        fprintf(err, "printerctl: config from-prusa: %s\n", error.message);
+        if (logger_ready) {
+            char detail[96];
+            snprintf(detail, sizeof(detail), "config_from_prusa status=%d", (int)status);
+            warn_on_log_failure(err, printerctl_log_error(logger, detail),
+                                "failed to record error log");
+        }
+        return status == PRINTERCTL_PRUSA_IMPORT_ERR_INVALID_ARGUMENT
+                   ? PRINTERCTL_EXIT_USAGE_ERROR
+                   : PRINTERCTL_EXIT_CONFIG_ERROR;
+    }
+
+    if (!printerctl_prusa_import_write_config(&result, args->prusa_file, out)) {
+        fprintf(err, "printerctl: config from-prusa: failed to write the configuration\n");
+        return PRINTERCTL_EXIT_CONFIG_ERROR;
+    }
+    return PRINTERCTL_EXIT_OK;
 }
 
 static double milli_to_double(int32_t value)
@@ -1268,6 +1553,7 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
      * port/baud/timeout; the compatibility view is removed in M25. */
     printerctl_config_view_t config_view =
         (is_migrated_daemon_command(request.command_args.command) ||
+         request.command_args.command == PRINTERCTL_COMMAND_CONFIG_FROM_PRUSA ||
          is_host_control_command(request.command_args.command))
             ? PRINTERCTL_CONFIG_VIEW_CLIENT
             : PRINTERCTL_CONFIG_VIEW_LEGACY_CLI;
@@ -1380,6 +1666,24 @@ int printerctl_cli_run(int argc, char *const argv[], FILE *out, FILE *err)
         exit_code = PRINTERCTL_EXIT_OK;
     } else if (request.command_args.command == PRINTERCTL_COMMAND_POWER_LOW_BATTERY) {
         exit_code = run_power_low_battery_command(&logger, logger_ready, out, err);
+    } else if (request.command_args.command == PRINTERCTL_COMMAND_MACRO_LIST && config.dry_run) {
+        fprintf(out,
+            "printerctl: dry run: would ask printerctld for its built-in macro list "
+            "(no serial device is opened)\n");
+        exit_code = PRINTERCTL_EXIT_OK;
+    } else if (request.command_args.command == PRINTERCTL_COMMAND_MACRO_LIST) {
+        exit_code = run_macro_list_command(&logger, logger_ready, out, err);
+    } else if (request.command_args.command == PRINTERCTL_COMMAND_MACRO_RUN && config.dry_run) {
+        fprintf(out,
+            "printerctl: dry run: would ask printerctld to run macro '%s' "
+            "(no daemon contact; no serial device is opened)\n",
+            request.command_args.macro_id);
+        exit_code = PRINTERCTL_EXIT_OK;
+    } else if (request.command_args.command == PRINTERCTL_COMMAND_MACRO_RUN) {
+        exit_code = run_macro_run_command(&request.command_args, &logger, logger_ready, out, err);
+    } else if (request.command_args.command == PRINTERCTL_COMMAND_CONFIG_FROM_PRUSA) {
+        exit_code =
+            run_config_from_prusa_command(&request.command_args, &logger, logger_ready, out, err);
     } else {
         fprintf(out,
             "printerctl: command '%s' parsed successfully but is not yet implemented "

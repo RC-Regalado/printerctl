@@ -60,9 +60,11 @@ operator's own, deliberate emergency action.
 Beyond `G28` specifically: nothing in printerctl issues a heating
 (`M104`/`M109`/`M140`/`M190`), movement (`G0`/`G1`) or extrusion command
 on its own initiative, ever. Every G-code command the printer receives
-either comes from the file the operator asked to `print`, or from a
+either comes from the file the operator asked to `print`, from a
 command the operator typed directly (`send`, `home`, the SD-print
-controls).
+controls), or from a daemon-owned built-in macro the operator explicitly
+ran with `macro run ID` (M28/M29: typed MOVE steps only, `G21` first,
+never homing, no cleanup G-code on failure or cancellation).
 
 ## 4. Dry-run guarantee
 

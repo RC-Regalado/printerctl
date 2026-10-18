@@ -30,6 +30,19 @@ target_include_directories(printerctl_config
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+# M29: PrusaSlicer printer profile / G-code configuration import. Pure
+# file-to-text transformation; no serial, daemon or protocol knowledge.
+add_library(printerctl_prusa_import STATIC
+    src/config/prusa_import.c
+)
+
+target_include_directories(printerctl_prusa_import
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+
+target_link_libraries(printerctl_prusa_import PUBLIC m)
+
 add_library(printerctl_logging STATIC
     src/logging/logging.c
 )
@@ -211,7 +224,7 @@ target_include_directories(printerctl_cli
         "${CMAKE_CURRENT_BINARY_DIR}/include"
 )
 
-target_link_libraries(printerctl_cli PUBLIC printerctl_config printerctl_logging printerctl_gcode printerctl_record printerctl_client)
+target_link_libraries(printerctl_cli PUBLIC printerctl_config printerctl_logging printerctl_gcode printerctl_record printerctl_client printerctl_prusa_import)
 
 add_executable(printerctl
     src/main.c

@@ -290,6 +290,16 @@ printerctl_daemon_status_t printerctl_daemon_runtime_drain_events(
 int printerctl_daemon_runtime_event_fd(const printerctl_daemon_runtime_t *runtime);
 
 /*
+ * M29: the configuration the runtime was started with. It is copied into
+ * the runtime before the worker thread is created and never mutated
+ * afterwards, so the control context may read it without synchronization
+ * (pthread_create() orders the write before any worker read). Returns NULL
+ * for a NULL runtime.
+ */
+const printerctl_config_t *printerctl_daemon_runtime_config(
+    const printerctl_daemon_runtime_t *runtime);
+
+/*
  * Blocks for exactly one event_pipe message and returns it via
  * *out_event, so a caller (or a test) can assert its type/token
  * directly. Also applies it to the published snapshot:

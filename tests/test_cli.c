@@ -3,6 +3,7 @@
 #define _DEFAULT_SOURCE
 
 #include "printerctl/cli.h"
+#include "printerctl/protocol/plp1.h"
 #include "printerctl/config.h"
 #include "printerctl/version.h"
 
@@ -1534,6 +1535,148 @@ static void test_safety_error_adds_single_error_log_line(void)
     free(err);
 }
 
+/* ---- M29: macro and config from-prusa commands ---- */
+
+static void expect_usage_error(int argc, char *argv[], const char *description)
+{
+    char *out = NULL;
+    char *err = NULL;
+    int status = run_cli(argc, argv, &out, &err);
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR, description);
+    check(err != NULL && strstr(err, "printerctl: ") != NULL, "usage error is explained");
+    free(out);
+    free(err);
+}
+
+static void test_macro_and_config_grammar(void)
+{
+    char long_id[PRINTERCTL_PLP1_MACRO_ID_MAX + 1];
+    memset(long_id, 'a', sizeof(long_id) - 1);
+    long_id[sizeof(long_id) - 1] = '\0';
+
+    char *a1[] = {"printerctl", "macro"};
+    expect_usage_error(2, a1, "'macro' requires a subcommand");
+    char *a2[] = {"printerctl", "macro", "delete"};
+    expect_usage_error(3, a2, "unknown 'macro' subcommand is rejected");
+    char *a3[] = {"printerctl", "macro", "list", "extra"};
+    expect_usage_error(4, a3, "'macro list' takes no arguments");
+    char *a4[] = {"printerctl", "macro", "run"};
+    expect_usage_error(3, a4, "'macro run' requires an ID");
+    char *a5[] = {"printerctl", "macro", "run", ""};
+    expect_usage_error(4, a5, "'macro run' rejects an empty ID");
+    char *a6[] = {"printerctl", "macro", "run", long_id};
+    expect_usage_error(4, a6, "'macro run' rejects an over-length ID");
+    char *a7[] = {"printerctl", "macro", "run", "park", "now"};
+    expect_usage_error(5, a7, "'macro run' rejects extra arguments");
+    char *a8[] = {"printerctl", "config"};
+    expect_usage_error(2, a8, "'config' requires a subcommand");
+    char *a9[] = {"printerctl", "config", "from-cura", "x.ini"};
+    expect_usage_error(4, a9, "unknown 'config' subcommand is rejected");
+    char *a10[] = {"printerctl", "config", "from-prusa"};
+    expect_usage_error(3, a10, "'config from-prusa' requires a FILE");
+    char *a11[] = {"printerctl", "config", "from-prusa", "x.ini", "-1"};
+    expect_usage_error(5, a11, "negative INSET_MM is rejected at parse time");
+    char *a12[] = {"printerctl", "config", "from-prusa", "x.ini", "30", "0"};
+    expect_usage_error(6, a12, "non-positive SAFE_Z_MM is rejected at parse time");
+    char *a13[] = {"printerctl", "config", "from-prusa", "x.ini", "30", "5", "9"};
+    expect_usage_error(7, a13, "'config from-prusa' rejects extra arguments");
+    char *a14[] = {"printerctl", "config", "from-prusa", "x.ini", "wide"};
+    expect_usage_error(5, a14, "non-numeric INSET_MM is rejected");
+}
+
+static void test_dry_run_macro_commands(void)
+{
+    char *run_argv[] = {"printerctl", "--dry-run", "macro", "run", "calibrate-center"};
+    char *out = NULL;
+    char *err = NULL;
+    int status = run_cli(5, run_argv, &out, &err);
+    check(status == PRINTERCTL_EXIT_OK, "dry-run macro run exits 0 without a daemon");
+    check(out != NULL && strstr(out, "calibrate-center") != NULL &&
+              strstr(out, "no serial device is opened") != NULL,
+          "dry-run macro run names the macro and reports no serial access");
+    free(out);
+    free(err);
+
+    char *list_argv[] = {"printerctl", "--dry-run", "macro", "list"};
+    status = run_cli(4, list_argv, &out, &err);
+    check(status == PRINTERCTL_EXIT_OK, "dry-run macro list exits 0 without a daemon");
+    free(out);
+    free(err);
+}
+
+static void test_macro_commands_need_daemon(void)
+{
+    char *list_argv[] = {"printerctl", "macro", "list"};
+    char *run_argv[] = {"printerctl", "macro", "run", "maintenance-z-lift"};
+    char **cases[] = {list_argv, run_argv};
+    int counts[] = {3, 4};
+    for (size_t i = 0; i < 2; i++) {
+        char *out = NULL;
+        char *err = NULL;
+        int status = run_cli(counts[i], cases[i], &out, &err);
+        check(status == PRINTERCTL_EXIT_COMM_ERROR,
+              "macro commands report a clean communication error with no daemon");
+        check(err != NULL && strstr(err, "connect") != NULL,
+              "macro commands report the daemon connection error");
+        free(out);
+        free(err);
+    }
+}
+
+static void test_config_from_prusa_generates_calibration(void)
+{
+    char path[64];
+    write_temp_config("bed_shape = 0x0,235x0,235x235,0x235\n"
+                      "machine_max_feedrate_x = 150,150\n"
+                      "machine_max_feedrate_y = 150,150\n"
+                      "machine_max_feedrate_z = 5,5\n"
+                      "max_print_height = 270\n",
+                      path, sizeof(path));
+
+    char *argv[] = {"printerctl", "config", "from-prusa", path};
+    char *out = NULL;
+    char *err = NULL;
+    int status = run_cli(4, argv, &out, &err);
+    check(status == PRINTERCTL_EXIT_OK, "config from-prusa succeeds on a printer profile");
+    check(out != NULL && strstr(out, "calibration.min_x=30.000\n") != NULL &&
+              strstr(out, "calibration.max_y=205.000\n") != NULL &&
+              strstr(out, "calibration.safe_z=5.000\n") != NULL &&
+              strstr(out, "calibration.xy_feedrate=9000.000\n") != NULL &&
+              strstr(out, "calibration.z_feedrate=300.000\n") != NULL,
+          "config from-prusa prints the derived calibration keys on stdout");
+    check(out != NULL && strstr(out, "\nport=") == NULL,
+          "config from-prusa never invents an active serial port");
+    check(err != NULL && strstr(err, "calibration.") == NULL,
+          "the generated configuration goes to stdout, not the log stream");
+    free(out);
+    free(err);
+
+    char *argv_custom[] = {"printerctl", "config", "from-prusa", path, "10", "2.5"};
+    status = run_cli(6, argv_custom, &out, &err);
+    check(status == PRINTERCTL_EXIT_OK && out != NULL &&
+              strstr(out, "calibration.min_x=10.000\n") != NULL &&
+              strstr(out, "calibration.safe_z=2.500\n") != NULL,
+          "config from-prusa applies INSET_MM and SAFE_Z_MM");
+    free(out);
+    free(err);
+
+    char *argv_wide[] = {"printerctl", "config", "from-prusa", path, "200"};
+    status = run_cli(5, argv_wide, &out, &err);
+    check(status == PRINTERCTL_EXIT_USAGE_ERROR && err != NULL &&
+              strstr(err, "no usable area") != NULL,
+          "an inset larger than the bed is a usage error");
+    free(out);
+    free(err);
+    unlink(path);
+
+    char *argv_missing[] = {"printerctl", "config", "from-prusa",
+                            "/nonexistent/printerctl/BiquB1.ini"};
+    status = run_cli(4, argv_missing, &out, &err);
+    check(status == PRINTERCTL_EXIT_CONFIG_ERROR, "a missing PrusaSlicer file is a config error");
+    free(out);
+    free(err);
+}
+
 int main(void)
 {
     /* No test may write into the developer's real state directory. */
@@ -1544,6 +1687,11 @@ int main(void)
         return EXIT_FAILURE;
     }
     setenv("XDG_STATE_HOME", g_default_state_home, 1);
+
+    test_macro_and_config_grammar();
+    test_dry_run_macro_commands();
+    test_macro_commands_need_daemon();
+    test_config_from_prusa_generates_calibration();
 
     test_help();
     test_version();

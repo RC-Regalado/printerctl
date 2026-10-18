@@ -43,7 +43,10 @@ typedef enum {
     PRINTERCTL_COMMAND_SD_PAUSE,
     PRINTERCTL_COMMAND_SD_RESUME,
     PRINTERCTL_COMMAND_SD_CANCEL,
-    PRINTERCTL_COMMAND_POWER_LOW_BATTERY /* `power low-battery` (Milestone 10) */
+    PRINTERCTL_COMMAND_POWER_LOW_BATTERY, /* `power low-battery` (Milestone 10) */
+    PRINTERCTL_COMMAND_MACRO_LIST,        /* `macro list` (M29) */
+    PRINTERCTL_COMMAND_MACRO_RUN,         /* `macro run ID` (M29) */
+    PRINTERCTL_COMMAND_CONFIG_FROM_PRUSA  /* `config from-prusa FILE [INSET [SAFE_Z]]` (M29) */
 } printerctl_command_t;
 
 /*
@@ -71,6 +74,12 @@ typedef struct {
     const char *print_file;
     const char *send_command;
     printerctl_home_axis_t home_axis;
+    const char *macro_id;      /* MACRO_RUN */
+    const char *prusa_file;    /* CONFIG_FROM_PRUSA */
+    bool has_prusa_inset;      /* CONFIG_FROM_PRUSA: optional INSET_MM */
+    double prusa_inset_mm;
+    bool has_prusa_safe_z;     /* CONFIG_FROM_PRUSA: optional SAFE_Z_MM */
+    double prusa_safe_z_mm;
 } printerctl_command_args_t;
 
 typedef struct {

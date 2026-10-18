@@ -32,7 +32,10 @@ migrates `send`, `home` and `sd pause`/`sd resume`/`sd cancel`; Milestone
 complete host print control, power alignment, legacy serial removal and Phase 2
 validation. M27 adds a pure typed macro domain and built-in macro registry
 metadata; M28 adds worker-owned physical execution for validated built-in
-MOVE macros only, without PLP macro operations or CLI macro UX. The Phase 1
+MOVE macros (remediated per `docs/audit/m28-remediation.md`); M29 exposes
+them through PLP `MACRO_LIST`/`MACRO_RUN` and `printerctl macro list|run`,
+and adds `printerctl config from-prusa` to derive the calibration settings
+from PrusaSlicer. The Phase 1
 remediation audit is recorded in
 `docs/audit/phase-1.md`. See
 `docs/milestones/milestone-22.md` /
@@ -117,10 +120,11 @@ cmake --build build-clang
 ctest --test-dir build --output-on-failure
 ```
 
-Use `build-clang` instead of `build` if you configured with Clang. 20
-independent test binaries are run: `printerctl_tests` (CLI grammar,
+Use `build-clang` instead of `build` if you configured with Clang. 21
+independent test binaries are run (use `TMPDIR=/tmp`; see `docs/testing.md`): `printerctl_tests` (CLI grammar,
 logging integration, daemon-unavailable paths and dry-run behavior),
 `printerctl_config_tests` (configuration module),
+`printerctl_prusa_import_tests` (M29 PrusaSlicer configuration import),
 `printerctl_gcode_tests` (G-code reader), `printerctl_macro_tests` (macro
 domain validation and registry), `printerctl_marlin_tests`
 (Marlin response parser), `printerctl_serial_tests` (serial transport
@@ -199,6 +203,9 @@ printerctl temp
 printerctl position
 printerctl info
 printerctl power low-battery
+printerctl macro list
+printerctl macro run calibrate-center
+printerctl config from-prusa ~/.config/PrusaSlicer/printer/BiquB1.ini [INSET_MM [SAFE_Z_MM]]
 ```
 
 `print FILE` and `send COMMAND` reject an empty `FILE`/`COMMAND` argument
@@ -262,6 +269,44 @@ does not abort an operation already running in firmware.
 
 `power low-battery` never requires a port and never opens a serial
 device itself — see Power events below.
+
+### Macros
+
+Built-in macros are typed, daemon-owned definitions (no arbitrary G-code):
+`maintenance-z-lift` and `calibrate-front-left|front-right|center|back-left|back-right`
+(`park` is listed but not executable yet). `printerctl macro list` shows
+which ones printerctld can run with its configuration; `printerctl macro run
+ID` starts one and stays attached until it ends (Ctrl+C detaches only).
+Every macro sends `G21` first, uses explicit feedrates, ends in `G90`, and
+never homes — run `printerctl home` before calibrating. SIGTERM/SIGPWR stop
+a macro without sending further commands.
+
+The calibration macros need these daemon keys:
+
+```ini
+calibration.min_x=30.000
+calibration.max_x=205.000
+calibration.min_y=30.000
+calibration.max_y=205.000
+calibration.safe_z=5.000
+calibration.xy_feedrate=9000.000
+calibration.z_feedrate=300.000
+```
+
+Generate them from PrusaSlicer instead of typing them:
+
+```bash
+printerctl config from-prusa ~/.config/PrusaSlicer/printer/BiquB1.ini > ~/printerctld.conf
+# add port=/dev/ttyUSB0 (and baud) to the file, then:
+printerctld --config ~/printerctld.conf
+```
+
+`bed_shape` gives the bed box (shrunk by INSET_MM, default 30 mm),
+`travel_speed`/`machine_max_feedrate_x/y` the XY feedrate (slowest wins) and
+`machine_max_feedrate_z`/`travel_speed_z` the Z feedrate; `safe_z` (default
+5 mm) is not a PrusaSlicer setting. A sliced ASCII `.gcode` works too
+(its embedded configuration block is read). See
+`docs/design/m29-macro-public-surface.md`.
 
 ### Power events
 

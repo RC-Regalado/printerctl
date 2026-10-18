@@ -142,4 +142,22 @@ printerctl_client_status_t printerctl_client_print_cancel(
     int timeout_ms,
     printerctl_client_error_t *out_error);
 
+/*
+ * M29: daemon-owned built-in macros. macro_list() is answered from the
+ * daemon's registry and configuration without touching serial;
+ * macro_run() returns once the worker accepts (or rejects) the execution
+ * -- observe progress/terminal state with printerctl_client_status().
+ */
+printerctl_client_status_t printerctl_client_macro_list(
+    printerctl_client_t *client,
+    int timeout_ms,
+    printerctl_plp1_macro_list_response_t *out_list,
+    printerctl_client_error_t *out_error);
+
+printerctl_client_status_t printerctl_client_macro_run(
+    printerctl_client_t *client,
+    const char *id,
+    int timeout_ms,
+    printerctl_client_error_t *out_error);
+
 #endif

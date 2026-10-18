@@ -6,7 +6,8 @@
 Phase 2 — DONE
 Phase 3 — ACTIVE
 M27 — DONE
-M28 — IN PROGRESS
+M28 — DONE (operator acceptance 2026-10-18; see docs/audit/m28-remediation.md)
+M29 — ACCEPTED BY OPERATOR (2026-10-18), technical fixes pending
 ```
 
 ## Phase objective
@@ -67,7 +68,8 @@ safe geometry/configuration before adding executable steps.
 
 ## M28 — Built-in Macro Execution
 
-**Status:** IN PROGRESS
+**Status:** DONE — operator acceptance of the remediation on 2026-10-18,
+recorded in `docs/audit/m28-remediation.md`. M29 acceptance remains separate.
 
 M28 adds worker-owned physical execution for validated built-in MOVE macros
 only.
@@ -105,6 +107,18 @@ Executable built-ins in M28:
 
 `park` remains registry metadata only until a later milestone gives it a safe
 typed definition.
+
+## M29 — Macro Public Surface and PrusaSlicer Configuration Import
+
+**Status:** ACCEPTED BY OPERATOR on 2026-10-18; technical closure pending
+M29-R1 through M29-R5 from `docs/audit/m29-review.md`. Operator acceptance
+does not constitute evidence that those findings are fixed.
+
+Adds PLP `MACRO_LIST`/`MACRO_RUN`, the client wrappers, CLI `macro list` /
+`macro run ID`, and `config from-prusa` to derive `calibration.*` keys from a
+PrusaSlicer printer profile or sliced G-code. Still no user-defined macros,
+DSL, arbitrary G-code, MACRO_CANCEL, queue, events, TUI/Web or multi-printer.
+See `docs/milestones/milestone-29.md`.
 
 ## Future direction
 

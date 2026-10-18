@@ -204,6 +204,27 @@ The snapshot includes:
 Macro observability must not gate execution. The control context remains the
 single event-pipe consumer, preserving the PRINT-LIVE-001 remediation model.
 
+## Remediation amendments (2026-10-14)
+
+Added after `docs/audit/m28-review.md`; see `docs/audit/m28-remediation.md`.
+
+- **Units.** Every macro first sends `G21` and requires its terminal response
+  before any `G90`/`G91` or motion. A `G21` failure stops the macro with zero
+  further TX. Postcondition: success leaves `G21` + `G90`; failure or
+  cancellation after `G21` leaves millimetres and an unknown coordinate mode.
+- **Representability.** All commands are formatted before the serial port is
+  opened. Rejected (INVALID_ARGUMENT, zero TX): |coordinate| > 9999.999 mm,
+  non-zero |coordinate| < 0.001, feedrate outside [0.001, 99999.999] mm/min,
+  any line longer than 95 bytes. `-0.0` is sent as `0.000`. These are wire
+  limits for Marlin (MAX_CMD_SIZE 96, 32-bit float), not machine travel limits.
+- **Cancellation.** The macro control poll runs before each TX and during each
+  ACK wait (every received line and every poll slice). It consumes the
+  async-signal-safe SIGTERM/SIGPWR flags, PRINT_CANCEL_POWER_FAILURE and
+  SHUTDOWN. Once cancellation is committed no further command is sent and no
+  cleanup G-code is generated; continuous `busy:` chatter cannot delay it.
+  Power-failure cancellation reports CANCELLED with failure_reason
+  SHUTTING_DOWN. PRINT_CANCEL does not target macros.
+
 ## Safety
 
 M28 adds no path for clients to submit arbitrary G-code.

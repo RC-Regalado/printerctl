@@ -513,6 +513,26 @@ static printerctl_plp1_status_response_t query_print_status_at_least(
     return decoded;
 }
 
+/* RR-001: commands_acknowledged reaching the last command precedes the
+ * worker's terminal event, so callers that assert a terminal state must
+ * wait for that state itself, not only for the acknowledgement count. */
+static printerctl_plp1_status_response_t query_print_status_until_state(
+    const char *socket_path, uint32_t request_id, uint8_t state)
+{
+    printerctl_plp1_status_response_t decoded;
+    memset(&decoded, 0, sizeof(decoded));
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        decoded = query_print_status(socket_path, request_id);
+        if (decoded.execution_state == state) {
+            return decoded;
+        }
+        sleep_ms(10);
+    }
+    check(decoded.execution_state == state,
+          "execution_state reaches the expected value within the retry budget");
+    return decoded;
+}
+
 static void expect_child_exit(pid_t child, int expected_exit)
 {
     int status = 0;
@@ -1835,7 +1855,8 @@ static void test_cli_print_sigint_kills_observer_not_the_print(void)
     mock_reply_ok(&mock);
 
     printerctl_plp1_status_response_t completed =
-        query_print_status_at_least(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, 701, 4);
+        query_print_status_until_state(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH, 701,
+                                       PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED);
     check(completed.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_COMPLETED,
           "the daemon-owned print reaches COMPLETED despite the observer's SIGINT death");
     check(completed.commands_acknowledged == 4,
@@ -2112,6 +2133,209 @@ static void test_home_client_disconnect_after_g28_is_not_fatal(void)
     run_home_disconnect_case(true);
 }
 
+/* ---- M29: macros through printerctld ---- */
+
+static void write_macro_config(char *path, size_t path_size, const char *port)
+{
+    char body[512];
+    snprintf(body, sizeof(body),
+             "port=%s\nbaud=115200\ntimeout=1000\n"
+             "calibration.min_x=10\ncalibration.max_x=90\n"
+             "calibration.min_y=20\ncalibration.max_y=120\n"
+             "calibration.safe_z=5\ncalibration.xy_feedrate=1500\n"
+             "calibration.z_feedrate=300\n",
+             port);
+    write_config_file(path, path_size, body);
+}
+
+static pid_t start_printerctld_default_with_config(const char *config_path)
+{
+    pid_t child = fork();
+    check(child >= 0, "fork");
+    if (child == 0) {
+        execl(TEST_PRINTERCTLD_PATH, "printerctld", "--config", config_path, (char *)NULL);
+        _exit(127);
+    }
+    return child;
+}
+
+static void send_macro_run_request(int client, uint32_t request_id, const char *id)
+{
+    uint8_t payload[PRINTERCTL_PLP1_MACRO_ID_MAX + 2];
+    size_t payload_length = 0;
+    printerctl_plp1_error_t plp_error;
+    check(printerctl_plp1_encode_macro_run_request(id, payload, sizeof(payload), &payload_length,
+                                                   &plp_error) == PRINTERCTL_PLP1_OK,
+          "encode MACRO_RUN payload");
+    uint8_t request[PRINTERCTL_PLP1_MAX_FRAME_SIZE];
+    size_t request_length = encode_request(PRINTERCTL_PLP1_MSG_MACRO_RUN, request_id, payload,
+                                           (uint16_t)payload_length, request, sizeof(request));
+    write_full(client, request, request_length);
+}
+
+/* M29: `printerctl macro list` and `printerctl macro run ID` drive the real
+ * printerctld over PLP/1; the daemon (configured from a file, as a
+ * `config from-prusa` output would be) owns serial and the macro steps. */
+static void test_cli_macro_list_and_run_use_daemon(void)
+{
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    char config_home[128];
+    snprintf(config_home, sizeof(config_home), "/tmp/printerctld-config-home-XXXXXX");
+    check(mkdtemp(config_home) != NULL, "config home mkdtemp");
+    mock_printer_t mock;
+    mock_open(&mock);
+    char config_path[128];
+    write_macro_config(config_path, sizeof(config_path), mock.slave_path);
+    pid_t daemon = start_printerctld_default_with_config(config_path);
+    int ready = connect_with_retry(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    close(ready);
+
+    int out_fd = -1;
+    pid_t cli = start_printerctl_args("macro", "list", NULL, config_home, &out_fd);
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    char output[4096];
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "maintenance-z-lift") != NULL && strstr(output, "ready (1 steps)") != NULL,
+          "macro list shows maintenance-z-lift as ready");
+    check(strstr(output, "calibrate-center") != NULL && strstr(output, "ready (3 steps)") != NULL,
+          "macro list shows calibration macros as ready");
+    check(strstr(output, "park") != NULL && strstr(output, "unavailable") != NULL,
+          "macro list shows park as unavailable");
+    mock_expect_no_command(&mock);
+
+    cli = start_printerctl_args("macro", "run", "calibrate-center", config_home, &out_fd);
+    mock_expect_command(&mock, "G21\n");
+    expect_child_still_running(cli);
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G91\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 Z5.000 F300.000\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G90\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 X50.000 Y70.000 F1500.000\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G91\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G1 Z-5.000 F300.000\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G90\n");
+    mock_reply_ok(&mock);
+    expect_child_exit(cli, PRINTERCTL_EXIT_OK);
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "macro 'calibrate-center' accepted by printerctld") != NULL,
+          "macro run reports daemon acceptance");
+    check(strstr(output, "Completed: 100%") != NULL, "macro run stays attached until completion");
+    mock_expect_no_command(&mock);
+
+    cli = start_printerctl_args_combined("macro", "run", "park", config_home, &out_fd);
+    expect_child_exit(cli, PRINTERCTL_EXIT_COMM_ERROR);
+    read_output(out_fd, output, sizeof(output));
+    check(strstr(output, "not executable") != NULL,
+          "non-executable macro is explained without touching serial");
+    mock_expect_no_command(&mock);
+
+    stop_printerctld(daemon);
+    mock_close(&mock);
+    unlink(config_path);
+    unlink(PRINTERCTL_CLIENT_DEFAULT_SOCKET_PATH);
+    rmdir(config_home);
+}
+
+/* M28/M29 process-level gap closure: SIGTERM delivered to printerctld while
+ * a macro waits for an ACK stops the macro (no further TX, no cleanup
+ * G-code) and the daemon exits cleanly. */
+static void test_sigterm_during_macro_is_safe(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    mock_printer_t mock;
+    mock_open(&mock);
+    char config_path[128];
+    write_macro_config(config_path, sizeof(config_path), mock.slave_path);
+    pid_t child = start_printerctld_with_config(socket_path, config_path, NULL);
+
+    int client = connect_with_retry(socket_path);
+    send_macro_run_request(client, 501, "calibrate-front-left");
+    printerctl_plp1_frame_t accepted =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_MACRO_RUN, 501);
+    check(accepted.status == PRINTERCTL_PLP1_SUCCESS, "MACRO_RUN accepted");
+    close(client);
+    mock_expect_command(&mock, "G21\n"); /* ACK held */
+
+    check(kill(child, SIGTERM) == 0, "SIGTERM printerctld during macro");
+    /* No ACK is ever sent: shutdown must not depend on the firmware. */
+    stop_printerctld_after_signal(child);
+    mock_expect_no_command(&mock);
+    check(access(socket_path, F_OK) != 0, "socket path cleaned after SIGTERM during macro");
+
+    mock_close(&mock);
+    unlink(config_path);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
+/* M28/M29 process-level gap closure: SIGPWR delivered to printerctld while a
+ * macro waits for an ACK cancels it with power-failure semantics; the
+ * daemon stays alive and reports CANCELLED/SHUTTING_DOWN. */
+static void test_sigpwr_during_macro_cancels_with_power_semantics(void)
+{
+    char socket_path[108];
+    char dir[128];
+    make_temp_socket_path(socket_path, sizeof(socket_path), dir, sizeof(dir));
+    mock_printer_t mock;
+    mock_open(&mock);
+    char config_path[128];
+    write_macro_config(config_path, sizeof(config_path), mock.slave_path);
+    pid_t child = start_printerctld_with_config(socket_path, config_path, NULL);
+
+    int client = connect_with_retry(socket_path);
+    send_macro_run_request(client, 601, "calibrate-front-left");
+    printerctl_plp1_frame_t accepted =
+        read_response_frame(client, PRINTERCTL_PLP1_MSG_MACRO_RUN, 601);
+    check(accepted.status == PRINTERCTL_PLP1_SUCCESS, "MACRO_RUN accepted");
+    close(client);
+    mock_expect_command(&mock, "G21\n");
+    mock_reply_ok(&mock);
+    mock_expect_command(&mock, "G91\n"); /* ACK held */
+
+    check(kill(child, SIGPWR) == 0, "SIGPWR printerctld during macro");
+    printerctl_plp1_status_response_t status;
+    memset(&status, 0, sizeof(status));
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        int observer = connect_with_retry(socket_path);
+        send_status(observer, 602,
+                    PRINTERCTL_PLP1_STATUS_FIELD_EXECUTION_STATE |
+                        PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON);
+        printerctl_plp1_frame_t response =
+            read_response_frame(observer, PRINTERCTL_PLP1_MSG_STATUS, 602);
+        printerctl_plp1_error_t error;
+        check(printerctl_plp1_decode_status_response(response.payload, response.payload_length,
+                                                     &status, &error) == PRINTERCTL_PLP1_OK,
+              "STATUS decodes after SIGPWR");
+        close(observer);
+        if (status.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED) {
+            break;
+        }
+        sleep_ms(10);
+    }
+    check(status.execution_state == PRINTERCTL_PLP1_EXECUTION_STATE_CANCELLED,
+          "SIGPWR cancels the active macro");
+    check((status.present_fields & PRINTERCTL_PLP1_STATUS_FIELD_FAILURE_REASON) != 0 &&
+              status.failure_reason == PRINTERCTL_PLP1_SHUTTING_DOWN,
+          "macro SIGPWR cancellation carries power-failure semantics");
+    mock_reply_ok(&mock); /* late ACK for the held G91 */
+    mock_expect_no_command(&mock);
+    expect_child_still_running(child);
+    stop_printerctld(child);
+
+    mock_close(&mock);
+    unlink(config_path);
+    unlink(socket_path);
+    rmdir(dir);
+}
+
 int main(void)
 {
     test_ping_and_clean_shutdown();
@@ -2147,5 +2371,8 @@ int main(void)
     test_physical_command_marlin_timeout_is_daemon_authoritative(true);
     test_home_printer_error_is_propagated();
     test_home_client_disconnect_after_g28_is_not_fatal();
+    test_cli_macro_list_and_run_use_daemon();
+    test_sigterm_during_macro_is_safe();
+    test_sigpwr_during_macro_cancels_with_power_semantics();
     return 0;
 }

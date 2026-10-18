@@ -95,7 +95,7 @@ implemented in M14.
 0x30–0x3F printer query/control
 0x40–0x4F events     reserved
 0x50–0x5F history    reserved
-0x60–0x7F future
+0x60–0x7F future     (0x60 MACRO_LIST, 0x61 MACRO_RUN since M29)
 0x80–0xFF reserved
 ```
 
@@ -399,6 +399,7 @@ Capability bits (`plp1.h`):
 | 3 | 0x00000008 | JOB_QUEUE (reserved/future) |
 | 4 | 0x00000010 | HISTORY (reserved/future) |
 | 5 | 0x00000020 | MULTI_PRINTER (reserved/future) |
+| 6 | 0x00000040 | MACROS (M29: MACRO_LIST/MACRO_RUN) |
 
 M14 only defines the bits; the future daemon decides which it actually
 publishes. No bit is assumed active by the codec.
@@ -632,6 +633,50 @@ uint8 axis   0 all, 1 X, 2 Y, 3 Z
 payload. They map to `M25`, `M24` and `M524` respectively and are
 distinct from host-stream `PRINT_PAUSE`, `PRINT_RESUME` and
 `PRINT_CANCEL`.
+
+## 20a. Built-in macros (0x60/0x61, M29)
+
+Additive message types in the `0x60–0x7F` future range. VERSION advertises
+them with capability bit 6, `MACROS = 0x00000040`.
+
+`MACRO_LIST` (0x60) request: no payload. Success response payload:
+
+```text
+uint16 count                      0..32
+count x {
+  string id                       non-empty, < 64 bytes
+  string display_name             < 96 bytes
+  string description              < 256 bytes
+  uint8  category                 macro.h category value (informative)
+  uint8  flags                    bit 0 EXECUTABLE; bits 1-7 reserved = 0
+  uint16 step_count               0 unless EXECUTABLE
+}
+```
+
+`EXECUTABLE` means printerctld's own start-time configuration resolves and
+validates the complete typed definition. The control context answers from
+the immutable registry: no worker command and no serial I/O, so MACRO_LIST
+is valid during a print or macro. Decoders reject counts above 32, empty
+ids, reserved flag bits, truncated entries and trailing bytes as
+`INVALID_PAYLOAD`.
+
+`MACRO_RUN` (0x61) request payload: `string id` (non-empty, < 64 bytes).
+Success response: no payload. Success means the worker accepted the macro
+and published `execution_state = RUNNING` before the response was sent;
+progress (step-based percent) and the terminal state are observed through
+`STATUS`, exactly like a host print. A client disconnect is not a cancel.
+
+| Status | MACRO_RUN meaning |
+|---|---|
+| `INVALID_PAYLOAD` | missing/empty/over-length id |
+| `INVALID_ARGUMENT` | unknown id, or a definition whose commands are not representable |
+| `INVALID_STATE` | known id that is not executable with the daemon configuration |
+| `BUSY` | a print or another macro owns execution |
+| `SERIAL_ERROR` / `PRINTER_ERROR` / `PRINTER_TIMEOUT` | serial could not be opened, or terminal failure before acceptance |
+
+There is no `MACRO_CANCEL` in M29; daemon shutdown (SIGTERM) and power
+failure (SIGPWR) stop a macro at the next control check, including during
+an ACK wait. `PRINT_CANCEL` does not target macros (`NOT_PRINTING`).
 
 ## 21. Generic error payload
 

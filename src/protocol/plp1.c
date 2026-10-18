@@ -70,6 +70,8 @@ static bool message_type_known(uint8_t type)
     case PRINTERCTL_PLP1_MSG_SD_PAUSE:
     case PRINTERCTL_PLP1_MSG_SD_RESUME:
     case PRINTERCTL_PLP1_MSG_SD_CANCEL:
+    case PRINTERCTL_PLP1_MSG_MACRO_LIST:
+    case PRINTERCTL_PLP1_MSG_MACRO_RUN:
         return true;
     default:
         return false;
@@ -104,6 +106,8 @@ static uint16_t message_type_allowed_roles(uint8_t type)
     case PRINTERCTL_PLP1_MSG_SD_PAUSE:
     case PRINTERCTL_PLP1_MSG_SD_RESUME:
     case PRINTERCTL_PLP1_MSG_SD_CANCEL:
+    case PRINTERCTL_PLP1_MSG_MACRO_LIST:
+    case PRINTERCTL_PLP1_MSG_MACRO_RUN:
         return PRINTERCTL_PLP1_FLAG_REQUEST | PRINTERCTL_PLP1_FLAG_RESPONSE;
     default:
         return 0;
@@ -166,6 +170,10 @@ static plp1_payload_requirement_t message_role_payload_requirement(uint8_t type,
     case PRINTERCTL_PLP1_MSG_SD_RESUME:
     case PRINTERCTL_PLP1_MSG_SD_CANCEL:
         return PLP1_PAYLOAD_FORBIDDEN;
+    case PRINTERCTL_PLP1_MSG_MACRO_LIST:
+        return is_response ? PLP1_PAYLOAD_REQUIRED : PLP1_PAYLOAD_FORBIDDEN;
+    case PRINTERCTL_PLP1_MSG_MACRO_RUN:
+        return is_response ? PLP1_PAYLOAD_FORBIDDEN : PLP1_PAYLOAD_REQUIRED;
     default:
         return PLP1_PAYLOAD_OPTIONAL; /* unreachable: message_type_known()
             already rejected anything else before this is ever called;
@@ -1362,5 +1370,196 @@ printerctl_plp1_result_t printerctl_plp1_decode_error_payload(
         memcpy(out_message, payload + 2, copy_length);
     }
     out_message[copy_length] = '\0';
+    return PRINTERCTL_PLP1_OK;
+}
+
+/* ---- M29 macros ---- */
+
+static printerctl_plp1_result_t macro_payload_error(printerctl_plp1_error_t *out_error,
+                                                    const char *message)
+{
+    set_error(out_error, PRINTERCTL_PLP1_ERR_MALFORMED, PRINTERCTL_PLP1_INVALID_PAYLOAD, "%s",
+              message);
+    return out_error->result;
+}
+
+printerctl_plp1_result_t printerctl_plp1_encode_macro_list_response(
+    const printerctl_plp1_macro_list_response_t *value,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if (value == NULL || out_payload == NULL || out_length == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "value, out_payload and out_length must not be NULL");
+        return out_error->result;
+    }
+    *out_length = 0;
+    if (value->count > PRINTERCTL_PLP1_MACRO_LIST_MAX) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "macro count %u exceeds the maximum %u", value->count,
+                  PRINTERCTL_PLP1_MACRO_LIST_MAX);
+        return out_error->result;
+    }
+    if (out_payload_size < 2) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_BUFFER_TOO_SMALL, PRINTERCTL_PLP1_SUCCESS,
+                  "MACRO_LIST payload buffer too small");
+        return out_error->result;
+    }
+    write_u16be(out_payload, value->count);
+    size_t offset = 2;
+    for (uint16_t i = 0; i < value->count; i++) {
+        const printerctl_plp1_macro_entry_t *entry = &value->entries[i];
+        if (entry->id[0] == '\0' || memchr(entry->id, '\0', sizeof(entry->id)) == NULL ||
+            memchr(entry->display_name, '\0', sizeof(entry->display_name)) == NULL ||
+            memchr(entry->description, '\0', sizeof(entry->description)) == NULL ||
+            (entry->flags & ~PRINTERCTL_PLP1_MACRO_FLAG_KNOWN_MASK) != 0) {
+            set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                      "macro entry %u is not encodable", (unsigned)i);
+            return out_error->result;
+        }
+        const char *strings[] = {entry->id, entry->display_name, entry->description};
+        for (size_t s = 0; s < sizeof(strings) / sizeof(strings[0]); s++) {
+            size_t written = 0;
+            printerctl_plp1_result_t status = printerctl_plp1_encode_string(
+                strings[s], out_payload + offset, out_payload_size - offset, &written, out_error);
+            if (status != PRINTERCTL_PLP1_OK) {
+                *out_length = 0;
+                return status;
+            }
+            offset += written;
+        }
+        if (out_payload_size - offset < 4) {
+            set_error(out_error, PRINTERCTL_PLP1_ERR_BUFFER_TOO_SMALL, PRINTERCTL_PLP1_SUCCESS,
+                      "MACRO_LIST payload buffer too small");
+            return out_error->result;
+        }
+        out_payload[offset++] = entry->category;
+        out_payload[offset++] = entry->flags;
+        write_u16be(out_payload + offset, entry->step_count);
+        offset += 2;
+    }
+    *out_length = offset;
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_decode_macro_list_response(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_macro_list_response_t *out_value,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if ((payload == NULL && payload_length > 0) || out_value == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_value must not be NULL, and payload must not be NULL when present");
+        return out_error->result;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+
+    if (payload_length < 2) {
+        return macro_payload_error(out_error, "MACRO_LIST response is missing its count");
+    }
+    uint16_t count = read_u16be(payload);
+    if (count > PRINTERCTL_PLP1_MACRO_LIST_MAX) {
+        return macro_payload_error(out_error, "MACRO_LIST count exceeds the maximum");
+    }
+    size_t offset = 2;
+    for (uint16_t i = 0; i < count; i++) {
+        printerctl_plp1_macro_entry_t *entry = &out_value->entries[i];
+        struct {
+            char *buffer;
+            size_t size;
+        } strings[] = {{entry->id, sizeof(entry->id)},
+                       {entry->display_name, sizeof(entry->display_name)},
+                       {entry->description, sizeof(entry->description)}};
+        for (size_t s = 0; s < sizeof(strings) / sizeof(strings[0]); s++) {
+            size_t consumed = 0;
+            printerctl_plp1_result_t status = printerctl_plp1_decode_string(
+                payload + offset, payload_length - offset, strings[s].buffer, strings[s].size,
+                &consumed, out_error);
+            if (status != PRINTERCTL_PLP1_OK) {
+                memset(out_value, 0, sizeof(*out_value));
+                return status;
+            }
+            offset += consumed;
+        }
+        if (payload_length - offset < 4) {
+            memset(out_value, 0, sizeof(*out_value));
+            return macro_payload_error(out_error, "MACRO_LIST entry is truncated");
+        }
+        entry->category = payload[offset++];
+        entry->flags = payload[offset++];
+        entry->step_count = read_u16be(payload + offset);
+        offset += 2;
+        if (entry->id[0] == '\0' ||
+            (entry->flags & ~PRINTERCTL_PLP1_MACRO_FLAG_KNOWN_MASK) != 0) {
+            memset(out_value, 0, sizeof(*out_value));
+            return macro_payload_error(out_error,
+                                       "MACRO_LIST entry has an empty id or reserved flags");
+        }
+    }
+    if (offset != payload_length) {
+        memset(out_value, 0, sizeof(*out_value));
+        return macro_payload_error(out_error, "MACRO_LIST response has trailing bytes");
+    }
+    out_value->count = count;
+    return PRINTERCTL_PLP1_OK;
+}
+
+printerctl_plp1_result_t printerctl_plp1_encode_macro_run_request(
+    const char *id,
+    uint8_t *out_payload, size_t out_payload_size, size_t *out_length,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if (id == NULL || id[0] == '\0' || strlen(id) >= PRINTERCTL_PLP1_MACRO_ID_MAX) {
+        if (out_length != NULL) {
+            *out_length = 0;
+        }
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "macro id must be non-empty and shorter than %u bytes",
+                  PRINTERCTL_PLP1_MACRO_ID_MAX);
+        return out_error->result;
+    }
+    return printerctl_plp1_encode_string(id, out_payload, out_payload_size, out_length,
+                                         out_error);
+}
+
+printerctl_plp1_result_t printerctl_plp1_decode_macro_run_request(
+    const uint8_t *payload, size_t payload_length,
+    printerctl_plp1_macro_run_request_t *out_value,
+    printerctl_plp1_error_t *out_error)
+{
+    if (out_error == NULL) {
+        return PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_error, 0, sizeof(*out_error));
+    if (out_value == NULL) {
+        set_error(out_error, PRINTERCTL_PLP1_ERR_INVALID_ARGUMENT, PRINTERCTL_PLP1_SUCCESS,
+                  "out_value must not be NULL");
+        return out_error->result;
+    }
+    memset(out_value, 0, sizeof(*out_value));
+
+    size_t consumed = 0;
+    printerctl_plp1_result_t status = printerctl_plp1_decode_string(
+        payload, payload_length, out_value->id, sizeof(out_value->id), &consumed, out_error);
+    if (status != PRINTERCTL_PLP1_OK) {
+        memset(out_value, 0, sizeof(*out_value));
+        return status;
+    }
+    if (out_value->id[0] == '\0' || consumed != payload_length) {
+        memset(out_value, 0, sizeof(*out_value));
+        return macro_payload_error(out_error, "MACRO_RUN payload must be one non-empty id string");
+    }
     return PRINTERCTL_PLP1_OK;
 }
